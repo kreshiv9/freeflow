@@ -523,6 +523,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Wispr-style text context read through Accessibility. On by default.
+    @Published var contextAwarenessEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(contextAwarenessEnabled, forKey: ContextCapturePreferences.contextAwarenessStorageKey)
+        }
+    }
+
+    /// Legacy context: a screenshot summarized by the context model. Off by default.
+    @Published var screenshotContextEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(screenshotContextEnabled, forKey: ContextCapturePreferences.screenshotContextStorageKey)
+            hasScreenRecordingPermission = hasScreenCapturePermission()
+        }
+    }
+
     @Published var preserveClipboard: Bool {
         didSet {
             UserDefaults.standard.set(preserveClipboard, forKey: preserveClipboardStorageKey)
@@ -801,6 +816,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.outputLanguage = outputLanguage
         self.shortcutStartDelay = shortcutStartDelay
         self.originalFieldInsertionEnabled = OriginalFieldInsertionPreference.load(from: .standard)
+        self.contextAwarenessEnabled = ContextCapturePreferences.loadContextAwareness(from: .standard)
+        self.screenshotContextEnabled = ContextCapturePreferences.loadScreenshotContext(from: .standard)
         self.preserveClipboard = preserveClipboard
         self.preserveExactWording = preserveExactWording
         self.keepDictationInClipboardHistory = keepDictationInClipboardHistory
@@ -1390,7 +1407,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         accessibilityTimer = nil
         hasAccessibility = AXIsProcessTrusted()
         hasScreenRecordingPermission = hasScreenCapturePermission()
-        if hasAccessibility && hasScreenRecordingPermission {
+        if hasAccessibility && (hasScreenRecordingPermission || !screenshotContextEnabled) {
             return
         }
         accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -1398,7 +1415,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 guard let self else { return }
                 self.hasAccessibility = AXIsProcessTrusted()
                 self.hasScreenRecordingPermission = self.hasScreenCapturePermission()
-                if self.hasAccessibility && self.hasScreenRecordingPermission {
+                if self.hasAccessibility && (self.hasScreenRecordingPermission || !self.screenshotContextEnabled) {
                     self.accessibilityTimer?.invalidate()
                     self.accessibilityTimer = nil
                 }
@@ -2134,7 +2151,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             manualCommandRequested: manualCommandRequested
         ) else { return false }
 
-        if resolvedIntent.isCommandMode {
+        // Text context needs no screenshot; only the legacy screenshot path requires Screen Recording.
+        if resolvedIntent.isCommandMode && screenshotContextEnabled {
             guard ensureScreenCaptureAccess() else { return false }
             if let startedAt {
                 os_log(.info, log: recordingLog, "screen capture check passed: %.3fms", (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
@@ -2716,6 +2734,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         debugStatusMessage = "Preparing audio"
         let sessionContext = capturedContext
         let inFlightContextTask = contextCaptureTask
+        let waitsForScreenshotContext = screenshotContextEnabled
         capturedContext = nil
         contextCaptureTask = nil
         lastRawTranscript = ""
@@ -2808,14 +2827,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             self?.lastTranscript = bootstrapTranscript
                         }
                     }
-                    let appContext: AppContext
-                    if let sessionContext {
-                        appContext = sessionContext
-                    } else if let inFlightContext = await inFlightContextTask?.value {
-                        appContext = inFlightContext
-                    } else {
-                        appContext = self.fallbackContextAtStop()
-                    }
+                    let appContext = await self.resolveSessionContext(
+                        captured: sessionContext,
+                        inFlight: inFlightContextTask,
+                        waitsForScreenshotContext: waitsForScreenshotContext
+                    )
                     try Task.checkCancellation()
                     await MainActor.run { [weak self] in
                         self?.debugStatusMessage = "Running post-processing"
@@ -2931,14 +2947,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.endCriticalDictationActivity()
                     }
                 } catch {
-                    let resolvedContext: AppContext
-                    if let sessionContext {
-                        resolvedContext = sessionContext
-                    } else if let inFlightContext = await inFlightContextTask?.value {
-                        resolvedContext = inFlightContext
-                    } else {
-                        resolvedContext = self.fallbackContextAtStop()
-                    }
+                    let resolvedContext = await self.resolveSessionContext(
+                        captured: sessionContext,
+                        inFlight: inFlightContextTask,
+                        waitsForScreenshotContext: waitsForScreenshotContext
+                    )
                     await MainActor.run {
                         guard self.isTranscribing else { return }
                         self.transcriptionTask = nil
@@ -3058,17 +3071,42 @@ final class AppState: ObservableObject, @unchecked Sendable {
         realtimeService = nil
     }
 
+    /// Text context never delays a dictation: if it is not ready shortly after the transcript,
+    /// cleanup proceeds without it. The legacy screenshot path keeps waiting for its summary.
+    private static let textContextStopWaitSeconds: TimeInterval = 0.1
+
+    private func resolveSessionContext(
+        captured: AppContext?,
+        inFlight: Task<AppContext?, Never>?,
+        waitsForScreenshotContext: Bool
+    ) async -> AppContext {
+        if let captured { return captured }
+        if let inFlight {
+            let context = waitsForScreenshotContext
+                ? await inFlight.value
+                : await TextContextCore.firstValue(of: inFlight, within: Self.textContextStopWaitSeconds)
+            if let context { return context }
+        }
+        return fallbackContextAtStop()
+    }
+
     private func startContextCapture() {
         contextCaptureTask?.cancel()
         capturedContext = nil
+        let usesScreenshotContext = screenshotContextEnabled
+        let readsFieldText = contextAwarenessEnabled
         lastContextSummary = "Collecting app context..."
         lastPostProcessingStatus = ""
         lastContextScreenshotDataURL = nil
-        lastContextScreenshotStatus = "Collecting screenshot..."
+        lastContextScreenshotStatus = usesScreenshotContext
+            ? "Collecting screenshot..."
+            : AppContextService.textContextScreenshotStatus
 
         contextCaptureTask = Task { [weak self] in
             guard let self else { return nil }
-            let context = await self.contextService.collectContext()
+            let context = usesScreenshotContext
+                ? await self.contextService.collectContext()
+                : self.contextService.collectTextContext(readFieldText: readsFieldText)
             await MainActor.run {
                 self.capturedContext = context
                 self.lastContextSummary = context.contextSummary
@@ -3081,7 +3119,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 self.lastContextSelectedText = context.selectedText ?? ""
                 self.lastContextLLMPrompt = context.contextPrompt ?? ""
                 self.lastPostProcessingStatus = "App context captured"
-                self.handleScreenshotCaptureIssue(context.screenshotError)
+                if usesScreenshotContext {
+                    self.handleScreenshotCaptureIssue(context.screenshotError)
+                }
             }
             return context
         }

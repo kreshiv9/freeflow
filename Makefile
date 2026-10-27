@@ -30,6 +30,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/TranscriptionErrorPresentationCore.swift \
 	Sources/TranscriptTextCore.swift \
 	Sources/TemperatureCapabilityCache.swift \
+	Sources/TextContextCore.swift \
 	Sources/TranscriptionService.swift \
 	Sources/UpdateManager.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \

@@ -22,6 +22,7 @@ struct AppContext {
     let screenshotDataURL: String?
     let screenshotMimeType: String?
     let screenshotError: String?
+    var textContext: TextContextSnapshot? = nil
 
     var contextSummary: String {
         currentActivity
@@ -29,6 +30,19 @@ struct AppContext {
 
     var summaryForPostProcessing: String {
         ContextInferenceFailure.usableSummary(currentActivity)
+    }
+
+    /// The CONTEXT section for cleanup and Edit Mode prompts. Text context is sent as a
+    /// labeled block; the legacy screenshot path sends its two-sentence summary.
+    var promptSectionForPostProcessing: String {
+        if let textContext {
+            return TextContextCore.promptSection(for: textContext)
+        }
+        // Run-history retries rebuild context from the stored block.
+        if TextContextCore.isPromptSection(currentActivity) {
+            return currentActivity.hasSuffix("\n") ? currentActivity : currentActivity + "\n"
+        }
+        return ContextInferenceFailure.promptSection(for: currentActivity)
     }
 }
 
@@ -121,6 +135,256 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             usesOriginalFieldInsertion: captureInsertionTarget
         )
     }
+
+    // MARK: - Text context
+
+    static let textContextScreenshotStatus = "Off (using text context)"
+    private static let textContextMessagingTimeout: Float = 0.25
+    private static let textContextBudgetSeconds: CFAbsoluteTime = 0.3
+    private static let nearbyAncestorLevels = 3
+    private static let nearbyMaxElements = 150
+    private static let nearbyMaxDepth = 6
+    private static let maxFullValueLength = 100_000
+
+    /// Reads Wispr-style context through Accessibility: app type, text around the cursor,
+    /// and nearby labels. No screenshot and no model call; reads stop at a short budget.
+    func collectTextContext(readFieldText: Bool) -> AppContext {
+        guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
+            return Self.textAppContext(snapshot: nil, appName: nil, bundleIdentifier: nil, windowTitle: nil)
+        }
+
+        let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
+        AXUIElementSetMessagingTimeout(appElement, Self.textContextMessagingTimeout)
+        let appName = frontmostApp.localizedName
+        let bundleIdentifier = frontmostApp.bundleIdentifier
+        let windowTitle = focusedWindowTitle(from: appElement) ?? appName
+        guard readFieldText else {
+            return Self.textAppContext(
+                snapshot: nil, appName: appName, bundleIdentifier: bundleIdentifier, windowTitle: windowTitle
+            )
+        }
+
+        var snapshot = TextContextSnapshot(
+            appName: appName,
+            bundleIdentifier: bundleIdentifier,
+            category: TextContextCore.category(bundleIdentifier: bundleIdentifier, websiteDomain: nil),
+            windowTitle: windowTitle
+        )
+        readFieldContext(
+            into: &snapshot,
+            appElement: appElement,
+            deadline: CFAbsoluteTimeGetCurrent() + Self.textContextBudgetSeconds
+        )
+        return Self.textAppContext(
+            snapshot: snapshot, appName: appName, bundleIdentifier: bundleIdentifier, windowTitle: windowTitle
+        )
+    }
+
+    private static func textAppContext(
+        snapshot: TextContextSnapshot?,
+        appName: String?,
+        bundleIdentifier: String?,
+        windowTitle: String?
+    ) -> AppContext {
+        AppContext(
+            appName: appName,
+            bundleIdentifier: bundleIdentifier,
+            windowTitle: windowTitle,
+            selectedText: snapshot?.selectedText,
+            currentActivity: snapshot.map(TextContextCore.promptSection(for:)) ?? "",
+            contextSystemPrompt: nil,
+            contextPrompt: nil,
+            screenshotDataURL: nil,
+            screenshotMimeType: nil,
+            screenshotError: textContextScreenshotStatus,
+            textContext: snapshot
+        )
+    }
+
+    private func readFieldContext(
+        into snapshot: inout TextContextSnapshot,
+        appElement: AXUIElement,
+        deadline: CFAbsoluteTime
+    ) {
+        if TextContextCore.isSensitiveApp(
+            bundleIdentifier: snapshot.bundleIdentifier,
+            ownBundleIdentifier: Bundle.main.bundleIdentifier
+        ) {
+            snapshot.omission = .sensitiveApp
+            return
+        }
+
+        guard let focused = accessibilityElement(
+            from: appElement, attribute: kAXFocusedUIElementAttribute as CFString
+        ) else { return }
+        AXUIElementSetMessagingTimeout(focused, Self.textContextMessagingTimeout)
+
+        let role = accessibilityRawString(from: focused, attribute: kAXRoleAttribute as CFString)
+        let subrole = accessibilityRawString(from: focused, attribute: kAXSubroleAttribute as CFString)
+        if subrole == kAXSecureTextFieldSubrole as String {
+            snapshot.omission = .secureField
+            return
+        }
+
+        // In browsers, only page content is read; the address bar and toolbars are skipped.
+        if TextContextCore.isBrowser(bundleIdentifier: snapshot.bundleIdentifier) {
+            guard let webArea = ancestor(of: focused, role: "AXWebArea", deadline: deadline) else {
+                snapshot.omission = .browserControls
+                return
+            }
+            snapshot.websiteDomain = accessibilityURL(from: webArea).flatMap(TextContextCore.domain(from:))
+            snapshot.category = TextContextCore.category(
+                bundleIdentifier: snapshot.bundleIdentifier, websiteDomain: snapshot.websiteDomain
+            )
+            if TextContextCore.isSensitiveDomain(snapshot.websiteDomain) {
+                snapshot.omission = .sensitiveWebsite
+                return
+            }
+        }
+
+        if AppTextInsertionCore.canCapture(role: role, subrole: subrole),
+           let slices = cursorText(from: focused) {
+            snapshot.textBeforeCursor = slices.before
+            snapshot.selectedText = slices.selected
+            snapshot.textAfterCursor = slices.after
+        }
+
+        guard CFAbsoluteTimeGetCurrent() < deadline else { return }
+        snapshot.nearbyText = nearbyText(
+            around: focused,
+            excluding: [snapshot.textBeforeCursor, snapshot.selectedText, snapshot.textAfterCursor, snapshot.windowTitle],
+            deadline: deadline
+        )
+    }
+
+    /// Prefers range reads so large documents are never copied whole.
+    private func cursorText(from element: AXUIElement) -> CursorTextSlices? {
+        guard let selection = accessibilitySelectedRange(from: element) else { return nil }
+        let placeholder = accessibilityRawString(from: element, attribute: kAXPlaceholderValueAttribute as CFString)
+
+        if let count = accessibilityInt(from: element, attribute: kAXNumberOfCharactersAttribute as CFString),
+           let ranges = TextContextCore.cursorReadRanges(selection: selection, characterCount: count),
+           let before = accessibilityString(from: element, range: ranges.before),
+           let selected = accessibilityString(from: element, range: ranges.selected),
+           let after = accessibilityString(from: element, range: ranges.after) {
+            return TextContextCore.normalizedSlices(
+                before: before, selected: selected, after: after, placeholder: placeholder
+            )
+        }
+
+        guard let value = accessibilityTextValue(from: element),
+              (value as NSString).length <= Self.maxFullValueLength,
+              let slices = TextContextCore.cursorSlices(in: value, selection: selection) else { return nil }
+        if let placeholder, !placeholder.isEmpty, value == placeholder { return nil }
+        return slices
+    }
+
+    /// Collects short labels and values near the focused field (names, recipients, thread
+    /// lines), skipping the field itself and secure controls, within element and time limits.
+    private func nearbyText(around focused: AXUIElement, excluding: [String?], deadline: CFAbsoluteTime) -> String? {
+        var root = focused
+        for _ in 0..<Self.nearbyAncestorLevels {
+            guard CFAbsoluteTimeGetCurrent() < deadline,
+                  let parent = accessibilityElement(from: root, attribute: kAXParentAttribute as CFString) else { break }
+            AXUIElementSetMessagingTimeout(parent, Self.textContextMessagingTimeout)
+            let parentRole = accessibilityRawString(from: parent, attribute: kAXRoleAttribute as CFString)
+            if parentRole == kAXWindowRole as String || parentRole == kAXApplicationRole as String { break }
+            root = parent
+        }
+        guard !CFEqual(root, focused) else { return nil }
+
+        var candidates: [String] = []
+        var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
+        var index = 0
+        while index < queue.count, index < Self.nearbyMaxElements, CFAbsoluteTimeGetCurrent() < deadline {
+            let (element, depth) = queue[index]
+            index += 1
+            if CFEqual(element, focused) { continue }
+            AXUIElementSetMessagingTimeout(element, Self.textContextMessagingTimeout)
+
+            let role = accessibilityRawString(from: element, attribute: kAXRoleAttribute as CFString)
+            let subrole = accessibilityRawString(from: element, attribute: kAXSubroleAttribute as CFString)
+            if subrole == kAXSecureTextFieldSubrole as String { continue }
+            if role == kAXStaticTextRole as String || AppTextInsertionCore.canCapture(role: role, subrole: subrole) {
+                if let text = accessibilityTextValue(from: element), text.count <= TextContextCore.maxNearbyCharacters {
+                    candidates.append(text)
+                }
+            }
+
+            guard depth < Self.nearbyMaxDepth, queue.count < Self.nearbyMaxElements * 2 else { continue }
+            for child in accessibilityChildren(of: element) {
+                queue.append((child, depth + 1))
+            }
+        }
+        return TextContextCore.nearbyText(from: candidates, excluding: excluding)
+    }
+
+    private func ancestor(of element: AXUIElement, role targetRole: String, deadline: CFAbsoluteTime) -> AXUIElement? {
+        var current: AXUIElement? = element
+        for _ in 0..<32 {
+            guard let candidate = current, CFAbsoluteTimeGetCurrent() < deadline else { return nil }
+            AXUIElementSetMessagingTimeout(candidate, Self.textContextMessagingTimeout)
+            if accessibilityRawString(from: candidate, attribute: kAXRoleAttribute as CFString) == targetRole {
+                return candidate
+            }
+            current = accessibilityElement(from: candidate, attribute: kAXParentAttribute as CFString)
+        }
+        return nil
+    }
+
+    private func accessibilitySelectedRange(from element: AXUIElement) -> NSRange? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
+              let rawValue = value,
+              CFGetTypeID(rawValue) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(unsafeBitCast(rawValue, to: AXValue.self), .cfRange, &range) else { return nil }
+        return NSRange(location: range.location, length: range.length)
+    }
+
+    private func accessibilityInt(from element: AXUIElement, attribute: CFString) -> Int? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else { return nil }
+        return (value as? NSNumber)?.intValue
+    }
+
+    /// Returns "" for an empty range without asking the app; nil when the app cannot answer.
+    private func accessibilityString(from element: AXUIElement, range: NSRange) -> String? {
+        guard range.length > 0 else { return "" }
+        var cfRange = CFRange(location: range.location, length: range.length)
+        guard let rangeValue = AXValueCreate(.cfRange, &cfRange) else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element, kAXStringForRangeParameterizedAttribute as CFString, rangeValue, &value
+        ) == .success else { return nil }
+        if let text = value as? String { return text }
+        return (value as? NSAttributedString)?.string
+    }
+
+    private func accessibilityTextValue(from element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success else { return nil }
+        if let text = value as? String { return text }
+        return (value as? NSAttributedString)?.string
+    }
+
+    private func accessibilityURL(from element: AXUIElement) -> URL? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &value) == .success else { return nil }
+        if let url = value as? URL { return url }
+        return (value as? String).flatMap(URL.init(string:))
+    }
+
+    private func accessibilityChildren(of element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value) == .success,
+              let children = value as? [AnyObject] else { return [] }
+        return children.compactMap { child in
+            CFGetTypeID(child) == AXUIElementGetTypeID() ? unsafeBitCast(child, to: AXUIElement.self) : nil
+        }
+    }
+
+    // MARK: - Legacy screenshot context
 
     func collectContext() async -> AppContext {
         let contextSystemPrompt = resolveContextPrompt()

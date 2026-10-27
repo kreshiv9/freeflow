@@ -227,18 +227,20 @@ struct ProviderSettingsFields: View {
                 .foregroundStyle(.orange)
             }
 
-            ModelDropdownView(
-                title: "Context Model",
-                subtitle: "Used for context inference, with a text-only retry when screenshot analysis fails. Screenshot analysis requires a model that accepts image input.",
-                predefinedModels: ModelConfiguration.visionModels,
-                defaultModel: AppState.defaultContextModel,
-                textDraft: $contextModelDraft,
-                onCommit: commitContextModel,
-                onReset: {
-                    contextModelDraft = AppState.defaultContextModel
-                    appState.contextModel = AppState.defaultContextModel
-                }
-            )
+            if appState.screenshotContextEnabled {
+                ModelDropdownView(
+                    title: "Context Model",
+                    subtitle: "Used by legacy screenshot context, with a text-only retry when screenshot analysis fails. Screenshot analysis requires a model that accepts image input.",
+                    predefinedModels: ModelConfiguration.visionModels,
+                    defaultModel: AppState.defaultContextModel,
+                    textDraft: $contextModelDraft,
+                    onCommit: commitContextModel,
+                    onReset: {
+                        contextModelDraft = AppState.defaultContextModel
+                        appState.contextModel = AppState.defaultContextModel
+                    }
+                )
+            }
 
             ModelDropdownView(
                 title: "Transcription Model",
@@ -721,6 +723,9 @@ struct GeneralSettingsView: View {
                 }
                 SettingsCard("Cleanup", icon: "sparkles") {
                     cleanupSection
+                }
+                SettingsCard("Context Awareness", icon: "text.viewfinder") {
+                    contextAwarenessSection
                 }
                 SettingsCard("Text insertion", icon: "text.cursor") {
                     textInsertionSection
@@ -1285,6 +1290,27 @@ struct GeneralSettingsView: View {
         }
     }
 
+    // MARK: Context awareness
+
+    private var contextAwarenessSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Context awareness", isOn: $appState.contextAwarenessEnabled)
+
+            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. Password fields, browser address bars, password managers, and banking sites are skipped. Reading is skipped if it takes too long, so dictation is never slowed down.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Divider()
+                .padding(.vertical, 2)
+
+            Toggle("Screenshot context (legacy)", isOn: $appState.screenshotContextEnabled)
+
+            Text("Replaces text context with a screenshot of the active window that the context model summarizes. Slower, requires Screen Recording permission, and sends the screenshot to your provider. Off by default.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     // MARK: Text insertion
 
     private var textInsertionSection: some View {
@@ -1463,14 +1489,16 @@ struct GeneralSettingsView: View {
                 }
             )
 
-            permissionRow(
-                title: "Screen Recording",
-                icon: "camera.viewfinder",
-                granted: appState.hasScreenRecordingPermission,
-                action: {
-                    appState.requestScreenCapturePermission()
-                }
-            )
+            if appState.screenshotContextEnabled {
+                permissionRow(
+                    title: "Screen Recording",
+                    icon: "camera.viewfinder",
+                    granted: appState.hasScreenRecordingPermission,
+                    action: {
+                        appState.requestScreenCapturePermission()
+                    }
+                )
+            }
         }
     }
 
@@ -1566,8 +1594,10 @@ struct PromptsSettingsView: View {
                 SettingsCard("Instruction Guard", icon: "shield.lefthalf.filled") {
                     instructionGuardSection
                 }
-                SettingsCard("Context Prompt", icon: "eye.fill") {
-                    contextPromptSection
+                if appState.screenshotContextEnabled {
+                    SettingsCard("Context Prompt", icon: "eye.fill") {
+                        contextPromptSection
+                    }
                 }
             }
             .padding(24)
