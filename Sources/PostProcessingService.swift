@@ -172,7 +172,8 @@ Behavior:
         customVocabulary: String,
         customSystemPrompt: String = "",
         outputLanguage: String = "",
-        dictationLanguage: String = ""
+        dictationLanguage: String = "",
+        preservesSnippetPlaceholders: Bool = false
     ) async throws -> PostProcessingResult {
         let vocabularyTerms = mergedVocabularyTerms(rawVocabulary: customVocabulary)
 
@@ -188,7 +189,8 @@ Behavior:
                     customVocabulary: vocabularyTerms,
                     customSystemPrompt: customSystemPrompt,
                     outputLanguage: outputLanguage,
-                    dictationLanguage: dictationLanguage
+                    dictationLanguage: dictationLanguage,
+                    preservesSnippetPlaceholders: preservesSnippetPlaceholders
                 )
             }
 
@@ -220,9 +222,14 @@ Behavior:
     /// also configured an Output Language: skipping the LLM entirely
     /// there would silently drop translation, so we route through a
     /// minimal translate-only prompt instead.
+    ///
+    /// `preservesSnippetPlaceholders` adds the same token-keeping line
+    /// as cleanup, so a snippet plan's placeholder text can be translated
+    /// without the expansions ever reaching the provider.
     func translateVerbatim(
         transcript: String,
-        targetLanguage: String
+        targetLanguage: String,
+        preservesSnippetPlaceholders: Bool = false
     ) async throws -> PostProcessingResult {
         let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTranscript.isEmpty else {
@@ -241,7 +248,8 @@ Behavior:
                 }
                 return try await self.translateVerbatimWithFallback(
                     transcript: trimmedTranscript,
-                    targetLanguage: trimmedLanguage
+                    targetLanguage: trimmedLanguage,
+                    preservesSnippetPlaceholders: preservesSnippetPlaceholders
                 )
             }
 
@@ -319,7 +327,8 @@ Behavior:
         customVocabulary: [String],
         customSystemPrompt: String = "",
         outputLanguage: String = "",
-        dictationLanguage: String = ""
+        dictationLanguage: String = "",
+        preservesSnippetPlaceholders: Bool = false
     ) async throws -> PostProcessingResult {
         var primaryModel = resolvedPrimaryModel()
         let retryModel = resolvedRetryModel(for: primaryModel)
@@ -340,7 +349,8 @@ Behavior:
                 customVocabulary: customVocabulary,
                 customSystemPrompt: customSystemPrompt,
                 outputLanguage: outputLanguage,
-                dictationLanguage: dictationLanguage
+                dictationLanguage: dictationLanguage,
+                preservesSnippetPlaceholders: preservesSnippetPlaceholders
             )
         } catch let error as PostProcessingError {
             // Unified fallback policy: decide whether to retry on the other model.
@@ -388,7 +398,8 @@ Behavior:
                     customVocabulary: customVocabulary,
                     customSystemPrompt: customSystemPrompt,
                     outputLanguage: outputLanguage,
-                    dictationLanguage: dictationLanguage
+                    dictationLanguage: dictationLanguage,
+                    preservesSnippetPlaceholders: preservesSnippetPlaceholders
                 )
             } catch PostProcessingError.suspectedInstructionExecution {
                 return PostProcessingResult(
@@ -484,7 +495,8 @@ Behavior:
         customVocabulary: [String],
         customSystemPrompt: String = "",
         outputLanguage: String = "",
-        dictationLanguage: String = ""
+        dictationLanguage: String = "",
+        preservesSnippetPlaceholders: Bool = false
     ) async throws -> PostProcessingResult {
         var request = URLRequest(url: URL(string: "\(baseURL)/chat/completions")!)
         request.httpMethod = "POST"
@@ -508,6 +520,9 @@ Use these spellings exactly in the output when relevant:
             outputLanguage: outputLanguage,
             dictationLanguage: dictationLanguage
         )
+        if preservesSnippetPlaceholders {
+            systemPrompt += "\n\n" + SnippetExpansion.cleanupInstruction
+        }
         if !vocabularyPrompt.isEmpty {
             systemPrompt += "\n\n" + vocabularyPrompt
         }
@@ -790,7 +805,8 @@ Model: \(model)
 
     private func translateVerbatimWithFallback(
         transcript: String,
-        targetLanguage: String
+        targetLanguage: String,
+        preservesSnippetPlaceholders: Bool
     ) async throws -> PostProcessingResult {
         let primaryModel = resolvedPrimaryModel()
         let retryModel = resolvedRetryModel(for: primaryModel)
@@ -798,7 +814,8 @@ Model: \(model)
             return try await translateVerbatim(
                 transcript: transcript,
                 targetLanguage: targetLanguage,
-                model: primaryModel
+                model: primaryModel,
+                preservesSnippetPlaceholders: preservesSnippetPlaceholders
             )
         } catch let error as PostProcessingError {
             let shouldFallback: Bool
@@ -814,7 +831,8 @@ Model: \(model)
             return try await translateVerbatim(
                 transcript: transcript,
                 targetLanguage: targetLanguage,
-                model: retryModel
+                model: retryModel,
+                preservesSnippetPlaceholders: preservesSnippetPlaceholders
             )
         }
     }
@@ -822,7 +840,8 @@ Model: \(model)
     private func translateVerbatim(
         transcript: String,
         targetLanguage: String,
-        model: String
+        model: String,
+        preservesSnippetPlaceholders: Bool
     ) async throws -> PostProcessingResult {
         var request = URLRequest(url: URL(string: "\(baseURL)/chat/completions")!)
         request.httpMethod = "POST"
@@ -830,7 +849,10 @@ Model: \(model)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = postProcessingTimeoutSeconds
 
-        let systemPrompt = Self.verbatimTranslationSystemPrompt(targetLanguage: targetLanguage)
+        var systemPrompt = Self.verbatimTranslationSystemPrompt(targetLanguage: targetLanguage)
+        if preservesSnippetPlaceholders {
+            systemPrompt += "\n\n" + SnippetExpansion.cleanupInstruction
+        }
         let userMessage = """
         Translate the transcript below into \(targetLanguage), keeping the wording literal.
 
