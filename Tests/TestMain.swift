@@ -12,6 +12,7 @@ struct FreeFlowTests {
         PipelineStageTimingsTests.run()
         RecordingTimerPreferenceTests.run()
         SilenceGatePreferenceTests.run()
+        AIAppRawTranscriptPreferenceTests.run()
         OriginalFieldInsertionPreferenceTests.run()
         ShortcutCoreTests.run()
         SemanticVersionTests.run()
