@@ -615,6 +615,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var lastContextWindowTitle: String = ""
     @Published var lastContextSelectedText: String = ""
     @Published var lastContextLLMPrompt: String = ""
+    @Published var lastStageTimings: PipelineStageTimings? = nil
     @Published var hasScreenRecordingPermission = false
     @Published var launchAtLogin: Bool {
         didSet { setLaunchAtLogin(launchAtLogin) }
@@ -635,6 +636,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var debugOverlayTimer: Timer?
     private var recordingInitializationTimer: DispatchSourceTimer?
     private var transcriptionTask: Task<Void, Never>?
+    /// Carries a dictation's paste-fired handler from the stop path to the next
+    /// gated action. The mark is sampled as the gate opens and the handler's
+    /// bookkeeping runs after the action, so nothing sits between the gate and
+    /// the paste. An original-field action that returns before pasting or
+    /// inserting reports that, leaving the paste stage nil.
+    private let pasteGate = PipelineStageTimings.PasteGate()
     private var transcribingAudioFileName: String?
     private var contextService: AppContextService
     private var contextCaptureTask: Task<AppContext?, Never>?
@@ -2692,31 +2699,36 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// Await the realtime WebSocket's final transcript. If it errors out (or
     /// was never started) fall back to the file-based POST so the user still
     /// gets a transcript. Runs the realtime commit and file upload in that
-    /// strict order to avoid paying for both when realtime succeeds.
+    /// strict order to avoid paying for both when realtime succeeds. Reports
+    /// which path produced the transcript so stage timings can record it.
     private static func resolveRawTranscript(
         realtimeService: RealtimeTranscriptionService?,
         fileService: TranscriptionService,
         fileURL: URL
-    ) async throws -> String {
+    ) async throws -> (transcript: String, source: String) {
         if let realtimeService {
             do {
                 try Task.checkCancellation()
-                return try await withTaskCancellationHandler {
+                let text = try await withTaskCancellationHandler {
                     try await realtimeService.commitAndAwaitFinal()
                 } onCancel: {
                     realtimeService.cancel()
                 }
+                return (text, PipelineStageTimings.realtimeTranscriptionSource)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 try Task.checkCancellation()
-                return try await fileService.transcribe(fileURL: fileURL)
+                let text = try await fileService.transcribe(fileURL: fileURL)
+                return (text, PipelineStageTimings.fileTranscriptionSource)
             }
         }
-        return try await fileService.transcribe(fileURL: fileURL)
+        let text = try await fileService.transcribe(fileURL: fileURL)
+        return (text, PipelineStageTimings.fileTranscriptionSource)
     }
 
     private func stopAndTranscribe() {
+        let stopRequestedAt = CFAbsoluteTimeGetCurrent()
         cancelPendingShortcutStart()
         cancelRecordingInitializationTimer()
         shortcutSessionController.reset()
@@ -2744,6 +2756,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         lastPostProcessingPrompt = ""
         lastContextScreenshotDataURL = nil
         lastContextScreenshotStatus = "No screenshot"
+        lastStageTimings = nil
         isRecording = false
         restoreAudioInterruptionIfNeeded()
         isTranscribing = true
@@ -2772,6 +2785,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
 
             let savedAudioFile = Self.saveAudioFile(from: fileURL)
+            let audioReadyAt = CFAbsoluteTimeGetCurrent()
             let transcriptionFileURL = savedAudioFile?.fileURL ?? fileURL
             self.transcribingAudioFileName = savedAudioFile?.fileName
             self.statusText = "Transcribing..."
@@ -2801,17 +2815,22 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return
             }
             self.transcriptionTask = Task {
+                var stageMarks = PipelineStageTimings.Marks(stopRequested: stopRequestedAt, audioReady: audioReadyAt)
                 defer {
                     activeRealtime?.cancel()
                 }
                 do {
                     let transcriptionService = try self.makeTranscriptionService()
-                    async let transcript = Self.resolveRawTranscript(
+                    stageMarks.transcriptionStarted = CFAbsoluteTimeGetCurrent()
+                    async let resolvedTranscript = Self.resolveRawTranscript(
                         realtimeService: activeRealtime,
                         fileService: transcriptionService,
                         fileURL: transcriptionFileURL
                     )
-                    let rawTranscript = try await transcript
+                    let resolved = try await resolvedTranscript
+                    stageMarks.transcriptionFinished = CFAbsoluteTimeGetCurrent()
+                    stageMarks.transcriptionSource = resolved.source
+                    let rawTranscript = resolved.transcript
                     let parsedTranscript = Self.parseTranscriptCommands(
                         from: rawTranscript,
                         pressEnterCommandEnabled: self.isPressEnterVoiceCommandEnabled
@@ -2827,15 +2846,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             self?.lastTranscript = bootstrapTranscript
                         }
                     }
+                    stageMarks.contextStarted = CFAbsoluteTimeGetCurrent()
                     let appContext = await self.resolveSessionContext(
                         captured: sessionContext,
                         inFlight: inFlightContextTask,
                         waitsForScreenshotContext: waitsForScreenshotContext
                     )
+                    stageMarks.contextFinished = CFAbsoluteTimeGetCurrent()
                     try Task.checkCancellation()
                     await MainActor.run { [weak self] in
                         self?.debugStatusMessage = "Running post-processing"
                     }
+                    stageMarks.cleanupStarted = CFAbsoluteTimeGetCurrent()
                     let result = await self.processTranscript(
                         parsedTranscript.transcript,
                         intent: sessionIntent,
@@ -2847,6 +2869,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
                         preserveExactWording: self.preserveExactWording
                     )
+                    stageMarks.cleanupFinished = CFAbsoluteTimeGetCurrent()
+                    // Immutable snapshot: the @Sendable MainActor closure must not capture the mutable marks.
+                    let recordedMarks = stageMarks
                     try Task.checkCancellation()
 
                     await MainActor.run {
@@ -2870,6 +2895,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.lastRawTranscript = trimmedRawTranscript
                         self.lastPostProcessedTranscript = trimmedFinalTranscript
                         self.lastPostProcessingStatus = processingStatus
+                        let entryID = UUID()
                         self.recordPipelineHistoryEntry(
                             rawTranscript: trimmedRawTranscript,
                             postProcessedTranscript: trimmedFinalTranscript,
@@ -2878,7 +2904,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             context: appContext,
                             processingStatus: processingStatus,
                             intent: sessionIntent,
-                            audioFileName: savedAudioFile?.fileName
+                            audioFileName: savedAudioFile?.fileName,
+                            id: entryID,
+                            stageTimings: recordedMarks.timings
                         )
                         self.transcriptionTask = nil
                         self.transcribingAudioFileName = nil
@@ -2900,6 +2928,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         }
 
                         if trimmedFinalTranscript.isEmpty {
+                            self.completeStageTimings(recordedMarks.timings, entryID: nil)
                             self.statusText = shouldPressEnterAfterPaste ? enterOnlyStatusText : "Nothing to transcribe"
                             self.clearPendingOverlayDismissToken()
                             if !self.showPostTranscriptionUpdateReminderIfNeeded() {
@@ -2929,6 +2958,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 }
                             }
 
+                            self.pasteGate.schedule { [weak self] firedAt in
+                                guard let firedAt else {
+                                    // Nothing was pasted or inserted; the stored row already holds these timings.
+                                    self?.completeStageTimings(recordedMarks.timings, entryID: nil)
+                                    return
+                                }
+                                var firedMarks = recordedMarks
+                                firedMarks.pasteFired = firedAt
+                                self?.completeStageTimings(firedMarks.timings, entryID: entryID)
+                            }
                             self.insertTranscriptWhenShortcutReleased(
                                 trimmedFinalTranscript, target: textInsertionTarget,
                                 shouldPressEnter: shouldPressEnterAfterPaste,
@@ -2947,6 +2986,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.endCriticalDictationActivity()
                     }
                 } catch {
+                    let errorMarks = stageMarks
                     let resolvedContext = await self.resolveSessionContext(
                         captured: sessionContext,
                         inFlight: inFlightContextTask,
@@ -2978,8 +3018,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             context: resolvedContext,
                             processingStatus: "Error: \(error.localizedDescription)",
                             intent: sessionIntent,
-                            audioFileName: savedAudioFile?.fileName
+                            audioFileName: savedAudioFile?.fileName,
+                            stageTimings: errorMarks.timings
                         )
+                        self.completeStageTimings(errorMarks.timings, entryID: nil)
                         self.audioRecorder.cleanup()
                         self.refreshAvailableMicrophonesIfNeeded()
                     }
@@ -3002,12 +3044,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
         context: AppContext,
         processingStatus: String,
         intent: SessionIntent,
-        audioFileName: String? = nil
+        audioFileName: String? = nil,
+        id: UUID = UUID(),
+        stageTimings: PipelineStageTimings? = nil
     ) {
         let newEntry = PipelineHistoryItem(
             intent: intent.persistedIntent,
             selectedText: intent.persistedSelectedText,
             capturedSelection: context.selectedText,
+            id: id,
             timestamp: Date(),
             rawTranscript: rawTranscript,
             postProcessedTranscript: postProcessedTranscript,
@@ -3025,7 +3070,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             audioFileName: audioFileName,
             contextAppName: context.appName,
             contextBundleIdentifier: context.bundleIdentifier,
-            contextWindowTitle: context.windowTitle
+            contextWindowTitle: context.windowTitle,
+            stageTimings: stageTimings
         )
         do {
             let removedAudioFileNames = try pipelineHistoryStore.append(newEntry, maxCount: maxPipelineHistoryCount)
@@ -3036,6 +3082,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
         } catch {
             errorMessage = "Unable to save run history entry: \(error.localizedDescription)"
         }
+    }
+
+    /// Publishes the final timings for one dictation, completes its stored
+    /// history row in place when the paste fired, and emits the single
+    /// numbers-only timing log line.
+    private func completeStageTimings(_ timings: PipelineStageTimings, entryID: UUID?) {
+        lastStageTimings = timings
+        if let entryID {
+            do {
+                try pipelineHistoryStore.updateStageTimings(id: entryID, stageTimings: timings)
+            } catch {
+                os_log(.error, log: recordingLog, "failed to store stage timings: %{public}@", error.localizedDescription)
+            }
+            if let index = pipelineHistory.firstIndex(where: { $0.id == entryID }) {
+                pipelineHistory[index].stageTimings = timings
+            }
+        }
+        os_log(.info, log: recordingLog, "stage timings: %{public}@", timings.summaryLine)
     }
 
     private func startRealtimeStreamingIfEnabled() {
@@ -3390,12 +3454,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return
         }
         performAfterShortcutReleased { [weak self] in
-            guard let self, target?.identifier == self.textInsertionTargetID else { return }
+            guard let self, target?.identifier == self.textInsertionTargetID else {
+                self?.pasteGate.report(dispatched: false)
+                return
+            }
             let finish: (String) -> Void = { [weak self] status in
                 self?.statusText = status
                 self?.scheduleReadyStatusReset(after: 3, matching: [status])
             }
             guard let target else {
+                self.pasteGate.report(dispatched: false)
                 finish("Original field unavailable — use Paste Again")
                 return
             }
@@ -3419,6 +3487,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     )
                 }
                 guard pasted else {
+                    self.pasteGate.report(dispatched: false)
                     self.restoreClipboardIfNeeded(pendingRestore)
                     if target.identifier == self.textInsertionTargetID {
                         finish("Original field changed or unavailable — use Paste Again")
@@ -3742,6 +3811,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func performAfterShortcutReleased(attempt: Int = 0, action: @escaping () -> Void) {
+        let action = attempt == 0 ? pasteGate.wrappingScheduledPaste(action) : action
         let maxAttempts = 24
         if hotkeyManager.hasPressedShortcutInputs && attempt < maxAttempts {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self] in

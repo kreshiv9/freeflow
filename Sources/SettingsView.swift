@@ -2316,6 +2316,19 @@ struct RunLogEntryView: View {
                         }
                     }
 
+                    // Stage timings
+                    if let summaryLine = item.stageTimings?.summaryLine, !summaryLine.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "timer")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(summaryLine)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+
                     // Custom vocabulary
                     if !item.customVocabulary.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {

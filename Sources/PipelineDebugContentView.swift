@@ -17,6 +17,7 @@ struct PipelineDebugContentView: View {
     let rawTranscript: String
     let postProcessedTranscript: String
     let postProcessingPrompt: String
+    let stageTimings: PipelineStageTimings?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -26,6 +27,10 @@ struct PipelineDebugContentView: View {
 
             if !postProcessingStatus.isEmpty {
                 debugRow(title: "Post-Processing", value: postProcessingStatus)
+            }
+
+            if let stageTimings, !stageTimings.summaryLine.isEmpty {
+                debugRow(title: "Stage Timings", value: stageTimings.summaryLine)
             }
 
             if !postProcessingPrompt.isEmpty {
@@ -64,7 +69,8 @@ struct PipelineDebugContentView: View {
                 debugRow(title: "Post-Processed Transcript", value: postProcessedTranscript, copyText: postProcessedTranscript)
             }
 
-            if contextSummary.isEmpty && rawTranscript.isEmpty && postProcessedTranscript.isEmpty && postProcessingPrompt.isEmpty {
+            if contextSummary.isEmpty && rawTranscript.isEmpty && postProcessedTranscript.isEmpty && postProcessingPrompt.isEmpty
+                && stageTimings == nil {
                 Text("No debug data for this entry.")
                     .font(.caption)
                     .foregroundStyle(.secondary)

@@ -109,6 +109,24 @@ final class PipelineHistoryStore {
         if let thrownError { throw thrownError }
     }
 
+    func updateStageTimings(id: UUID, stageTimings: PipelineStageTimings) throws {
+        guard isStoreLoaded else { return }
+
+        var thrownError: Error?
+        container.viewContext.performAndWait {
+            do {
+                let request = pipelineHistoryRequest()
+                request.predicate = NSPredicate(format: "id == %@", id as CVarArg)
+                guard let entity = try container.viewContext.fetch(request).first else { return }
+                entity.stageTimingsJSON = stageTimings.jsonString
+                try saveContext()
+            } catch {
+                thrownError = error
+            }
+        }
+        if let thrownError { throw thrownError }
+    }
+
     func delete(id: UUID) throws -> String? {
         guard isStoreLoaded else { return nil }
 
@@ -210,6 +228,7 @@ final class PipelineHistoryStore {
                 entity.contextAppName = item.contextAppName
                 entity.contextBundleIdentifier = item.contextBundleIdentifier
                 entity.contextWindowTitle = item.contextWindowTitle
+                entity.stageTimingsJSON = item.stageTimings?.jsonString
                 try saveContext()
             } catch {
                 thrownError = error
@@ -287,7 +306,8 @@ final class PipelineHistoryStore {
             audioFileName: entity.audioFileName,
             contextAppName: entity.contextAppName,
             contextBundleIdentifier: entity.contextBundleIdentifier,
-            contextWindowTitle: entity.contextWindowTitle
+            contextWindowTitle: entity.contextWindowTitle,
+            stageTimings: entity.stageTimingsJSON.flatMap { PipelineStageTimings(jsonString: $0) }
         )
     }
 
@@ -319,7 +339,8 @@ final class PipelineHistoryStore {
             makeAttribute(name: "audioFileName", type: .stringAttributeType, isOptional: true),
             makeAttribute(name: "contextAppName", type: .stringAttributeType, isOptional: true),
             makeAttribute(name: "contextBundleIdentifier", type: .stringAttributeType, isOptional: true),
-            makeAttribute(name: "contextWindowTitle", type: .stringAttributeType, isOptional: true)
+            makeAttribute(name: "contextWindowTitle", type: .stringAttributeType, isOptional: true),
+            makeAttribute(name: "stageTimingsJSON", type: .stringAttributeType, isOptional: true)
         ]
 
         model.entities = [entity]
@@ -364,4 +385,5 @@ final class PipelineHistoryEntry: NSManagedObject {
     @NSManaged var contextAppName: String?
     @NSManaged var contextBundleIdentifier: String?
     @NSManaged var contextWindowTitle: String?
+    @NSManaged var stageTimingsJSON: String?
 }
