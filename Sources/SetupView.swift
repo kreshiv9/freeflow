@@ -1338,6 +1338,10 @@ struct SetupView: View {
 
             case .switchedToToggle:
                 break
+
+            case .stopUnlessRetapped, .cancel:
+                // The harness folds these into `.stop` before they reach here.
+                break
             }
         }
 

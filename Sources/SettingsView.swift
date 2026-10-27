@@ -1133,6 +1133,22 @@ struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Stepper(
+                    value: $appState.handsFreeSilenceTimeoutSeconds,
+                    in: HandsFreeAutoStop.silenceTimeoutRange
+                ) {
+                    Text("Hands-free stops after \(appState.handsFreeSilenceTimeoutSeconds) s of silence")
+                        .font(.caption.weight(.semibold))
+                }
+
+                Text("Only for tap-to-toggle and double-tap sessions; hold-to-talk stops when you release. Double-tap the hold shortcut within half a second to go hands-free; press a dictation shortcut again within half a second of starting to cancel. Every dictation stops at 20 minutes.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

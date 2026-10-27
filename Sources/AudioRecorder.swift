@@ -713,6 +713,13 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
     }
 
+    /// Read-only snapshot of the current recording's speech activity for callers
+    /// polling on the main queue; the stop-time value still arrives through
+    /// stopRecording's completion.
+    var currentSpeechActivity: SpeechActivityTracker {
+        speechActivityLock.withLock { $0 }
+    }
+
     func cancelRecording() {
         captureTiming.withLock { $0.invalidate() }
         sessionQueue.async {

@@ -15,6 +15,18 @@ enum ShortcutCoreTests {
         testHoldSessionControllerLifecycle()
         testToggleSessionControllerLifecycle()
         testHoldToToggleSessionControllerLifecycle()
+        testQuickTapThenRetapBecomesHandsFree()
+        testQuickTapWithoutRetapStopsAtDeadlineThenStartsASeparateDictation()
+        testOverdueTapStopWinsOverLatePress()
+        testLongHoldStopsImmediatelyOnRelease()
+        testToggleReactivationInsideCancelWindowCancels()
+        testToggleShortcutPressDoesNotCancelItsOwnSession()
+        testDoubleTapSessionStopsWithToggleShortcut()
+        testHoldToToggleSwitchThenHoldTapStops()
+        testResetClearsDeferredTapStop()
+        testToggleShortcutEndPressDoesNotStartHoldSession()
+        testHoldShortcutEndPressSwallowsAddedToggleActivation()
+        testWindowsCountFromRecordingStart()
     }
 
     private static func testBareFnHoldLifecycle() {
@@ -311,20 +323,26 @@ enum ShortcutCoreTests {
         TestSupport.expect(!first.conflicts(with: .disabled), "Disabled bindings should not conflict")
     }
 
+    /// A hold longer than the double-tap window still stops on release.
     private static func testHoldSessionControllerLifecycle() {
-        let controller = DictationShortcutSessionController()
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
         TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: true), nil)
         TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 1
         TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), .stop)
         TestSupport.expectEqual(controller.activeMode, nil)
     }
 
+    /// A toggle press after the cancel window stops the session.
     private static func testToggleSessionControllerLifecycle() {
-        let controller = DictationShortcutSessionController()
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
         TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
         TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), nil)
         TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
         TestSupport.expectEqual(controller.toggleStopArmed, true)
+        now = 1
         TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .stop)
         TestSupport.expectEqual(controller.activeMode, nil)
     }
@@ -343,5 +361,326 @@ enum ShortcutCoreTests {
         controller.reset()
         TestSupport.expectEqual(controller.activeMode, nil)
         TestSupport.expectEqual(controller.toggleStopArmed, false)
+    }
+
+    private static func testQuickTapThenRetapBecomesHandsFree() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 0.2
+        TestSupport.expectEqual(
+            controller.handle(event: .holdDeactivated, isTranscribing: false),
+            .stopUnlessRetapped(deadline: 0.5)
+        )
+        TestSupport.expectEqual(controller.activeMode, .hold)
+        TestSupport.expectEqual(controller.pendingTapStopDeadline, 0.5)
+        now = 0.4
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .switchedToToggle)
+        TestSupport.expectEqual(controller.activeMode, .toggle)
+        TestSupport.expectEqual(controller.pendingTapStopDeadline, nil)
+        now = 0.45
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        // A stale timer must not end the hands-free session.
+        TestSupport.expectEqual(controller.resolvePendingTapStop(deadline: 0.5), nil)
+        TestSupport.expectEqual(controller.activeMode, .toggle)
+        now = 3
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .stop)
+        TestSupport.expectEqual(controller.activeMode, nil)
+    }
+
+    private static func testQuickTapWithoutRetapStopsAtDeadlineThenStartsASeparateDictation() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 0.2
+        TestSupport.expectEqual(
+            controller.handle(event: .holdDeactivated, isTranscribing: false),
+            .stopUnlessRetapped(deadline: 0.5)
+        )
+        // A mismatched deadline is ignored.
+        TestSupport.expectEqual(controller.resolvePendingTapStop(deadline: 0.4), nil)
+        TestSupport.expectEqual(controller.activeMode, .hold)
+        now = 0.5
+        TestSupport.expectEqual(controller.resolvePendingTapStop(deadline: 0.5), .stop)
+        TestSupport.expectEqual(controller.activeMode, nil)
+        // A second, separate dictation.
+        now = 0.8
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 0.9
+        TestSupport.expectEqual(
+            controller.handle(event: .holdDeactivated, isTranscribing: false),
+            .stopUnlessRetapped(deadline: 1.3)
+        )
+        now = 1.3
+        TestSupport.expectEqual(controller.resolvePendingTapStop(deadline: 1.3), .stop)
+        TestSupport.expectEqual(controller.activeMode, nil)
+    }
+
+    private static func testOverdueTapStopWinsOverLatePress() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 0.2
+        TestSupport.expectEqual(
+            controller.handle(event: .holdDeactivated, isTranscribing: false),
+            .stopUnlessRetapped(deadline: 0.5)
+        )
+        // The timer is late: the deferred stop wins and the press is consumed.
+        now = 0.6
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .stop)
+        TestSupport.expectEqual(controller.activeMode, nil)
+        TestSupport.expectEqual(controller.resolvePendingTapStop(deadline: 0.5), nil)
+    }
+
+    private static func testLongHoldStopsImmediatelyOnRelease() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 0.6
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), .stop)
+        TestSupport.expectEqual(controller.activeMode, nil)
+        TestSupport.expectEqual(controller.pendingTapStopDeadline, nil)
+
+        // Boundary: a release at exactly the window stops immediately.
+        var boundaryNow: TimeInterval = 0
+        let boundary = DictationShortcutSessionController(now: { boundaryNow })
+        TestSupport.expectEqual(boundary.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        boundaryNow = 0.5
+        TestSupport.expectEqual(boundary.handle(event: .holdDeactivated, isTranscribing: false), .stop)
+        TestSupport.expectEqual(boundary.activeMode, nil)
+    }
+
+    private static func testToggleReactivationInsideCancelWindowCancels() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        now = 0.1
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        now = 0.3
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .cancel)
+        TestSupport.expectEqual(controller.activeMode, nil)
+
+        var lateNow: TimeInterval = 0
+        let late = DictationShortcutSessionController(now: { lateNow })
+        TestSupport.expectEqual(late.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        lateNow = 0.1
+        TestSupport.expectEqual(late.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        lateNow = 0.7
+        TestSupport.expectEqual(late.handle(event: .toggleActivated, isTranscribing: false), .stop)
+        TestSupport.expectEqual(late.activeMode, nil)
+    }
+
+    /// The default ⌘+Fn press emits .toggleActivated then .holdActivated in the
+    /// same keypress (see testDefaultShortcutSpecificityOrdering); the trailing
+    /// hold activation must not end the session it just started.
+    private static func testToggleShortcutPressDoesNotCancelItsOwnSession() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.holdStopArmed, false)
+        now = 0.1
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.holdStopArmed, true)
+        // A bare hold tap inside the window cancels.
+        now = 0.2
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .cancel)
+        TestSupport.expectEqual(controller.activeMode, nil)
+
+        var lateNow: TimeInterval = 0
+        let late = DictationShortcutSessionController(now: { lateNow })
+        TestSupport.expectEqual(late.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        TestSupport.expectEqual(late.handle(event: .holdActivated, isTranscribing: false), nil)
+        lateNow = 0.1
+        TestSupport.expectEqual(late.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(late.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        lateNow = 1
+        TestSupport.expectEqual(late.handle(event: .holdActivated, isTranscribing: false), .stop)
+        TestSupport.expectEqual(late.activeMode, nil)
+    }
+
+    /// Double-tap entry arms the toggle shortcut, so a non-overlapping toggle
+    /// binding can end a hands-free session with one press.
+    private static func testDoubleTapSessionStopsWithToggleShortcut() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 0.2
+        TestSupport.expectEqual(
+            controller.handle(event: .holdDeactivated, isTranscribing: false),
+            .stopUnlessRetapped(deadline: 0.5)
+        )
+        now = 0.4
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .switchedToToggle)
+        TestSupport.expectEqual(controller.toggleStopArmed, true)
+        now = 0.45
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        now = 2
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .stop)
+        TestSupport.expectEqual(controller.activeMode, nil)
+    }
+
+    private static func testHoldToToggleSwitchThenHoldTapStops() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 0.1
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .switchedToToggle)
+        TestSupport.expectEqual(controller.pendingTapStopDeadline, nil)
+        now = 0.2
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        now = 0.3
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        now = 2
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .stop)
+        TestSupport.expectEqual(controller.activeMode, nil)
+
+        // The cancel window counts from the first press, not from the switch.
+        var earlyNow: TimeInterval = 0
+        let early = DictationShortcutSessionController(now: { earlyNow })
+        TestSupport.expectEqual(early.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        earlyNow = 0.1
+        TestSupport.expectEqual(early.handle(event: .toggleActivated, isTranscribing: false), .switchedToToggle)
+        earlyNow = 0.2
+        TestSupport.expectEqual(early.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        earlyNow = 0.3
+        TestSupport.expectEqual(early.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        earlyNow = 0.4
+        TestSupport.expectEqual(early.handle(event: .holdActivated, isTranscribing: false), .cancel)
+        TestSupport.expectEqual(early.activeMode, nil)
+    }
+
+    private static func testResetClearsDeferredTapStop() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        now = 0.2
+        TestSupport.expectEqual(
+            controller.handle(event: .holdDeactivated, isTranscribing: false),
+            .stopUnlessRetapped(deadline: 0.5)
+        )
+        controller.reset()
+        TestSupport.expectEqual(controller.pendingTapStopDeadline, nil)
+        TestSupport.expectEqual(controller.holdStopArmed, false)
+        TestSupport.expectEqual(controller.resolvePendingTapStop(deadline: 0.5), nil)
+
+        // Manual sessions also get a cancel window.
+        now = 0
+        controller.beginManual(mode: .toggle)
+        now = 0.2
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .cancel)
+        TestSupport.expectEqual(controller.activeMode, nil)
+    }
+
+    /// The default ⌘+Fn press that ends a toggle session also emits a trailing
+    /// .holdActivated (see testDefaultShortcutSpecificityOrdering). It must not
+    /// start a hold dictation, for a cancel or a stop, even though AppState
+    /// resets the controller and leaves isTranscribing false on cancel.
+    private static func testToggleShortcutEndPressDoesNotStartHoldSession() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), nil)
+        now = 0.1
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        now = 0.3
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .cancel)
+        // AppState's cancel path resets the controller before the trailing event arrives.
+        controller.reset()
+        TestSupport.expectEqual(controller.swallowsActivationsUntilRelease, true)
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.activeMode, nil)
+        now = 0.4
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.swallowsActivationsUntilRelease, false)
+        // A fresh press after the release starts normally.
+        now = 1
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        TestSupport.expectEqual(controller.activeMode, .hold)
+
+        // Same keypress after the cancel window: a stop, still without a hold start.
+        var lateNow: TimeInterval = 0
+        let late = DictationShortcutSessionController(now: { lateNow })
+        TestSupport.expectEqual(late.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        TestSupport.expectEqual(late.handle(event: .holdActivated, isTranscribing: false), nil)
+        lateNow = 0.1
+        TestSupport.expectEqual(late.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(late.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        lateNow = 1
+        TestSupport.expectEqual(late.handle(event: .toggleActivated, isTranscribing: false), .stop)
+        late.reset()
+        TestSupport.expectEqual(late.handle(event: .holdActivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(late.activeMode, nil)
+        // Releasing ⌘ first leaves Fn's hold binding active: only .toggleDeactivated arrives.
+        lateNow = 1.1
+        TestSupport.expectEqual(late.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        lateNow = 1.2
+        TestSupport.expectEqual(late.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        lateNow = 2
+        TestSupport.expectEqual(late.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+    }
+
+    /// Reverse order: Fn alone ends the session, then ⌘ is added before Fn is
+    /// released. The added .toggleActivated belongs to the ending keypress.
+    private static func testHoldShortcutEndPressSwallowsAddedToggleActivation() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), nil)
+        now = 0.1
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        now = 0.3
+        TestSupport.expectEqual(controller.handle(event: .holdActivated, isTranscribing: false), .cancel)
+        controller.reset()
+        // Adding ⌘ keeps the Fn hold binding active, so only .toggleActivated arrives.
+        now = 0.35
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.activeMode, nil)
+        now = 0.4
+        TestSupport.expectEqual(controller.handle(event: .holdDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        now = 1
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        TestSupport.expectEqual(controller.activeMode, .toggle)
+    }
+
+    /// With a Shortcut Start Delay the recording begins after the press; both
+    /// half-second windows count from `markRecordingStarted()`.
+    private static func testWindowsCountFromRecordingStart() {
+        var now: TimeInterval = 0
+        let controller = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        now = 0.1
+        TestSupport.expectEqual(controller.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        now = 0.5
+        controller.markRecordingStarted()
+        now = 0.8
+        TestSupport.expectEqual(controller.handle(event: .toggleActivated, isTranscribing: false), .cancel)
+        TestSupport.expectEqual(controller.activeMode, nil)
+
+        var tapNow: TimeInterval = 0
+        let tap = DictationShortcutSessionController(now: { tapNow })
+        TestSupport.expectEqual(tap.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        tapNow = 0.5
+        tap.markRecordingStarted()
+        tapNow = 0.7
+        TestSupport.expectEqual(
+            tap.handle(event: .holdDeactivated, isTranscribing: false),
+            .stopUnlessRetapped(deadline: 1.0)
+        )
+        tapNow = 0.9
+        TestSupport.expectEqual(tap.handle(event: .holdActivated, isTranscribing: false), .switchedToToggle)
+        TestSupport.expectEqual(tap.activeMode, .toggle)
+
+        // Without a session there is nothing to anchor.
+        let idle = DictationShortcutSessionController(now: { 5 })
+        idle.markRecordingStarted()
+        TestSupport.expectEqual(idle.activeMode, nil)
+        TestSupport.expectEqual(idle.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
     }
 }
