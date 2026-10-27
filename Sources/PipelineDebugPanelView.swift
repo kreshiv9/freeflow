@@ -16,7 +16,8 @@ struct PipelineDebugPanelView: View {
                 contextScreenshotDataURL: appState.lastContextScreenshotDataURL,
                 rawTranscript: appState.lastRawTranscript,
                 postProcessedTranscript: appState.lastPostProcessedTranscript,
-                postProcessingPrompt: appState.lastPostProcessingPrompt
+                postProcessingPrompt: appState.lastPostProcessingPrompt,
+                stageTimings: appState.lastStageTimings
             )
 
             if appState.lastContextSummary.isEmpty && appState.lastRawTranscript.isEmpty {
