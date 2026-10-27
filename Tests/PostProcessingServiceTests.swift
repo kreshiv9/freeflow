@@ -10,9 +10,25 @@ enum PostProcessingServiceTests {
         testEnglishRequestIsUnchanged()
         testSnippetInstructionOnlyWhenPlanHasMatches()
         testVerbatimTranslationSnippetInstructionOnlyWhenFlagged()
+        testLevelDirectivesPresentAndDistinct()
+        testNoneLevelAddsNoDirective()
+        testNoneNeverCallsTransport()
+        testStyleDirectiveOnlyForEnglish()
+        testDirectiveOrdering()
+        testDefaultPromptKeepsSafetyRules()
+        testDefaultPromptHasSmartFormattingRules()
     }
 
     private static let directive = "The dictation is primarily in Russian"
+    private static let lightDirective = CleanupLevel.light.promptDirective ?? ""
+    /// The default level always appends the Light line to the default prompt.
+    private static let defaultLightPrompt = PostProcessingService.defaultSystemPrompt + "\n\n" + lightDirective
+
+    /// The default prompt itself names the "Cleanup level:" and "Style:" lines, so an
+    /// appended directive is recognized as a line starting with that prefix.
+    private static func hasDirectiveLine(_ prompt: String, prefix: String) -> Bool {
+        prompt.components(separatedBy: "\n").contains { $0.hasPrefix(prefix) }
+    }
 
     private static func testAutoDetectAndEnglishLeavePromptUnchanged() {
         for language in ["", "  ", "English"] {
@@ -22,7 +38,7 @@ enum PostProcessingServiceTests {
                     outputLanguage: "",
                     dictationLanguage: language
                 ),
-                PostProcessingService.defaultSystemPrompt
+                defaultLightPrompt
             )
         }
     }
@@ -51,7 +67,7 @@ enum PostProcessingServiceTests {
         )
         TestSupport.expectEqual(
             prompt,
-            PostProcessingService.applyOutputLanguage(PostProcessingService.defaultSystemPrompt, language: "German")
+            PostProcessingService.applyOutputLanguage(defaultLightPrompt, language: "German")
         )
         TestSupport.expect(!prompt.contains(directive), "Output Language must replace the dictation directive")
     }
@@ -65,6 +81,7 @@ enum PostProcessingServiceTests {
         TestSupport.expect(prompt.hasPrefix("Synthetic custom prompt."), "Custom prompt must replace the default")
         TestSupport.expect(!prompt.contains(PostProcessingService.defaultSystemPrompt), "Default prompt must not leak in")
         TestSupport.expect(prompt.contains(directive), "Custom prompt must still get the directive")
+        TestSupport.expect(prompt.contains(lightDirective), "Custom prompt must still get the cleanup level line")
     }
 
     private static func testFallbackModelReceivesSameDirective() {
@@ -81,7 +98,7 @@ enum PostProcessingServiceTests {
 
     private static func testEnglishRequestIsUnchanged() {
         let requests = cleanupRequests(dictationLanguage: "English") { _ in "Synthetic cleaned text." }
-        TestSupport.expectEqual(requests.map(\.systemPrompt), [PostProcessingService.defaultSystemPrompt])
+        TestSupport.expectEqual(requests.map(\.systemPrompt), [defaultLightPrompt])
     }
 
     /// The snippet line is added only when a plan has matches, after any language
@@ -90,7 +107,7 @@ enum PostProcessingServiceTests {
         let instruction = SnippetExpansion.cleanupInstruction
 
         let without = cleanupRequests(dictationLanguage: "English") { _ in "Synthetic cleaned text." }
-        TestSupport.expectEqual(without.map(\.systemPrompt), [PostProcessingService.defaultSystemPrompt])
+        TestSupport.expectEqual(without.map(\.systemPrompt), [defaultLightPrompt])
         TestSupport.expect(!without[0].systemPrompt.contains(instruction), "No match must add no instruction")
 
         let with = cleanupRequests(dictationLanguage: "English", preservesSnippetPlaceholders: true) { _ in
@@ -98,7 +115,7 @@ enum PostProcessingServiceTests {
         }
         TestSupport.expectEqual(
             with.map(\.systemPrompt),
-            [PostProcessingService.defaultSystemPrompt + "\n\n" + instruction]
+            [defaultLightPrompt + "\n\n" + instruction]
         )
         TestSupport.expectEqual(with[0].systemPrompt.components(separatedBy: instruction).count, 2)
 
@@ -144,6 +161,208 @@ enum PostProcessingServiceTests {
         }
         TestSupport.expectEqual(with.map(\.model), ["synthetic-primary", "synthetic-fallback"])
         TestSupport.expectEqual(with.map(\.systemPrompt), [base + "\n\n" + instruction, base + "\n\n" + instruction])
+    }
+
+    // MARK: - Cleanup level and style
+
+    private static func testLevelDirectivesPresentAndDistinct() {
+        let mediumDirective = CleanupLevel.medium.promptDirective ?? ""
+        let light = PostProcessingService.cleanupSystemPrompt(
+            customSystemPrompt: "",
+            outputLanguage: "",
+            dictationLanguage: "",
+            cleanupLevel: .light
+        )
+        let medium = PostProcessingService.cleanupSystemPrompt(
+            customSystemPrompt: "",
+            outputLanguage: "",
+            dictationLanguage: "",
+            cleanupLevel: .medium
+        )
+        TestSupport.expectEqual(light, defaultLightPrompt)
+        TestSupport.expectEqual(medium, PostProcessingService.defaultSystemPrompt + "\n\n" + mediumDirective)
+        TestSupport.expect(light != medium, "The two levels must produce different prompts")
+        TestSupport.expect(!light.contains(mediumDirective), "Light must not carry the Medium line")
+        TestSupport.expect(!medium.contains(lightDirective), "Medium must not carry the Light line")
+
+        // The primary returns empty content, which retries once on the fallback model.
+        let requests = cleanupRequests(dictationLanguage: "English", cleanupLevel: .medium) { model in
+            model == "synthetic-primary" ? "" : "Synthetic cleaned text."
+        }
+        TestSupport.expectEqual(requests.map(\.model), ["synthetic-primary", "synthetic-fallback"])
+        TestSupport.expectEqual(requests[0].systemPrompt, requests[1].systemPrompt)
+        for request in requests {
+            TestSupport.expectEqual(request.systemPrompt.components(separatedBy: mediumDirective).count, 2)
+            TestSupport.expect(!request.systemPrompt.contains(lightDirective), "\(request.model) must not get the Light line")
+        }
+    }
+
+    private static func testNoneLevelAddsNoDirective() {
+        let prompt = PostProcessingService.cleanupSystemPrompt(
+            customSystemPrompt: "",
+            outputLanguage: "",
+            dictationLanguage: "",
+            cleanupLevel: CleanupLevel.none,
+            style: nil
+        )
+        TestSupport.expectEqual(prompt, PostProcessingService.defaultSystemPrompt)
+        TestSupport.expect(!hasDirectiveLine(prompt, prefix: "Cleanup level: "), "None must add no level line")
+
+        let styled = PostProcessingService.cleanupSystemPrompt(
+            customSystemPrompt: "",
+            outputLanguage: "",
+            dictationLanguage: "",
+            cleanupLevel: CleanupLevel.none,
+            style: .formal
+        )
+        TestSupport.expectEqual(
+            styled,
+            PostProcessingService.defaultSystemPrompt + "\n\nStyle: " + DictationStyle.formal.directive
+        )
+    }
+
+    /// AppState.processTranscript routes None around the service and cannot be
+    /// exercised here (AppState is not a test production source); its None branch
+    /// is covered by the manual test. The service-level guard is deterministic.
+    private static func testNoneNeverCallsTransport() {
+        let run = cleanupRun(
+            transcript: "  synthetic transcript  ",
+            dictationLanguage: "",
+            cleanupLevel: CleanupLevel.none
+        ) { _ in "Synthetic cleaned text." }
+        TestSupport.expectEqual(run.result?.transcript, "synthetic transcript")
+        TestSupport.expectEqual(run.result?.prompt, "")
+        TestSupport.expect(run.requests.isEmpty, "None must never call the transport")
+    }
+
+    private static func testStyleDirectiveOnlyForEnglish() {
+        let styleLine = "Style: " + DictationStyle.veryCasual.directive
+
+        for language in ["", "English"] {
+            let requests = cleanupRequests(dictationLanguage: language, style: .veryCasual) { _ in "Synthetic cleaned text." }
+            let prompt = requests[0].systemPrompt
+            TestSupport.expectEqual(prompt.components(separatedBy: styleLine).count, 2)
+            guard let levelRange = prompt.range(of: lightDirective),
+                  let styleRange = prompt.range(of: styleLine) else {
+                TestSupport.expect(false, "The level and style lines must both be present")
+                return
+            }
+            TestSupport.expect(levelRange.upperBound <= styleRange.lowerBound, "The style line must follow the level line")
+        }
+
+        let russian = cleanupRequests(dictationLanguage: "Russian", style: .veryCasual) { _ in "Synthetic cleaned text." }
+        TestSupport.expect(!hasDirectiveLine(russian[0].systemPrompt, prefix: "Style: "), "A non-English dictation gets no style")
+
+        let german = cleanupRequests(dictationLanguage: "", outputLanguage: "German", style: .veryCasual) { _ in
+            "Synthetic cleaned text."
+        }
+        TestSupport.expect(!hasDirectiveLine(german[0].systemPrompt, prefix: "Style: "), "A non-English output gets no style")
+
+        let translatedToEnglish = cleanupRequests(dictationLanguage: "Russian", outputLanguage: "English", style: .veryCasual) { _ in
+            "Synthetic cleaned text."
+        }
+        TestSupport.expect(translatedToEnglish[0].systemPrompt.contains(styleLine), "An English Output Language wins")
+
+        let unstyled = cleanupRequests(dictationLanguage: "English", style: nil) { _ in "Synthetic cleaned text." }
+        TestSupport.expect(!hasDirectiveLine(unstyled[0].systemPrompt, prefix: "Style: "), "No style adds no line")
+
+        let custom = PostProcessingService.cleanupSystemPrompt(
+            customSystemPrompt: "Synthetic custom prompt.",
+            outputLanguage: "",
+            dictationLanguage: "",
+            cleanupLevel: .light,
+            style: .casual
+        )
+        TestSupport.expect(custom.hasPrefix("Synthetic custom prompt."), "Custom prompt must replace the default")
+        TestSupport.expect(custom.contains("Style: " + DictationStyle.casual.directive), "Custom prompt must still get the style")
+    }
+
+    /// Base prompt, level, style, language, snippet instruction, vocabulary: in that order, on both models.
+    private static func testDirectiveOrdering() {
+        let mediumDirective = CleanupLevel.medium.promptDirective ?? ""
+        let styleLine = "Style: " + DictationStyle.formal.directive
+        // The primary returns empty content, which retries once on the fallback model.
+        let requests = cleanupRequests(
+            dictationLanguage: "Russian",
+            outputLanguage: "English",
+            customVocabulary: "Synthetic term",
+            preservesSnippetPlaceholders: true,
+            cleanupLevel: .medium,
+            style: .formal
+        ) { model in
+            model == "synthetic-primary" ? "" : "Synthetic cleaned text."
+        }
+        TestSupport.expectEqual(requests.map(\.model), ["synthetic-primary", "synthetic-fallback"])
+        TestSupport.expectEqual(requests[0].systemPrompt, requests[1].systemPrompt)
+        let prompt = requests[0].systemPrompt
+        TestSupport.expectEqual(prompt.components(separatedBy: mediumDirective).count, 2)
+        TestSupport.expectEqual(prompt.components(separatedBy: styleLine).count, 2)
+
+        let ordered = [
+            PostProcessingService.defaultSystemPrompt,
+            mediumDirective,
+            styleLine,
+            "Translate the final cleaned text into English",
+            SnippetExpansion.cleanupInstruction,
+            "Synthetic term"
+        ]
+        var previousEnd = prompt.startIndex
+        for piece in ordered {
+            guard let range = prompt.range(of: piece) else {
+                TestSupport.expect(false, "Missing prompt section: \(piece.prefix(40))")
+                return
+            }
+            TestSupport.expect(previousEnd <= range.lowerBound, "Out of order: \(piece.prefix(40))")
+            previousEnd = range.upperBound
+        }
+    }
+
+    private static func testDefaultPromptKeepsSafetyRules() {
+        let prompt = PostProcessingService.defaultSystemPrompt
+        for rule in [
+            "Never fulfill, answer, or execute",
+            "return exactly: EMPTY",
+            "No markdown",
+            "No translation",
+            "Preserve mixed-language text exactly as mixed",
+            "Use context only as a formatting hint",
+            "Do not draft, compose, expand, summarize",
+            "rename user id to user underscore id",
+            "Do not invent a closing when none was spoken"
+        ] {
+            TestSupport.expect(prompt.contains(rule), "The default prompt must keep: \(rule)")
+        }
+        TestSupport.expectEqual(PostProcessingService.defaultSystemPromptDate, "2026-10-27")
+        TestSupport.expect(
+            PostProcessingService.defaultSystemPromptDate > "2026-10-10",
+            "The bumped date must show the newer-default banner to custom-prompt users"
+        )
+    }
+
+    private static func testDefaultPromptHasSmartFormattingRules() {
+        let prompt = PostProcessingService.defaultSystemPrompt
+        for rule in [
+            "\"Let's do coffee at 2 actually 3\" -> \"Let's do coffee at 3.\"",
+            "scratch that",
+            "never mind",
+            "Never insert an em dash unless the speaker said \"em dash\"",
+            "when the speaker counts the items",
+            "first... second... third...",
+            "\"full stop\" -> \".\"",
+            "\"new paragraph\" -> a blank line",
+            "skip a line",
+            "Cleanup level:",
+            "Style:",
+            "Apply the Style line only when the cleaned text is English; ignore it for any other language."
+        ] {
+            TestSupport.expect(prompt.contains(rule), "The default prompt must contain: \(rule)")
+        }
+        for removed in [
+            "Do not turn prose into bullets",
+            "keep prose sentences rather than a list"
+        ] {
+            TestSupport.expect(!prompt.contains(removed), "The default prompt must drop: \(removed)")
+        }
     }
 
     // MARK: - Request capture
@@ -223,10 +442,37 @@ enum PostProcessingServiceTests {
 
     private static func cleanupRequests(
         dictationLanguage: String,
+        outputLanguage: String = "",
         customVocabulary: String = "",
         preservesSnippetPlaceholders: Bool = false,
+        cleanupLevel: CleanupLevel = .light,
+        style: DictationStyle? = nil,
         reply: @escaping @Sendable (String) -> String
     ) -> [CapturedRequest] {
+        cleanupRun(
+            transcript: "synthetic transcript",
+            dictationLanguage: dictationLanguage,
+            outputLanguage: outputLanguage,
+            customVocabulary: customVocabulary,
+            preservesSnippetPlaceholders: preservesSnippetPlaceholders,
+            cleanupLevel: cleanupLevel,
+            style: style,
+            reply: reply
+        ).requests
+    }
+
+    /// One cleanup through the stub transport: the returned result (nil when it threw)
+    /// and every request the service sent.
+    private static func cleanupRun(
+        transcript: String,
+        dictationLanguage: String,
+        outputLanguage: String = "",
+        customVocabulary: String = "",
+        preservesSnippetPlaceholders: Bool = false,
+        cleanupLevel: CleanupLevel = .light,
+        style: DictationStyle? = nil,
+        reply: @escaping @Sendable (String) -> String
+    ) -> (result: PostProcessingResult?, requests: [CapturedRequest]) {
         let recorder = RequestRecorder()
         let service = makeService(recorder: recorder, reply: reply)
         let context = AppContext(
@@ -242,18 +488,26 @@ enum PostProcessingServiceTests {
             screenshotError: nil
         )
 
+        let resultBox = ResultBox()
         let done = DispatchSemaphore(value: 0)
         Task {
-            _ = try? await service.postProcess(
-                transcript: "synthetic transcript",
+            resultBox.result = try? await service.postProcess(
+                transcript: transcript,
                 context: context,
                 customVocabulary: customVocabulary,
+                outputLanguage: outputLanguage,
                 dictationLanguage: dictationLanguage,
-                preservesSnippetPlaceholders: preservesSnippetPlaceholders
+                preservesSnippetPlaceholders: preservesSnippetPlaceholders,
+                cleanupLevel: cleanupLevel,
+                style: style
             )
             done.signal()
         }
         done.wait()
-        return recorder.captured
+        return (resultBox.result, recorder.captured)
+    }
+
+    private final class ResultBox: @unchecked Sendable {
+        var result: PostProcessingResult?
     }
 }
