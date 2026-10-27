@@ -8,6 +8,8 @@ enum PostProcessingServiceTests {
         testCustomPromptKeepsDirective()
         testFallbackModelReceivesSameDirective()
         testEnglishRequestIsUnchanged()
+        testSnippetInstructionOnlyWhenPlanHasMatches()
+        testVerbatimTranslationSnippetInstructionOnlyWhenFlagged()
     }
 
     private static let directive = "The dictation is primarily in Russian"
@@ -82,6 +84,68 @@ enum PostProcessingServiceTests {
         TestSupport.expectEqual(requests.map(\.systemPrompt), [PostProcessingService.defaultSystemPrompt])
     }
 
+    /// The snippet line is added only when a plan has matches, after any language
+    /// directive and before the vocabulary section, on both models.
+    private static func testSnippetInstructionOnlyWhenPlanHasMatches() {
+        let instruction = SnippetExpansion.cleanupInstruction
+
+        let without = cleanupRequests(dictationLanguage: "English") { _ in "Synthetic cleaned text." }
+        TestSupport.expectEqual(without.map(\.systemPrompt), [PostProcessingService.defaultSystemPrompt])
+        TestSupport.expect(!without[0].systemPrompt.contains(instruction), "No match must add no instruction")
+
+        let with = cleanupRequests(dictationLanguage: "English", preservesSnippetPlaceholders: true) { _ in
+            "Synthetic cleaned text."
+        }
+        TestSupport.expectEqual(
+            with.map(\.systemPrompt),
+            [PostProcessingService.defaultSystemPrompt + "\n\n" + instruction]
+        )
+        TestSupport.expectEqual(with[0].systemPrompt.components(separatedBy: instruction).count, 2)
+
+        // The primary returns empty content, which retries once on the fallback model.
+        let ordered = cleanupRequests(
+            dictationLanguage: "Russian",
+            customVocabulary: "Synthetic term",
+            preservesSnippetPlaceholders: true
+        ) { model in
+            model == "synthetic-primary" ? "" : "Synthetic cleaned text."
+        }
+        TestSupport.expectEqual(ordered.map(\.model), ["synthetic-primary", "synthetic-fallback"])
+        TestSupport.expectEqual(ordered[0].systemPrompt, ordered[1].systemPrompt)
+        let prompt = ordered[0].systemPrompt
+        guard let directiveRange = prompt.range(of: directive),
+              let instructionRange = prompt.range(of: instruction),
+              let vocabularyRange = prompt.range(of: "Synthetic term") else {
+            TestSupport.expect(false, "The directive, instruction and vocabulary must all be present")
+            return
+        }
+        TestSupport.expect(
+            directiveRange.upperBound <= instructionRange.lowerBound,
+            "The instruction must follow the language directive"
+        )
+        TestSupport.expect(
+            instructionRange.upperBound <= vocabularyRange.lowerBound,
+            "The vocabulary section must follow the instruction"
+        )
+    }
+
+    /// The verbatim translator gets the same line only when flagged, appended to its
+    /// minimal system prompt, on both models.
+    private static func testVerbatimTranslationSnippetInstructionOnlyWhenFlagged() {
+        let instruction = SnippetExpansion.cleanupInstruction
+        let base = PostProcessingService.verbatimTranslationSystemPrompt(targetLanguage: "Spanish")
+
+        let without = translationRequests(targetLanguage: "Spanish") { _ in "Synthetic translated text." }
+        TestSupport.expectEqual(without.map(\.systemPrompt), [base])
+
+        // The primary returns empty content, which retries once on the fallback model.
+        let with = translationRequests(targetLanguage: "Spanish", preservesSnippetPlaceholders: true) { model in
+            model == "synthetic-primary" ? "" : "Synthetic translated text."
+        }
+        TestSupport.expectEqual(with.map(\.model), ["synthetic-primary", "synthetic-fallback"])
+        TestSupport.expectEqual(with.map(\.systemPrompt), [base + "\n\n" + instruction, base + "\n\n" + instruction])
+    }
+
     // MARK: - Request capture
 
     private struct CapturedRequest {
@@ -114,12 +178,11 @@ enum PostProcessingServiceTests {
         }
     }
 
-    private static func cleanupRequests(
-        dictationLanguage: String,
+    private static func makeService(
+        recorder: RequestRecorder,
         reply: @escaping @Sendable (String) -> String
-    ) -> [CapturedRequest] {
-        let recorder = RequestRecorder()
-        let service = PostProcessingService(
+    ) -> PostProcessingService {
+        PostProcessingService(
             apiKey: "synthetic-key",
             baseURL: "https://example.invalid/v1",
             preferredModel: "synthetic-primary",
@@ -135,6 +198,37 @@ enum PostProcessingServiceTests {
                 return (body, response)
             }
         )
+    }
+
+    private static func translationRequests(
+        targetLanguage: String,
+        preservesSnippetPlaceholders: Bool = false,
+        reply: @escaping @Sendable (String) -> String
+    ) -> [CapturedRequest] {
+        let recorder = RequestRecorder()
+        let service = makeService(recorder: recorder, reply: reply)
+
+        let done = DispatchSemaphore(value: 0)
+        Task {
+            _ = try? await service.translateVerbatim(
+                transcript: "synthetic transcript",
+                targetLanguage: targetLanguage,
+                preservesSnippetPlaceholders: preservesSnippetPlaceholders
+            )
+            done.signal()
+        }
+        done.wait()
+        return recorder.captured
+    }
+
+    private static func cleanupRequests(
+        dictationLanguage: String,
+        customVocabulary: String = "",
+        preservesSnippetPlaceholders: Bool = false,
+        reply: @escaping @Sendable (String) -> String
+    ) -> [CapturedRequest] {
+        let recorder = RequestRecorder()
+        let service = makeService(recorder: recorder, reply: reply)
         let context = AppContext(
             appName: nil,
             bundleIdentifier: nil,
@@ -153,8 +247,9 @@ enum PostProcessingServiceTests {
             _ = try? await service.postProcess(
                 transcript: "synthetic transcript",
                 context: context,
-                customVocabulary: "",
-                dictationLanguage: dictationLanguage
+                customVocabulary: customVocabulary,
+                dictationLanguage: dictationLanguage,
+                preservesSnippetPlaceholders: preservesSnippetPlaceholders
             )
             done.signal()
         }
