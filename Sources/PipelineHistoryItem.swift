@@ -31,6 +31,14 @@ struct PipelineHistoryItem: Identifiable, Codable {
     // The only mutable field: the stop path completes it in place once the paste fires.
     var stageTimings: PipelineStageTimings?
 
+    /// "Undo AI edit" applies to a dictation whose processing changed the text. An Edit Mode
+    /// row stores the spoken command as its raw transcript, so it never qualifies.
+    var canUndoAIEdit: Bool {
+        let raw = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        return intent == .dictation && !raw.isEmpty
+            && raw != postProcessedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     init(
         intent: PipelineHistoryItemIntent = .dictation,
         selectedText: String? = nil,
