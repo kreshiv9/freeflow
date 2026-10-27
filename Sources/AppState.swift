@@ -522,6 +522,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Seconds of silence after which a hands-free (toggle) session stops itself. Hold sessions never auto-stop.
+    @Published var handsFreeSilenceTimeoutSeconds: Int {
+        didSet {
+            UserDefaults.standard.set(handsFreeSilenceTimeoutSeconds, forKey: HandsFreeAutoStop.silenceTimeoutStorageKey)
+        }
+    }
+
     @Published var originalFieldInsertionEnabled: Bool {
         didSet {
             UserDefaults.standard.set(originalFieldInsertionEnabled, forKey: OriginalFieldInsertionPreference.storageKey)
@@ -681,6 +688,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var needsMicrophoneRefreshAfterRecording = false
     private let pipelineHistoryStore = PipelineHistoryStore()
     private let shortcutSessionController = DictationShortcutSessionController()
+    /// Replaced at each recording start so a preference change mid-dictation does not affect the running one.
+    private var handsFreeAutoStop = HandsFreeAutoStop(silenceTimeoutSeconds: HandsFreeAutoStop.defaultSilenceTimeoutSeconds)
     private var activeRecordingTriggerMode: RecordingTriggerMode?
     private var activeTextInsertionTarget: AppTextInsertionTarget?
     private var insertionAccessibilityCancellable: AnyCancellable?
@@ -866,6 +875,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.realtimeStreamingModel = realtimeStreamingModel
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
+        self.handsFreeSilenceTimeoutSeconds = HandsFreeAutoStop.loadSilenceTimeoutSeconds(from: .standard)
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
         self.cursorFormattingEnabled = CursorFormatting.load(from: .standard)
         self.dictationStyles = StyleCategory.loadStyles(from: .standard)
@@ -1912,6 +1922,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return
         }
 
+        handleShortcutAction(action)
+    }
+
+    private func handleShortcutAction(_ action: DictationShortcutAction) {
         switch action {
         case .start(let mode):
             os_log(.info, log: recordingLog, "Shortcut start fired for mode %{public}@", mode.rawValue)
@@ -1932,6 +1946,26 @@ final class AppState: ObservableObject, @unchecked Sendable {
             } else if pendingShortcutStartMode != nil {
                 pendingShortcutStartMode = .toggle
             }
+        case .stopUnlessRetapped(let deadline):
+            guard isRecording else {
+                // A tap shorter than the start delay stays a no-op, as before.
+                cancelPendingShortcutStart()
+                shortcutSessionController.reset()
+                activeRecordingTriggerMode = nil
+                activeTextInsertionTarget = nil
+                return
+            }
+            scheduleDeferredTapStop(deadline: deadline)
+        case .cancel:
+            os_log(.info, log: recordingLog, "Shortcut cancel fired inside the cancel window")
+            cancelPendingShortcutStart()
+            guard isRecording else {
+                shortcutSessionController.reset()
+                activeRecordingTriggerMode = nil
+                activeTextInsertionTarget = nil
+                return
+            }
+            cancelToggleShortcutSession()
         }
     }
 
@@ -1975,6 +2009,30 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private func handleOverlayStopButtonPressed() {
         guard isRecording, activeRecordingTriggerMode == .toggle else { return }
         stopAndTranscribe()
+    }
+
+    /// Rides the audio-level tick: ends a hands-free session after the silence
+    /// timeout and every session at the 20-minute cap, warning a minute before.
+    private func checkAutomaticStop() {
+        guard isRecording, let mode = activeRecordingTriggerMode else { return }
+        let activity = audioRecorder.currentSpeechActivity
+        switch handsFreeAutoStop.evaluate(
+            mode: mode,
+            elapsedMilliseconds: activity.totalMilliseconds,
+            silenceMilliseconds: activity.silenceMillisecondsSinceLastSpeech
+        ) {
+        case .continueRecording:
+            return
+        case .warn:
+            statusText = HandsFreeAutoStop.warningStatusText
+            playAlertSound(named: "Ping")
+        case .stopForSilence:
+            os_log(.info, log: recordingLog, "hands-free session stopped after silence timeout")
+            stopAndTranscribe()
+        case .stopAtMaximumDuration:
+            os_log(.info, log: recordingLog, "dictation stopped at the maximum duration")
+            stopAndTranscribe()
+        }
     }
 
     private func cancelToggleShortcutSession() {
@@ -2080,6 +2138,19 @@ final class AppState: ObservableObject, @unchecked Sendable {
         pendingManualCommandInvocation = false
         if resetMode {
             pendingShortcutStartMode = nil
+        }
+    }
+
+    /// A quick hold tap keeps recording until `deadline` so a second tap can turn
+    /// it hands-free. The controller answers nil if the session changed meanwhile
+    /// (second tap, Esc, stop, failure), so a stale timer is harmless.
+    private func scheduleDeferredTapStop(deadline: TimeInterval) {
+        let delay = max(0, deadline - Date().timeIntervalSinceReferenceDate)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, let action = self.shortcutSessionController.resolvePendingTapStop(deadline: deadline) else {
+                return
+            }
+            self.handleShortcutAction(action)
         }
     }
 
@@ -2394,6 +2465,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // Keep this recording's display preference fixed, including during startup silence.
         let showsRecordingTimer =
             RecordingTimerPreference.load(from: .standard)
+        handsFreeAutoStop = HandsFreeAutoStop(silenceTimeoutSeconds: handsFreeSilenceTimeoutSeconds)
+        // The cancel and double-tap windows count from here, not from the shortcut press.
+        shortcutSessionController.markRecordingStarted()
 
         let timingGeneration = audioRecorder.prepareRecordingTiming()
 
@@ -2466,7 +2540,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     self.audioLevelCancellable = self.audioRecorder.$audioLevel
                         .receive(on: DispatchQueue.main)
                         .sink { [weak self] level in
-                            self?.overlayManager.updateAudioLevel(level)
+                            guard let self else { return }
+                            self.overlayManager.updateAudioLevel(level)
+                            self.checkAutomaticStop()
                         }
                 }
             } catch {
