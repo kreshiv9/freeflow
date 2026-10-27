@@ -104,7 +104,10 @@ struct SetupView: View {
     @StateObject private var testHotkeyHarness = SetupTestHotkeyHarness()
     @AppStorage("use_compact_overlay") private var useCompactOverlay = true
 
-    private let totalSteps: [SetupStep] = SetupStep.allCases
+    /// Screen Recording is only needed by the legacy screenshot context path.
+    private var totalSteps: [SetupStep] {
+        SetupStep.allCases.filter { $0 != .screenRecording || appState.screenshotContextEnabled }
+    }
     private var isCapturingShortcut: Bool {
         isCapturingHoldShortcut || isCapturingToggleShortcut || isCapturingCopyAgainShortcut
     }
@@ -1179,13 +1182,17 @@ struct SetupView: View {
     }
 
     private func previousStep(_ step: SetupStep) -> SetupStep {
-        let previous = SetupStep(rawValue: step.rawValue - 1)
-        return previous ?? .welcome
+        guard let index = totalSteps.firstIndex(of: step), index > 0 else {
+            return SetupStep(rawValue: step.rawValue - 1) ?? .welcome
+        }
+        return totalSteps[index - 1]
     }
 
     private func nextStep(_ step: SetupStep) -> SetupStep {
-        let next = SetupStep(rawValue: step.rawValue + 1)
-        return next ?? .ready
+        guard let index = totalSteps.firstIndex(of: step), index + 1 < totalSteps.count else {
+            return SetupStep(rawValue: step.rawValue + 1) ?? .ready
+        }
+        return totalSteps[index + 1]
     }
 
     func checkMicPermission() {
