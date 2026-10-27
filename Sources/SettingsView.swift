@@ -1309,6 +1309,16 @@ struct GeneralSettingsView: View {
             Text("Matches Wispr Flow: in ChatGPT, Claude, Perplexity and similar AI chats the transcript is pasted without cleanup (voice macros and Corrections still apply) so your prompt stays as spoken. Terminals and code editors still get cleanup.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            Divider()
+                .padding(.vertical, 2)
+
+            Toggle("Match capitalization and spacing at the cursor", isOn: $appState.cursorFormattingEnabled)
+                .disabled(!appState.contextAwarenessEnabled || appState.screenshotContextEnabled)
+
+            Text("Fits the dictation into the text around your cursor: lowercase and a space mid-sentence, a capital after a period, no stray period when the sentence continues. Needs the app to expose its text (not all do). Uses the text that Context awareness reads, so it needs that setting on and is unavailable with the legacy screenshot context.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

@@ -51,6 +51,9 @@ struct TextContextSnapshot: Equatable, Sendable {
     var textAfterCursor: String?
     var nearbyText: String?
     var omission: TextContextOmission?
+    /// True once the field's text was read, even when every slice came back empty, so an
+    /// empty field is told apart from one that could not be read.
+    var fieldTextRead = false
 }
 
 struct CursorTextSlices: Equatable {
