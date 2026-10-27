@@ -516,6 +516,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Skip the provider round trip when the recorder heard no speech. On by default.
+    @Published var silenceGateEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(silenceGateEnabled, forKey: SilenceGatePreference.storageKey)
+        }
+    }
+
     @Published var originalFieldInsertionEnabled: Bool {
         didSet {
             UserDefaults.standard.set(originalFieldInsertionEnabled, forKey: OriginalFieldInsertionPreference.storageKey)
@@ -831,6 +838,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.realtimeStreamingEnabled = realtimeStreamingEnabled
         self.realtimeStreamingModel = realtimeStreamingModel
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
+        self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
         self.isPressEnterVoiceCommandEnabled = isPressEnterVoiceCommandEnabled
         self.alertSoundsEnabled = alertSoundsEnabled
         self.soundVolume = soundVolume
@@ -2764,7 +2772,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         errorMessage = nil
         playAlertSound(named: "Pop")
         overlayManager.showTranscribing()
-        audioRecorder.stopRecording { [weak self] fileURL in
+        audioRecorder.stopRecording { [weak self] fileURL, speechActivity in
             guard let self else { return }
             guard let fileURL else {
                 self.isTranscribing = false
@@ -2814,10 +2822,40 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 self.refreshAvailableMicrophonesIfNeeded()
                 return
             }
+            let silenceGateEnabled = self.silenceGateEnabled
             self.transcriptionTask = Task {
                 var stageMarks = PipelineStageTimings.Marks(stopRequested: stopRequestedAt, audioReady: audioReadyAt)
                 defer {
                     activeRealtime?.cancel()
+                }
+                if SilenceGatePreference.shouldSkipTranscription(enabled: silenceGateEnabled, speechActivity: speechActivity) {
+                    // The context only annotates the Run Log row here, so both
+                    // modes get the short text-context wait rather than the
+                    // screenshot path's LLM summary, resolved off the main thread
+                    // like every other stop path. A capture that is still
+                    // running afterwards leaves the row without a summary (no
+                    // post-processing ran, so the text-only fallback wording
+                    // would be wrong) and is cancelled so it cannot publish
+                    // over the gated row.
+                    let gateContext = await self.resolveSessionContext(
+                        captured: sessionContext,
+                        inFlight: inFlightContextTask,
+                        waitsForScreenshotContext: false,
+                        fallbackActivity: ""
+                    )
+                    inFlightContextTask?.cancel()
+                    // Immutable snapshot: the @Sendable MainActor closure must not capture the mutable marks.
+                    let gateMarks = stageMarks
+                    await MainActor.run {
+                        self.completeSilentDictation(
+                            speechActivity: speechActivity,
+                            savedAudioFile: savedAudioFile,
+                            context: gateContext,
+                            intent: sessionIntent,
+                            stageMarks: gateMarks
+                        )
+                    }
+                    return
                 }
                 do {
                     let transcriptionService = try self.makeTranscriptionService()
@@ -3030,6 +3068,67 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Ends a dictation whose audio never contained speech without contacting
+    /// the provider. Mirrors the empty-transcript branch of stopAndTranscribe:
+    /// the saved WAV stays attached to the Run Log row, the overlay is
+    /// dismissed the same way and the status resets after a few seconds.
+    @MainActor
+    private func completeSilentDictation(
+        speechActivity: SpeechActivityTracker,
+        savedAudioFile: SavedAudioFile?,
+        context: AppContext,
+        intent: SessionIntent,
+        stageMarks: PipelineStageTimings.Marks
+    ) {
+        guard isTranscribing else { return }
+        os_log(
+            .info,
+            log: recordingLog,
+            "silence gate: skipping transcription (%.0f ms speech in %.0f ms of audio, peak rms=%.4f)",
+            speechActivity.speechMilliseconds,
+            speechActivity.totalMilliseconds,
+            Double(speechActivity.peakRMS)
+        )
+        let status = SilenceGatePreference.skippedStatusText
+        let processingStatus = SilenceGatePreference.skippedProcessingStatus
+        transcriptionTask = nil
+        transcribingAudioFileName = nil
+        debugStatusMessage = status
+        lastContextSummary = context.contextSummary
+        lastContextScreenshotDataURL = context.screenshotDataURL
+        lastContextScreenshotStatus = context.screenshotError
+            ?? "available (\(context.screenshotMimeType ?? "image"))"
+        lastContextAppName = context.appName ?? ""
+        lastContextBundleIdentifier = context.bundleIdentifier ?? ""
+        lastContextWindowTitle = context.windowTitle ?? ""
+        lastContextSelectedText = context.selectedText ?? ""
+        lastContextLLMPrompt = context.contextPrompt ?? ""
+        lastPostProcessingStatus = processingStatus
+        recordPipelineHistoryEntry(
+            rawTranscript: "",
+            postProcessedTranscript: "",
+            postProcessingPrompt: "",
+            systemPrompt: Self.resolvedSystemPrompt(customSystemPrompt),
+            context: context,
+            processingStatus: processingStatus,
+            intent: intent,
+            audioFileName: savedAudioFile?.fileName,
+            stageTimings: stageMarks.timings
+        )
+        completeStageTimings(stageMarks.timings, entryID: nil)
+        lastTranscript = ""
+        isTranscribing = false
+        endCriticalDictationActivity()
+        statusText = status
+        clearPendingOverlayDismissToken()
+        if !showPostTranscriptionUpdateReminderIfNeeded() {
+            overlayManager.dismiss()
+        }
+        audioRecorder.cleanup()
+        refreshAvailableMicrophonesIfNeeded()
+        scheduleReadyStatusReset(after: 3, matching: [status])
+    }
+
     static func resolvedSystemPrompt(_ customSystemPrompt: String) -> String {
         customSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? PostProcessingService.defaultSystemPrompt
@@ -3138,11 +3237,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// Text context never delays a dictation: if it is not ready shortly after the transcript,
     /// cleanup proceeds without it. The legacy screenshot path keeps waiting for its summary.
     private static let textContextStopWaitSeconds: TimeInterval = 0.1
+    /// Summary recorded when the capture had not finished by stop time and
+    /// post-processing went ahead on text only; ContextInferenceFailure keeps it
+    /// out of prompts. The silence gate records an empty summary instead.
+    private static let contextNotRefreshedAtStopActivity =
+        "Could not refresh app context at stop time; using text-only post-processing."
 
     private func resolveSessionContext(
         captured: AppContext?,
         inFlight: Task<AppContext?, Never>?,
-        waitsForScreenshotContext: Bool
+        waitsForScreenshotContext: Bool,
+        fallbackActivity: String = AppState.contextNotRefreshedAtStopActivity
     ) async -> AppContext {
         if let captured { return captured }
         if let inFlight {
@@ -3151,7 +3256,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 : await TextContextCore.firstValue(of: inFlight, within: Self.textContextStopWaitSeconds)
             if let context { return context }
         }
-        return fallbackContextAtStop()
+        return fallbackContextAtStop(currentActivity: fallbackActivity)
     }
 
     private func startContextCapture() {
@@ -3171,7 +3276,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
             let context = usesScreenshotContext
                 ? await self.contextService.collectContext()
                 : self.contextService.collectTextContext(readFieldText: readsFieldText)
+            // A cancelled capture (the session was aborted, or ended without
+            // speech) must not publish over the state that replaced it.
+            guard !Task.isCancelled else { return nil }
             await MainActor.run {
+                guard !Task.isCancelled else { return }
                 self.capturedContext = context
                 self.lastContextSummary = context.contextSummary
                 self.lastContextScreenshotDataURL = context.screenshotDataURL
@@ -3191,7 +3300,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func fallbackContextAtStop() -> AppContext {
+    private func fallbackContextAtStop(currentActivity: String) -> AppContext {
         let frontmostApp = NSWorkspace.shared.frontmostApplication
         let windowTitle = focusedWindowTitle(for: frontmostApp)
         return AppContext(
@@ -3199,7 +3308,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             bundleIdentifier: frontmostApp?.bundleIdentifier,
             windowTitle: windowTitle,
             selectedText: nil,
-            currentActivity: "Could not refresh app context at stop time; using text-only post-processing.",
+            currentActivity: currentActivity,
             contextSystemPrompt: resolvedContextSystemPrompt(),
             contextPrompt: nil,
             screenshotDataURL: nil,
