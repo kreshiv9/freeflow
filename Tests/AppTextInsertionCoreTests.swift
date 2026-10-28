@@ -16,6 +16,7 @@ enum AppTextInsertionCoreTests {
         testDelayedWriteSequences()
         testPasteRequiresStableFocusedTarget()
         testPasteRestoresExactSelectionOnce()
+        testWholeFieldReplaceVerification()
     }
 
     private static func testCaptureRoleEligibility() {
@@ -622,6 +623,159 @@ enum AppTextInsertionCoreTests {
         TestSupport.expect(didPaste, "A stable focused target should allow paste")
         TestSupport.expectEqual(restoredRanges, [originalRange])
         TestSupport.expectEqual(pasteCount, 1)
+    }
+
+    /// A whole-field Edit Mode write goes through the same snapshot and readback checks as a
+    /// range insert: a field edited since capture is refused before any write. The select-all
+    /// step is undone for a refused or unverified write while the value is still the capture,
+    /// so the user's next keystroke cannot wipe the field.
+    private static func testWholeFieldReplaceVerification() {
+        let capturedValue = "synthetic draft"
+        let capturedCaret = NSRange(location: 4, length: 0)
+
+        var editedWrites = 0
+        var editedCursorMoves = 0
+        let refused = AppTextInsertionCore.replaceAll(
+            "rewritten",
+            capturedValue: capturedValue,
+            capturedSelection: capturedCaret,
+            readValue: { "synthetic draft edited" },
+            replaceText: { _, _, _ in editedWrites += 1; return true },
+            placeCursor: { _ in editedCursorMoves += 1 },
+            restoreSelection: { _ in TestSupport.expect(false, "An edited field is never touched again") }
+        )
+        TestSupport.expectEqual(refused, .unavailable)
+        TestSupport.expectEqual(editedWrites, 0)
+        TestSupport.expectEqual(editedCursorMoves, 0)
+
+        var value: String? = capturedValue
+        var writes = 0
+        var cursorRanges: [NSRange] = []
+        let verified = AppTextInsertionCore.replaceAll(
+            "rewritten",
+            capturedValue: capturedValue,
+            capturedSelection: capturedCaret,
+            readValue: { value },
+            replaceText: { range, text, expectedValue in
+                TestSupport.expectEqual(range, NSRange(location: 0, length: 15))
+                TestSupport.expectEqual(text, "rewritten")
+                TestSupport.expectEqual(expectedValue, "rewritten")
+                writes += 1
+                value = expectedValue
+                return true
+            },
+            placeCursor: { cursorRanges.append($0) },
+            restoreSelection: { _ in TestSupport.expect(false, "A verified write keeps its new cursor") }
+        )
+        TestSupport.expectEqual(verified, .inserted)
+        TestSupport.expectEqual(writes, 1)
+        TestSupport.expectEqual(cursorRanges, [NSRange(location: 9, length: 0)])
+        TestSupport.expectEqual(value, "rewritten")
+
+        // An acknowledged write whose readback differs leaves whatever the editor did alone.
+        var mismatchedValue: String? = capturedValue
+        let mismatched = AppTextInsertionCore.replaceAll(
+            "rewritten",
+            capturedValue: capturedValue,
+            capturedSelection: capturedCaret,
+            readValue: { mismatchedValue },
+            replaceText: { _, _, _ in mismatchedValue = "rewritten!"; return true },
+            placeCursor: { _ in TestSupport.expect(false, "Unverified whole-field writes must not move the caret") },
+            restoreSelection: { _ in TestSupport.expect(false, "A changed field must not have its selection reset") }
+        )
+        TestSupport.expectEqual(mismatched, .unverified)
+
+        // An acknowledged write that has not shown up yet still reads as the capture: the
+        // select-all comes back to the captured caret.
+        var restoredAfterLag: [NSRange] = []
+        let lagging = AppTextInsertionCore.replaceAll(
+            "rewritten",
+            capturedValue: capturedValue,
+            capturedSelection: capturedCaret,
+            readValue: { capturedValue },
+            replaceText: { _, _, _ in true },
+            placeCursor: { _ in TestSupport.expect(false, "Unverified whole-field writes must not move the caret") },
+            restoreSelection: { restoredAfterLag.append($0) }
+        )
+        TestSupport.expectEqual(lagging, .unverified)
+        TestSupport.expectEqual(restoredAfterLag, [capturedCaret])
+
+        var restoredAfterRefusal: [NSRange] = []
+        let refusedByApp = AppTextInsertionCore.replaceAll(
+            "rewritten",
+            capturedValue: capturedValue,
+            capturedSelection: capturedCaret,
+            readValue: { capturedValue },
+            replaceText: { _, _, _ in false },
+            placeCursor: { _ in TestSupport.expect(false, "A refused whole-field write must not move the caret") },
+            restoreSelection: { restoredAfterRefusal.append($0) }
+        )
+        TestSupport.expectEqual(refusedByApp, .notInserted)
+        TestSupport.expectEqual(restoredAfterRefusal, [capturedCaret])
+
+        // Without a captured selection the field collapses to a caret at its start.
+        var restoredWithoutCaret: [NSRange] = []
+        let refusedWithoutCaret = AppTextInsertionCore.replaceAll(
+            "rewritten",
+            capturedValue: capturedValue,
+            capturedSelection: nil,
+            readValue: { capturedValue },
+            replaceText: { _, _, _ in false },
+            placeCursor: { _ in },
+            restoreSelection: { restoredWithoutCaret.append($0) }
+        )
+        TestSupport.expectEqual(refusedWithoutCaret, .notInserted)
+        TestSupport.expectEqual(restoredWithoutCaret, [NSRange(location: 0, length: 0)])
+
+        let uncaptured = AppTextInsertionCore.replaceAll(
+            "rewritten",
+            capturedValue: nil,
+            capturedSelection: nil,
+            readValue: { "synthetic draft" },
+            replaceText: { _, _, _ in TestSupport.expect(false, "Nothing may be written without a captured value"); return true },
+            placeCursor: { _ in },
+            restoreSelection: { _ in TestSupport.expect(false, "Nothing was selected without a captured value") }
+        )
+        TestSupport.expectEqual(uncaptured, .unavailable)
+
+        let emojiValue = "one 🧪 two"
+        TestSupport.expectEqual(AppTextInsertionCore.fullRange(of: emojiValue), NSRange(location: 0, length: 10))
+        var emojiCurrent: String? = emojiValue
+        var emojiCursorRanges: [NSRange] = []
+        let emojiReplaced = AppTextInsertionCore.replaceAll(
+            "🦊 three",
+            capturedValue: emojiValue,
+            capturedSelection: NSRange(location: 10, length: 0),
+            readValue: { emojiCurrent },
+            replaceText: { range, _, expectedValue in
+                TestSupport.expectEqual(range, NSRange(location: 0, length: 10))
+                emojiCurrent = expectedValue
+                return true
+            },
+            placeCursor: { emojiCursorRanges.append($0) },
+            restoreSelection: { _ in TestSupport.expect(false, "A verified write keeps its new cursor") }
+        )
+        TestSupport.expectEqual(emojiReplaced, .inserted)
+        TestSupport.expectEqual(emojiCurrent, "🦊 three")
+        TestSupport.expectEqual(emojiCursorRanges, [NSRange(location: ("🦊 three" as NSString).length, length: 0)])
+
+        // A blurred web editor is refused before select-all; restoring the capture is then a no-op.
+        var unfocusedWrites = 0
+        var restoredWhileBlurred: [NSRange] = []
+        let unfocused = AppTextInsertionCore.replaceAll(
+            "rewritten",
+            capturedValue: capturedValue,
+            capturedSelection: capturedCaret,
+            requiresFocus: true,
+            isTargetFocused: { false },
+            readValue: { capturedValue },
+            replaceText: { _, _, _ in unfocusedWrites += 1; return true },
+            placeCursor: { _ in },
+            restoreSelection: { restoredWhileBlurred.append($0) }
+        )
+        TestSupport.expectEqual(unfocused, .notInserted)
+        TestSupport.expectEqual(unfocusedWrites, 0)
+        TestSupport.expectEqual(restoredWhileBlurred, [capturedCaret])
     }
 
     private static func expectUnavailable(

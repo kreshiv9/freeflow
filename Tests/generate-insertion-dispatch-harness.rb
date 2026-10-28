@@ -13,6 +13,7 @@ lines = source.lines
 method_names = %w[
   prepareForegroundApplicationForInsertion
   insertTranscriptWhenShortcutReleased
+  replaceWholeFieldWhenShortcutReleased
   performAtTarget
   sameAccessibilityElement
   pressEnterAfterPaste
@@ -81,6 +82,12 @@ generated = <<~SWIFT
               transcript, target: target, shouldPressEnter: shouldPressEnter, useOriginalField: useOriginalField,
               appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark
           )
+      }
+
+      func testDispatchWholeFieldReplacement(
+          _ text: String, target: TestInsertionTarget, shouldPressEnter: Bool
+      ) {
+          replaceWholeFieldWhenShortcutReleased(text, target: target, shouldPressEnter: shouldPressEnter)
       }
 
       func testPerformAtTarget(
