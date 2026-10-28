@@ -203,6 +203,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let transcriptionModelStorageKey = "transcription_model"
     private let transcriptionAPIURLStorageKey = "transcription_api_url"
     private let transcriptionAPIKeyStorageKey = "transcription_api_key"
+    private let deepgramAPIKeyStorageKey = "deepgram_api_key"
     private let postProcessingModelStorageKey = "post_processing_model"
     private let postProcessingFallbackModelStorageKey = "post_processing_fallback_model"
     private let contextModelStorageKey = "context_model"
@@ -232,7 +233,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let commandModeStyleStorageKey = "command_mode_style"
     private let commandModeManualModifierStorageKey = "command_mode_manual_modifier"
     private let outputLanguageStorageKey = "output_language"
-    private let realtimeStreamingEnabledStorageKey = "realtime_streaming_enabled"
     private let realtimeStreamingModelStorageKey = "realtime_streaming_model"
     private let dictationAudioInterruptionEnabledStorageKey = "dictation_audio_interruption_enabled"
     private let pasteAfterShortcutReleaseDelay: TimeInterval = 0.03
@@ -317,6 +317,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
             guard !isApplyingAPIConfiguration else { return }
             persistOptionalAPIValue(transcriptionAPIKey, account: transcriptionAPIKeyStorageKey)
         }
+    }
+
+    /// Deepgram key for the streaming provider; separate from the OpenAI-compatible key pair.
+    @Published var deepgramAPIKey: String {
+        didSet { persistOptionalAPIValue(deepgramAPIKey, account: deepgramAPIKeyStorageKey) }
     }
 
     // Publish only after the complete configuration transaction has persisted.
@@ -488,14 +493,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Stream audio to the transcription backend during recording via the
-    /// OpenAI Realtime WebSocket. Reduces wall-clock latency between "stop"
-    /// and text-ready because most of the transcription work happens while
-    /// the user is still speaking.
-    @Published var realtimeStreamingEnabled: Bool {
-        didSet {
-            UserDefaults.standard.set(realtimeStreamingEnabled, forKey: realtimeStreamingEnabledStorageKey)
-        }
+    /// Which service, if any, hears audio while the shortcut is held. Both streaming paths
+    /// cut the wall-clock time between "stop" and text-ready because most transcription
+    /// work happens while the user is still speaking; `.off` uploads the file after release.
+    @Published var streamingProvider: StreamingTranscriptionProvider {
+        didSet { streamingProvider.save(to: .standard) }
     }
 
     /// Model ID the realtime WebSocket should transcribe with. Empty means
@@ -706,7 +708,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var pendingManualCommandInvocation = false
     private var pendingShortcutStartTask: Task<Void, Never>?
     private var pendingShortcutStartMode: RecordingTriggerMode?
-    private var realtimeService: RealtimeTranscriptionService?
+    /// The active streaming session (OpenAI Realtime or Deepgram); nil when streaming is off or failed to start.
+    private var realtimeService: StreamingTranscriptionSession?
     private var automaticTerminationDisabled = false
     private var activeAudioInterruption: ActiveAudioInterruption?
     private var pendingOverlayDismissToken: UUID?
@@ -730,6 +733,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let transcriptionModel = UserDefaults.standard.string(forKey: transcriptionModelStorageKey) ?? Self.defaultTranscriptionModel
         let transcriptionAPIURL = Self.loadOptionalStoredAPIValue(account: transcriptionAPIURLStorageKey)
         let transcriptionAPIKey = Self.loadStoredAPIKey(account: transcriptionAPIKeyStorageKey)
+        let deepgramAPIKey = Self.loadOptionalStoredAPIValue(account: deepgramAPIKeyStorageKey)
         let postProcessingModel = UserDefaults.standard.string(forKey: postProcessingModelStorageKey) ?? Self.defaultPostProcessingModel
         let postProcessingFallbackModel = Self.loadStoredPostProcessingFallbackModel(
             key: postProcessingFallbackModelStorageKey
@@ -785,7 +789,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
             ? true
             : UserDefaults.standard.bool(forKey: preserveClipboardStorageKey)
         let keepDictationInClipboardHistory = UserDefaults.standard.bool(forKey: keepDictationInClipboardHistoryStorageKey)
-        let realtimeStreamingEnabled = UserDefaults.standard.bool(forKey: realtimeStreamingEnabledStorageKey)
         let realtimeStreamingModel = UserDefaults.standard.string(forKey: realtimeStreamingModelStorageKey) ?? ""
         let dictationAudioInterruptionEnabled = UserDefaults.standard.bool(
             forKey: dictationAudioInterruptionEnabledStorageKey
@@ -835,6 +838,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.apiBaseURL = apiBaseURL
         self.transcriptionAPIURL = transcriptionAPIURL
         self.transcriptionAPIKey = transcriptionAPIKey
+        self.deepgramAPIKey = deepgramAPIKey
         self.committedAPIConfiguration = ValidatedAPIConfiguration(
             apiKey: apiKey,
             baseURL: apiBaseURL,
@@ -871,7 +875,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.preserveClipboard = preserveClipboard
         self.cleanupLevel = CleanupLevel.load(from: .standard)
         self.keepDictationInClipboardHistory = keepDictationInClipboardHistory
-        self.realtimeStreamingEnabled = realtimeStreamingEnabled
+        self.streamingProvider = StreamingTranscriptionProvider.load(from: .standard)
         self.realtimeStreamingModel = realtimeStreamingModel
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
@@ -2525,7 +2529,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
         }
 
-        startRealtimeStreamingIfEnabled()
+        startStreamingIfEnabled()
 
         // Start engine on background thread so UI isn't blocked
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -2927,13 +2931,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Await the realtime WebSocket's final transcript. If it errors out (or
+    /// Await the streaming session's final transcript. If it errors out (or
     /// was never started) fall back to the file-based POST so the user still
-    /// gets a transcript. Runs the realtime commit and file upload in that
-    /// strict order to avoid paying for both when realtime succeeds. Reports
+    /// gets a transcript. Runs the streaming commit and file upload in that
+    /// strict order to avoid paying for both when streaming succeeds. Reports
     /// which path produced the transcript so stage timings can record it.
     private static func resolveRawTranscript(
-        realtimeService: RealtimeTranscriptionService?,
+        realtimeService: StreamingTranscriptionSession?,
         fileService: TranscriptionService,
         fileURL: URL
     ) async throws -> (transcript: String, source: String) {
@@ -2945,7 +2949,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 } onCancel: {
                     realtimeService.cancel()
                 }
-                return (text, PipelineStageTimings.realtimeTranscriptionSource)
+                return (text, realtimeService.transcriptionSource)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -3001,6 +3005,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             guard let self else { return }
             guard let fileURL else {
                 self.isTranscribing = false
+                self.tearDownRealtimeService()
                 self.audioRecorder.cleanup()
                 self.endCriticalDictationActivity()
                 self.errorMessage = "No audio recorded"
@@ -3472,12 +3477,43 @@ final class AppState: ObservableObject, @unchecked Sendable {
         os_log(.info, log: recordingLog, "stage timings: %{public}@", timings.summaryLine)
     }
 
-    private func startRealtimeStreamingIfEnabled() {
-        guard realtimeStreamingEnabled else { return }
+    private func startStreamingIfEnabled() {
+        // A session left over from a stop path that never reached the pipeline
+        // must not keep receiving this recording's PCM16, whatever the picker says now.
+        tearDownRealtimeService()
+        let service: StreamingTranscriptionSession
+        switch streamingProvider {
+        case .off:
+            return
+        case .openAIRealtime:
+            guard let realtime = makeRealtimeStreamingService() else { return }
+            service = realtime
+        case .deepgram:
+            guard let deepgram = makeDeepgramStreamingService() else { return }
+            service = deepgram
+        }
+        do {
+            try service.start()
+        } catch {
+            os_log(
+                .error, log: recordingLog,
+                "failed to start %{public}@ streaming: %{public}@",
+                service.transcriptionSource, error.localizedDescription
+            )
+            return
+        }
+        realtimeService = service
+        audioRecorder.onPCM16Samples = { [weak service] data in
+            service?.appendPCM16(data)
+        }
+    }
+
+    /// Nil when the base URL is empty.
+    private func makeRealtimeStreamingService() -> RealtimeTranscriptionService? {
         let trimmedBase = resolvedTranscriptionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedBase.isEmpty else {
             os_log(.info, log: recordingLog, "realtime streaming requested but base URL is empty — skipping")
-            return
+            return nil
         }
         let model = realtimeStreamingModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let config = RealtimeTranscriptionService.Configuration(
@@ -3486,17 +3522,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
             model: model,
             language: resolvedTranscriptionLanguage
         )
-        let service = RealtimeTranscriptionService(config: config)
-        do {
-            try service.start()
-        } catch {
-            os_log(.error, log: recordingLog, "failed to start realtime service: %{public}@", error.localizedDescription)
-            return
+        return RealtimeTranscriptionService(config: config)
+    }
+
+    /// Nil without a key: the dictation then takes the file-upload path (Settings shows the same warning).
+    private func makeDeepgramStreamingService() -> DeepgramStreamingService? {
+        let key = deepgramAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            os_log(.info, log: recordingLog, "deepgram streaming selected but no API key is set — using file upload")
+            return nil
         }
-        realtimeService = service
-        audioRecorder.onPCM16Samples = { [weak service] data in
-            service?.appendPCM16(data)
-        }
+        let vocabulary = DictionaryCorrection.vocabularyText(customVocabulary, merging: dictionaryCorrections)
+        let config = DeepgramStreamingCore.Configuration(
+            apiKey: key,
+            language: resolvedTranscriptionLanguage,
+            sampleRate: AudioRecorder.pcm16StreamSampleRate,
+            keyterms: DeepgramStreamingCore.keyterms(fromVocabularyText: vocabulary)
+        )
+        return DeepgramStreamingService(config: config)
     }
 
     private func tearDownRealtimeService() {

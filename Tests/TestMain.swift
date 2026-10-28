@@ -12,6 +12,7 @@ struct FreeFlowTests {
         PipelineStageTimingsTests.run()
         RecordingTimerPreferenceTests.run()
         SilenceGatePreferenceTests.run()
+        StreamingTranscriptionProviderTests.run()
         HandsFreeAutoStopTests.run()
         AIAppRawTranscriptPreferenceTests.run()
         CleanupLevelTests.run()
@@ -30,6 +31,7 @@ struct FreeFlowTests {
         AppTextInsertionDispatchTests.run()
         await TextContextCoreTests.run()
         await TranscriptionServiceTests.run()
+        await DeepgramStreamingCoreTests.run()
         await APIConfigurationDraftTests.run()
         print("FreeFlowTests passed")
     }

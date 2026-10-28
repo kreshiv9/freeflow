@@ -117,7 +117,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private let pcm16TargetFormat: AVAudioFormat = {
         AVAudioFormat(
             commonFormat: .pcmFormatInt16,
-            sampleRate: 24_000,
+            sampleRate: Double(AudioRecorder.pcm16StreamSampleRate),
             channels: 1,
             interleaved: true
         )!
@@ -126,6 +126,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private var failureReported = false
     private static let watchdogTimeout: TimeInterval = 2.0
     private static let sampleRateLogLimit = 40
+    /// Rate of the chunks `onPCM16Samples` delivers; streaming sessions declare it to their provider.
+    static let pcm16StreamSampleRate = 24_000
 
     override init() {
         super.init()

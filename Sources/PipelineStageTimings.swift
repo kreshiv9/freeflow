@@ -7,10 +7,11 @@ import Foundation
 struct PipelineStageTimings: Codable, Equatable, Sendable {
     static let realtimeTranscriptionSource = "realtime"
     static let fileTranscriptionSource = "file"
+    static let deepgramTranscriptionSource = "deepgram"
 
     /// Shortcut release until the audio file is ready for transcription.
     var audioFinalizeMilliseconds: Int? = nil
-    /// Duration of resolveRawTranscript (realtime commit or file upload).
+    /// Duration of resolveRawTranscript (streaming commit or file upload).
     var transcriptionMilliseconds: Int? = nil
     /// Which transcription path produced the transcript; nil when it never completed.
     var transcriptionSource: String? = nil

@@ -23,6 +23,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/CleanupLevel.swift \
 	Sources/ContextInferenceFailure.swift \
 	Sources/CursorFormatting.swift \
+	Sources/DeepgramStreamingCore.swift \
 	Sources/DictationStyle.swift \
 	Sources/DictionaryCorrections.swift \
 	Sources/HandsFreeAutoStop.swift \
@@ -38,6 +39,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/SilenceGatePreference.swift \
 	Sources/SnippetExpansion.swift \
 	Sources/SpeechActivityTracker.swift \
+	Sources/StreamingTranscriptionProvider.swift \
 	Sources/TranscriptionErrorPresentationCore.swift \
 	Sources/TranscriptTextCore.swift \
 	Sources/TemperatureCapabilityCache.swift \
