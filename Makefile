@@ -46,6 +46,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/TemperatureCapabilityCache.swift \
 	Sources/TextContextCore.swift \
 	Sources/TranscriptionService.swift \
+	Sources/TransformCore.swift \
+	Sources/TransformService.swift \
 	Sources/UpdateManager.swift \
 	Sources/WordBoundedText.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \

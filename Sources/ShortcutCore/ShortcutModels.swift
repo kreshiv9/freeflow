@@ -52,16 +52,56 @@ enum RecordingTriggerMode: String, Codable {
     }
 }
 
-enum ShortcutRole {
+/// Which transform a tap shortcut runs. Custom prompts are keyed by their record's UUID.
+enum TransformID: Hashable {
+    case polish
+    case promptEngineer
+    case custom(UUID)
+
+    /// Stable order for the matcher's emitted events (dictionary iteration order is not).
+    var sortKey: String {
+        switch self {
+        case .polish: return "0"
+        case .promptEngineer: return "1"
+        case .custom(let id): return "2:" + id.uuidString
+        }
+    }
+}
+
+enum ShortcutRole: Equatable {
     case hold
     case toggle
     case copyAgain
+    case polishTransform
+    case promptEngineerTransform
+    case customTransform(UUID)
+
+    init(transformID: TransformID) {
+        switch transformID {
+        case .polish: self = .polishTransform
+        case .promptEngineer: self = .promptEngineerTransform
+        case .custom(let id): self = .customTransform(id)
+        }
+    }
 
     var title: String {
         switch self {
         case .hold: return "Hold to Talk"
         case .toggle: return "Tap to Toggle"
         case .copyAgain: return "Paste Again"
+        case .polishTransform: return "Polish"
+        case .promptEngineerTransform: return "Prompt Engineer"
+        // The custom prompt's name is shown by its editor, not the role.
+        case .customTransform: return "Shortcut"
+        }
+    }
+
+    var transformID: TransformID? {
+        switch self {
+        case .hold, .toggle, .copyAgain: return nil
+        case .polishTransform: return .polish
+        case .promptEngineerTransform: return .promptEngineer
+        case .customTransform(let id): return .custom(id)
         }
     }
 }
@@ -72,24 +112,37 @@ enum ShortcutEvent: Equatable {
     case toggleActivated
     case toggleDeactivated
     case copyAgainTriggered
+    case transformTriggered(TransformID)
 }
 
 struct ShortcutConfiguration: Equatable {
     let hold: ShortcutBinding
     let toggle: ShortcutBinding
     let copyAgain: ShortcutBinding
+    let transforms: [TransformID: ShortcutBinding]
     let permittedAdditionalExactMatchModifiers: ShortcutModifiers
 
     init(
         hold: ShortcutBinding,
         toggle: ShortcutBinding,
         copyAgain: ShortcutBinding = .disabled,
+        transforms: [TransformID: ShortcutBinding] = [:],
         permittedAdditionalExactMatchModifiers: ShortcutModifiers = []
     ) {
         self.hold = hold
         self.toggle = toggle
         self.copyAgain = copyAgain
+        self.transforms = transforms
         self.permittedAdditionalExactMatchModifiers = permittedAdditionalExactMatchModifiers
+    }
+
+    /// The transform bindings in `sortKey` order, so emitted events and consume checks are deterministic.
+    var orderedTransforms: [(id: TransformID, binding: ShortcutBinding)] {
+        transforms.sorted { $0.key.sortKey < $1.key.sortKey }.map { (id: $0.key, binding: $0.value) }
+    }
+
+    var allBindings: [ShortcutBinding] {
+        [hold, toggle, copyAgain] + orderedTransforms.map(\.binding)
     }
 
     static let disabled = ShortcutConfiguration(hold: .disabled, toggle: .disabled, copyAgain: .disabled)
@@ -343,6 +396,29 @@ struct ShortcutBinding: Codable, Hashable, Identifiable, Equatable {
     )
     static let defaultHold = ShortcutPreset.fnKey.binding
     static let defaultToggle = ShortcutPreset.fnKey.binding.withAddedModifiers(.command)
+    /// Ctrl+Option+1 / +2 with exactModifierKeyCodes {59, 62, 58, 61}: either Ctrl/Option side, no extra
+    /// modifier; displayName renders "Ctrl ⌃ + Option ⌥ + 1". Key codes per ShortcutBinding.swift (18: "1", 19: "2").
+    static let defaultPolishTransform = ShortcutBinding(
+        keyCode: 18,
+        keyDisplay: "1",
+        modifiers: [.control, .option],
+        kind: .key,
+        preset: nil,
+        exactModifierKeyCodes: exactModifierKeyCodesPreservingSides(for: [.control, .option])
+    )
+    static let defaultPromptEngineerTransform = ShortcutBinding(
+        keyCode: 19,
+        keyDisplay: "2",
+        modifiers: [.control, .option],
+        kind: .key,
+        preset: nil,
+        exactModifierKeyCodes: exactModifierKeyCodesPreservingSides(for: [.control, .option])
+    )
+
+    /// A built-in transform default that conflicts with any reserved binding resolves to Disabled.
+    static func transformDefault(_ candidate: ShortcutBinding, avoiding reserved: [ShortcutBinding]) -> ShortcutBinding {
+        reserved.contains { candidate.conflicts(with: $0) } ? .disabled : candidate
+    }
 
     static let modifierKeyCodes: Set<UInt16> = [54, 55, 56, 58, 59, 60, 61, 62, 63]
 

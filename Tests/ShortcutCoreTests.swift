@@ -27,6 +27,224 @@ enum ShortcutCoreTests {
         testToggleShortcutEndPressDoesNotStartHoldSession()
         testHoldShortcutEndPressSwallowsAddedToggleActivation()
         testWindowsCountFromRecordingStart()
+        testTransformFiresOnLeadingEdgeOnly()
+        testTransformDefaultsRequireExactModifiers()
+        testTransformInputsHoldTheReleaseGate()
+        testTransformConflictDetection()
+        testTransformDefaultsSkippedOnConflict()
+        testSessionControllerIgnoresTransformEvents()
+    }
+
+    // MARK: - Transforms
+
+    private static let f5Binding = ShortcutBinding(
+        keyCode: 96,
+        keyDisplay: "F5",
+        modifiers: [],
+        kind: .key,
+        preset: nil
+    )
+
+    /// A captured Ctrl+Option+1, as the Settings capture row produces it.
+    private static let capturedControlOptionOne = ShortcutBinding(
+        keyCode: 18,
+        keyDisplay: "1",
+        modifiers: [.control, .option],
+        kind: .key,
+        preset: nil,
+        exactModifierKeyCodes: [59, 58]
+    )
+
+    /// Presses the given modifier key codes, then the key, and returns the key-down result.
+    private static func pressKey(
+        _ keyCode: UInt16,
+        withModifierKeyCodes modifierKeyCodes: [UInt16],
+        configuration: ShortcutConfiguration
+    ) -> ShortcutMatchResult {
+        var state = ShortcutInputState()
+        for modifierKeyCode in modifierKeyCodes {
+            state = ShortcutMatcher.reduce(
+                state: state,
+                event: .modifierChanged(keyCode: modifierKeyCode, isDown: true),
+                configuration: configuration
+            ).state
+        }
+        return ShortcutMatcher.reduce(
+            state: state,
+            event: .keyChanged(keyCode: keyCode, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+    }
+
+    private static func testTransformFiresOnLeadingEdgeOnly() {
+        let customID = UUID()
+        for id in [TransformID.polish, .custom(customID)] {
+            let configuration = ShortcutConfiguration(hold: .disabled, toggle: .disabled, transforms: [id: f5Binding])
+            let firstDown = ShortcutMatcher.reduce(
+                state: ShortcutInputState(),
+                event: .keyChanged(keyCode: 96, isDown: true, isRepeat: false),
+                configuration: configuration
+            )
+            let repeated = ShortcutMatcher.reduce(
+                state: firstDown.state,
+                event: .keyChanged(keyCode: 96, isDown: true, isRepeat: true),
+                configuration: configuration
+            )
+            let up = ShortcutMatcher.reduce(
+                state: repeated.state,
+                event: .keyChanged(keyCode: 96, isDown: false, isRepeat: false),
+                configuration: configuration
+            )
+            let secondDown = ShortcutMatcher.reduce(
+                state: up.state,
+                event: .keyChanged(keyCode: 96, isDown: true, isRepeat: false),
+                configuration: configuration
+            )
+
+            TestSupport.expectEqual(firstDown.emittedEvents, [.transformTriggered(id)])
+            TestSupport.expectEqual(firstDown.consumeDecision, .consume)
+            TestSupport.expectEqual(firstDown.state.activeTransformIDs, [id])
+            TestSupport.expectEqual(repeated.emittedEvents, [])
+            TestSupport.expectEqual(up.emittedEvents, [])
+            TestSupport.expect(up.state.activeTransformIDs.isEmpty, "Release should clear the active transform")
+            TestSupport.expectEqual(secondDown.emittedEvents, [.transformTriggered(id)])
+        }
+
+        let disabled = ShortcutConfiguration(hold: .disabled, toggle: .disabled, transforms: [.polish: .disabled])
+        let disabledDown = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .keyChanged(keyCode: 96, isDown: true, isRepeat: false),
+            configuration: disabled
+        )
+        TestSupport.expectEqual(disabledDown.emittedEvents, [])
+        TestSupport.expectEqual(disabledDown.consumeDecision, .passthrough)
+    }
+
+    private static func testTransformDefaultsRequireExactModifiers() {
+        let polishOnly = ShortcutConfiguration(
+            hold: .disabled, toggle: .disabled, transforms: [.polish: .defaultPolishTransform]
+        )
+        TestSupport.expectEqual(
+            pressKey(18, withModifierKeyCodes: [59, 58], configuration: polishOnly).emittedEvents,
+            [.transformTriggered(.polish)]
+        )
+        TestSupport.expectEqual(
+            pressKey(18, withModifierKeyCodes: [62, 61], configuration: polishOnly).emittedEvents,
+            [.transformTriggered(.polish)]
+        )
+        TestSupport.expectEqual(pressKey(18, withModifierKeyCodes: [59, 58, 56], configuration: polishOnly).emittedEvents, [])
+        TestSupport.expectEqual(pressKey(18, withModifierKeyCodes: [58], configuration: polishOnly).emittedEvents, [])
+        TestSupport.expectEqual(pressKey(18, withModifierKeyCodes: [55, 59, 58], configuration: polishOnly).emittedEvents, [])
+        TestSupport.expectEqual(pressKey(19, withModifierKeyCodes: [59, 58], configuration: polishOnly).emittedEvents, [])
+
+        let both = ShortcutConfiguration(
+            hold: .disabled,
+            toggle: .disabled,
+            transforms: [.polish: .defaultPolishTransform, .promptEngineer: .defaultPromptEngineerTransform]
+        )
+        TestSupport.expectEqual(
+            pressKey(19, withModifierKeyCodes: [59, 58], configuration: both).emittedEvents,
+            [.transformTriggered(.promptEngineer)]
+        )
+        TestSupport.expectEqual(
+            pressKey(18, withModifierKeyCodes: [59, 58], configuration: both).emittedEvents,
+            [.transformTriggered(.polish)]
+        )
+
+        // Two transforms on one binding emit in sortKey order.
+        let customID = UUID()
+        let shared = ShortcutConfiguration(
+            hold: .disabled, toggle: .disabled, transforms: [.custom(customID): f5Binding, .promptEngineer: f5Binding]
+        )
+        TestSupport.expectEqual(
+            pressKey(96, withModifierKeyCodes: [], configuration: shared).emittedEvents,
+            [.transformTriggered(.promptEngineer), .transformTriggered(.custom(customID))]
+        )
+    }
+
+    private static func testTransformInputsHoldTheReleaseGate() {
+        let configuration = ShortcutConfiguration(
+            hold: .disabled, toggle: .disabled, transforms: [.polish: .defaultPolishTransform]
+        )
+        var state = ShortcutInputState()
+        TestSupport.expect(!state.hasPressedShortcutInputs(configuration: configuration), "Nothing pressed yet")
+
+        state = ShortcutMatcher.reduce(
+            state: state, event: .modifierChanged(keyCode: 59, isDown: true), configuration: configuration
+        ).state
+        TestSupport.expect(state.hasPressedShortcutInputs(configuration: configuration), "Ctrl holds the gate")
+        state = ShortcutMatcher.reduce(
+            state: state, event: .modifierChanged(keyCode: 61, isDown: true), configuration: configuration
+        ).state
+        state = ShortcutMatcher.reduce(
+            state: state, event: .keyChanged(keyCode: 18, isDown: true, isRepeat: false), configuration: configuration
+        ).state
+        state = ShortcutMatcher.reduce(
+            state: state, event: .modifierChanged(keyCode: 59, isDown: false), configuration: configuration
+        ).state
+        state = ShortcutMatcher.reduce(
+            state: state, event: .modifierChanged(keyCode: 61, isDown: false), configuration: configuration
+        ).state
+        TestSupport.expect(state.hasPressedShortcutInputs(configuration: configuration), "The digit still holds the gate")
+        state = ShortcutMatcher.reduce(
+            state: state, event: .keyChanged(keyCode: 18, isDown: false, isRepeat: false), configuration: configuration
+        ).state
+        TestSupport.expect(!state.hasPressedShortcutInputs(configuration: configuration), "Everything released")
+    }
+
+    private static func testTransformConflictDetection() {
+        let polish = ShortcutBinding.defaultPolishTransform
+        TestSupport.expect(polish.conflicts(with: capturedControlOptionOne), "The default conflicts with a captured ⌃⌥1")
+        TestSupport.expect(capturedControlOptionOne.conflicts(with: polish), "Conflict detection is symmetric")
+        TestSupport.expect(polish.conflicts(with: polish), "The default conflicts with itself as Paste Again or a hold key")
+        TestSupport.expect(!polish.conflicts(with: .defaultPromptEngineerTransform), "Different digits do not conflict")
+        TestSupport.expect(!polish.conflicts(with: ShortcutPreset.rightOption.binding), "A Right Option hold does not conflict")
+        TestSupport.expect(!polish.conflicts(with: .defaultHold), "Fn does not conflict")
+        TestSupport.expect(!polish.conflicts(with: f5Binding), "F5 does not conflict")
+        TestSupport.expect(!polish.conflicts(with: .disabled), "Disabled never conflicts")
+    }
+
+    private static func testTransformDefaultsSkippedOnConflict() {
+        let polish = ShortcutBinding.defaultPolishTransform
+        TestSupport.expectEqual(ShortcutBinding.transformDefault(polish, avoiding: [polish]), .disabled)
+        TestSupport.expectEqual(ShortcutBinding.transformDefault(polish, avoiding: [capturedControlOptionOne]), .disabled)
+        TestSupport.expectEqual(
+            ShortcutBinding.transformDefault(polish, avoiding: [.defaultHold, .defaultToggle, ShortcutPreset.rightOption.binding]),
+            polish
+        )
+        TestSupport.expectEqual(ShortcutBinding.transformDefault(polish, avoiding: []), polish)
+        // The manual Edit Mode press for a Ctrl+1 hold with the Option modifier is ⌃⌥1.
+        let manualPress = ShortcutBinding(keyCode: 18, keyDisplay: "1", modifiers: [.control], kind: .key, preset: nil)
+            .withAddedModifiers(.option)
+        TestSupport.expectEqual(ShortcutBinding.transformDefault(polish, avoiding: [manualPress]), .disabled)
+        TestSupport.expectEqual(
+            ShortcutBinding.transformDefault(.defaultPromptEngineerTransform, avoiding: [polish]),
+            .defaultPromptEngineerTransform
+        )
+        TestSupport.expectEqual(TransformCore.resolvedDefaultShortcut(for: .polish, avoiding: []), polish)
+        TestSupport.expectEqual(TransformCore.resolvedDefaultShortcut(for: .polish, avoiding: [polish]), .disabled)
+        TestSupport.expectEqual(TransformCore.resolvedDefaultShortcut(for: .custom(UUID()), avoiding: []), .disabled)
+    }
+
+    private static func testSessionControllerIgnoresTransformEvents() {
+        let idle = DictationShortcutSessionController()
+        TestSupport.expectEqual(idle.handle(event: .transformTriggered(.polish), isTranscribing: false), nil)
+        TestSupport.expectEqual(idle.activeMode, nil)
+
+        let holding = DictationShortcutSessionController()
+        TestSupport.expectEqual(holding.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        TestSupport.expectEqual(holding.handle(event: .transformTriggered(.custom(UUID())), isTranscribing: false), nil)
+        TestSupport.expectEqual(holding.activeMode, .hold)
+        TestSupport.expectEqual(holding.toggleStopArmed, false)
+
+        var now: TimeInterval = 0
+        let toggling = DictationShortcutSessionController(now: { now })
+        TestSupport.expectEqual(toggling.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        now = 1
+        TestSupport.expectEqual(toggling.handle(event: .toggleDeactivated, isTranscribing: false), nil)
+        TestSupport.expectEqual(toggling.handle(event: .transformTriggered(.promptEngineer), isTranscribing: false), nil)
+        TestSupport.expectEqual(toggling.activeMode, .toggle)
+        TestSupport.expectEqual(toggling.toggleStopArmed, true)
     }
 
     private static func testBareFnHoldLifecycle() {
