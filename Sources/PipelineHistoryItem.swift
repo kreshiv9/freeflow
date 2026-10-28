@@ -4,6 +4,8 @@ enum PipelineHistoryItemIntent: String, Codable {
     case dictation
     case commandAutomatic = "command:automatic"
     case commandManual = "command:manual"
+    /// A shortcut-triggered transform: raw = input, post-processed = output, no audio.
+    case transform
 }
 
 struct PipelineHistoryItem: Identifiable, Codable {
