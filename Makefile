@@ -21,6 +21,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AppTextInsertionCore.swift \
 	Sources/AppTextInsertionTarget.swift \
 	Sources/CleanupLevel.swift \
+	Sources/CommandModeIntent.swift \
 	Sources/ContextInferenceFailure.swift \
 	Sources/CursorFormatting.swift \
 	Sources/DeepgramStreamingCore.swift \

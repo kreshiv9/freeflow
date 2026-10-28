@@ -2,7 +2,8 @@ import AppKit
 import ApplicationServices
 import Foundation
 
-/// Kept only for the active dictation; field contents never enter provider requests or history.
+/// Kept only for the active dictation. Field text reaches a provider request and the Run Log only as
+/// the source of a whole-field Edit Mode command.
 struct AppTextInsertionTarget {
     let identifier = UUID()
     let element: AXUIElement
@@ -84,35 +85,64 @@ struct AppTextInsertionTarget {
         _ text: String, isCurrent: @escaping () -> Bool,
         completion: @escaping (AppTextInsertionResult) -> Void
     ) {
+        write(text, range: selectedTextRange, wholeField: false, isCurrent: isCurrent, completion: completion)
+    }
+
+    /// Replaces the whole captured field through the same verified range write: a field edited since
+    /// capture is refused before any write, and the readback must equal the new text. Never pastes.
+    /// A refused or unverified write gets the captured selection back so select-all cannot linger.
+    func replaceAll(
+        _ text: String, isCurrent: @escaping () -> Bool,
+        completion: @escaping (AppTextInsertionResult) -> Void
+    ) {
+        write(
+            text, range: valueAtCapture.map(AppTextInsertionCore.fullRange(of:)), wholeField: true,
+            isCurrent: isCurrent, completion: completion
+        )
+    }
+
+    private func write(
+        _ text: String, range: NSRange?, wholeField: Bool, isCurrent: @escaping () -> Bool,
+        completion: @escaping (AppTextInsertionResult) -> Void
+    ) {
         var expectedValue: String?
         var writeSucceeded = false
-        let result = AppTextInsertionCore.insert(
-            text, capturedValue: valueAtCapture, range: selectedTextRange,
-            requiresFocus: isWebContent,
-            isTargetFocused: { isFocusedInApplication },
-            readValue: { Self.textValue(from: element) },
-            replaceText: { range, replacementText, expectedReadbackValue in
-                var settable = DarwinBoolean(false)
-                guard AXUIElementIsAttributeSettable(
-                    element, kAXSelectedTextAttribute as CFString, &settable
-                ) == .success,
-                settable.boolValue else { return false }
-                guard setSelection(range) else { return false }
-                guard let capturedValue = valueAtCapture,
-                      let currentValue = Self.textValue(from: element),
-                      currentValue.utf16.elementsEqual(capturedValue.utf16),
-                      Self.selection(from: element) == range else { return false }
-                guard !isWebContent || isFocusedInApplication else { return false }
-                expectedValue = expectedReadbackValue
-                writeSucceeded = AXUIElementSetAttributeValue(
-                    element, kAXSelectedTextAttribute as CFString, replacementText as CFString
-                ) == .success
-                return writeSucceeded
-            },
-            placeCursor: { range in _ = setSelection(range) }
-        )
+        let readValue: () -> String? = { Self.textValue(from: element) }
+        let replaceText: (NSRange, String, String) -> Bool = { range, replacementText, expectedReadbackValue in
+            var settable = DarwinBoolean(false)
+            guard AXUIElementIsAttributeSettable(
+                element, kAXSelectedTextAttribute as CFString, &settable
+            ) == .success,
+            settable.boolValue else { return false }
+            guard setSelection(range) else { return false }
+            guard let capturedValue = valueAtCapture,
+                  let currentValue = Self.textValue(from: element),
+                  currentValue.utf16.elementsEqual(capturedValue.utf16),
+                  Self.selection(from: element) == range else { return false }
+            guard !isWebContent || isFocusedInApplication else { return false }
+            expectedValue = expectedReadbackValue
+            writeSucceeded = AXUIElementSetAttributeValue(
+                element, kAXSelectedTextAttribute as CFString, replacementText as CFString
+            ) == .success
+            return writeSucceeded
+        }
+        let placeCursor: (NSRange) -> Void = { range in _ = setSelection(range) }
+        let result = wholeField
+            ? AppTextInsertionCore.replaceAll(
+                text, capturedValue: valueAtCapture, capturedSelection: selectedTextRange,
+                requiresFocus: isWebContent,
+                isTargetFocused: { isFocusedInApplication },
+                readValue: readValue, replaceText: replaceText, placeCursor: placeCursor,
+                restoreSelection: { range in _ = setSelection(range) }
+            )
+            : AppTextInsertionCore.insert(
+                text, capturedValue: valueAtCapture, range: range,
+                requiresFocus: isWebContent,
+                isTargetFocused: { isFocusedInApplication },
+                readValue: readValue, replaceText: replaceText, placeCursor: placeCursor
+            )
         guard result != .inserted, let expectedValue, let originalValue = valueAtCapture,
-              let range = selectedTextRange else {
+              let range else {
             completion(result)
             return
         }

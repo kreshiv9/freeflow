@@ -35,6 +35,111 @@ enum AppTextInsertionDispatchTests {
         testDisabledOriginalFieldUsesCurrentFieldPaste()
         testFittedTranscriptKeepsItsTrailingEdge()
         testPasteTimingReportsSkippedOriginalFieldInsertion()
+        testWholeFieldRefusalCopiesWithoutPasting()
+        testWholeFieldWriteNeverPastes()
+        testWholeFieldStaleSessionDoesNothing()
+    }
+
+    /// Whole-field Edit Mode never falls back to select-all and paste: any outcome short of a
+    /// verified write copies the result once, pastes nothing, sends no Enter and shows the
+    /// pinned message. The copy is the result, so the clipboard is not restored.
+    private static func testWholeFieldRefusalCopiesWithoutPasting() {
+        for result in [AppTextInsertionResult.notInserted, .unverified, .unavailable] {
+            let fixture = makeFixture(focused: true)
+            fixture.target.insertionResult = result
+            fixture.state.preserveClipboard = true
+
+            fixture.state.testDispatchWholeFieldReplacement("rewritten", target: fixture.target, shouldPressEnter: true)
+            TestDispatchQueue.runAll()
+
+            TestSupport.expectEqual(fixture.target.replaceAllCallCount, 1)
+            TestSupport.expectEqual(fixture.target.replacedTexts, ["rewritten"])
+            TestSupport.expectEqual(fixture.target.insertCallCount, 0)
+            TestSupport.expectEqual(fixture.target.focusCallCount, 0)
+            TestSupport.expectEqual(fixture.target.selectionRestoreCount, 0)
+            TestSupport.expectEqual(TestAX.activationCount, 0)
+            TestSupport.expectEqual(fixture.state.clipboardWriteCount, 1)
+            TestSupport.expectEqual(fixture.state.clipboardTexts, ["rewritten"])
+            TestSupport.expectEqual(fixture.state.clipboardRestoreCount, 0)
+            TestSupport.expectEqual(fixture.state.pasteCalls.count, 0)
+            TestSupport.expectEqual(fixture.state.enterCalls.count, 0)
+            TestSupport.expectEqual(fixture.state.statusText, CommandModeIntent.fieldChangedOverlayMessage)
+            TestSupport.expectEqual(fixture.state.overlayManager.errorMessages, [CommandModeIntent.fieldChangedOverlayMessage])
+        }
+
+        // A refusal reports a skipped paste stage.
+        let gated = makeFixture(focused: true)
+        gated.target.insertionResult = .notInserted
+        var reported: [CFAbsoluteTime?] = []
+        gated.state.pasteGate.schedule { reported.append($0) }
+        let dispatch = gated.state.pasteGate.wrappingScheduledPaste {
+            gated.state.testDispatchWholeFieldReplacement("rewritten", target: gated.target, shouldPressEnter: false)
+        }
+        dispatch()
+        TestDispatchQueue.runAll()
+        TestSupport.expectEqual(reported, [nil])
+    }
+
+    /// A verified whole-field write pastes nothing and reports the replaced status. A detected
+    /// "press enter" goes to the same field, and the result is copied only when the clipboard
+    /// setting asks for a copy.
+    private static func testWholeFieldWriteNeverPastes() {
+        for shouldPressEnter in [false, true] {
+            let fixture = makeFixture(focused: true)
+            fixture.target.insertionResult = .inserted
+            fixture.state.preserveClipboard = true
+
+            fixture.state.testDispatchWholeFieldReplacement(
+                "rewritten", target: fixture.target, shouldPressEnter: shouldPressEnter
+            )
+            TestDispatchQueue.runAll()
+
+            TestSupport.expectEqual(fixture.target.replaceAllCallCount, 1)
+            TestSupport.expectEqual(fixture.target.insertCallCount, 0)
+            TestSupport.expectEqual(fixture.state.pasteCalls.count, 0)
+            TestSupport.expectEqual(fixture.state.clipboardWriteCount, 0)
+            TestSupport.expectEqual(fixture.state.enterCalls, shouldPressEnter ? [fixture.target.processIdentifier] : [])
+            TestSupport.expectEqual(TestAX.activationCount, 0)
+            TestSupport.expectEqual(fixture.state.statusText, CommandModeIntent.wholeFieldReplacedStatusText)
+            TestSupport.expect(fixture.state.overlayManager.errorMessages.isEmpty, "A verified write shows no error")
+        }
+
+        let copied = makeFixture(focused: true)
+        copied.target.insertionResult = .inserted
+        copied.state.preserveClipboard = false
+        copied.state.testDispatchWholeFieldReplacement("rewritten", target: copied.target, shouldPressEnter: false)
+        TestDispatchQueue.runAll()
+        TestSupport.expectEqual(copied.state.clipboardTexts, ["rewritten"])
+        TestSupport.expectEqual(copied.state.pasteCalls.count, 0)
+
+        // The verified write is the paste stage.
+        let gated = makeFixture(focused: true)
+        gated.target.insertionResult = .inserted
+        var reported: [CFAbsoluteTime?] = []
+        gated.state.pasteGate.schedule { reported.append($0) }
+        let dispatch = gated.state.pasteGate.wrappingScheduledPaste {
+            gated.state.testDispatchWholeFieldReplacement("rewritten", target: gated.target, shouldPressEnter: false)
+        }
+        dispatch()
+        TestDispatchQueue.runAll()
+        TestSupport.expectEqual(reported, [TestInsertionState.pasteFiredMark])
+    }
+
+    /// A session that moved on before the shortcut was released touches neither field nor clipboard.
+    private static func testWholeFieldStaleSessionDoesNothing() {
+        let fixture = makeFixture(focused: true)
+        fixture.target.insertionResult = .inserted
+        fixture.state.textInsertionTargetID = UUID()
+
+        fixture.state.testDispatchWholeFieldReplacement("rewritten", target: fixture.target, shouldPressEnter: true)
+        TestDispatchQueue.runAll()
+
+        TestSupport.expectEqual(fixture.target.replaceAllCallCount, 0)
+        TestSupport.expectEqual(fixture.state.clipboardWriteCount, 0)
+        TestSupport.expectEqual(fixture.state.pasteCalls.count, 0)
+        TestSupport.expectEqual(fixture.state.enterCalls.count, 0)
+        TestSupport.expectEqual(fixture.state.statusText, "")
+        TestSupport.expect(fixture.state.overlayManager.errorMessages.isEmpty, "A stale session shows nothing")
     }
 
     private static func testAccessibilityPreparationRequiresEnabledMonitoringAndPermission() {
@@ -705,6 +810,7 @@ final class TestInsertionState {
     var shouldMonitorHotkeys = false
     let insertionAccessibilityQueue = TestDispatchQueue.main
     let pasteGate = PipelineStageTimings.PasteGate(now: { TestInsertionState.pasteFiredMark })
+    let overlayManager = TestOverlayManager()
     var textInsertionTargetID: UUID?
     var statusText = ""
     var preserveClipboard = false
@@ -780,6 +886,8 @@ final class TestInsertionTarget {
     var insertionResult: AppTextInsertionResult = .notInserted
     var insertCallCount = 0
     var insertedTexts: [String] = []
+    var replaceAllCallCount = 0
+    var replacedTexts: [String] = []
     var focusCallCount = 0
     var selectionRestoreCount = 0
     var minimizeChangeCount = 0
@@ -823,6 +931,13 @@ final class TestInsertionTarget {
         completion(isCurrent() ? insertionResult : .unavailable)
     }
 
+    /// The scripted outcome of the verified whole-field AX write; the real one never pastes.
+    func replaceAll(_ text: String, isCurrent: @escaping () -> Bool, completion: @escaping (AppTextInsertionResult) -> Void) {
+        replaceAllCallCount += 1
+        replacedTexts.append(text)
+        completion(isCurrent() ? insertionResult : .unavailable)
+    }
+
     func pasteIfUnchanged(
         restoringSelection: Bool,
         isCurrent: () -> Bool,
@@ -853,6 +968,12 @@ final class TestPendingClipboardRestore {
     var didRestore = false
 
     init(state: TestInsertionState) { self.state = state }
+}
+
+final class TestOverlayManager {
+    var errorMessages: [String] = []
+
+    func showError(_ message: String) { errorMessages.append(message) }
 }
 
 final class TestAXElement {
