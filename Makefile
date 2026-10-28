@@ -27,7 +27,9 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/DeepgramStreamingCore.swift \
 	Sources/DictationStyle.swift \
 	Sources/DictionaryCorrections.swift \
+	Sources/FileTagMatcher.swift \
 	Sources/HandsFreeAutoStop.swift \
+	Sources/IdentifierExtractor.swift \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
 	Sources/ModelConfiguration.swift \

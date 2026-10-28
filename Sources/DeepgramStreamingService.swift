@@ -61,6 +61,9 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     private var finalContinuation: CheckedContinuation<String, Error>?
     private var terminalError: DeepgramStreamingError?
     private var closed = false
+    private var keytermUpdateRequested = false
+    /// A Configure message waiting for the socket to open.
+    private var pendingKeytermUpdate: String?
 
     init(config: Configuration) {
         self.config = config
@@ -209,12 +212,38 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         }
     }
 
+    // MARK: Keyterms
+
+    /// Adds code identifiers from the text context to this stream's keyterms with one
+    /// mid-stream Configure message; the stream's vocabulary keyterms come first. Sent at
+    /// most once per stream, because Deepgram refuses a second Configure while one is
+    /// pending, and never after the commit. A refused update keeps the starting keyterms.
+    func updateKeyterms(_ additionalKeyterms: [String]) {
+        guard let keyterms = DeepgramStreamingCore.mergedKeyterms(base: config.keyterms, adding: additionalKeyterms),
+              let message = DeepgramStreamingCore.configureMessage(keyterms: keyterms) else { return }
+        stateQueue.async { [self] in
+            guard !closed, terminalError == nil, commitStartedAt == nil, socketState == .open,
+                  !keytermUpdateRequested else { return }
+            keytermUpdateRequested = true
+            if isOpen, let task {
+                sendKeytermUpdateLocked(message, over: task)
+            } else {
+                pendingKeytermUpdate = message
+            }
+        }
+    }
+
     // MARK: Socket events
 
     fileprivate func socketDidOpen() {
         stateQueue.async { [self] in
             guard !closed, let task else { return }
             isOpen = true
+            // Before the buffered audio, so that audio already uses the new keyterms.
+            if let message = pendingKeytermUpdate {
+                pendingKeytermUpdate = nil
+                sendKeytermUpdateLocked(message, over: task)
+            }
             let chunks = pendingAudio
             pendingAudio = []
             pendingAudioBytes = 0
@@ -304,6 +333,17 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         }
     }
 
+    /// A failed send keeps the starting keyterms, so it never ends the stream. Logs never
+    /// carry the terms.
+    private func sendKeytermUpdateLocked(_ message: String, over task: URLSessionWebSocketTask) {
+        task.send(.string(message)) { error in
+            if let error {
+                os_log(.error, log: deepgramLog, "keyterm update send failed: %{public}@", error.localizedDescription)
+            }
+        }
+        os_log(.info, log: deepgramLog, "sent keyterm update")
+    }
+
     /// Called once, from the receive loop's exit. The close is normal only when
     /// the server's close frame carried 1000, read from the delegate's code or,
     /// when the delegate has not run yet, from the task itself; a transport
@@ -365,5 +405,6 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         session = nil
         pendingAudio = []
         pendingAudioBytes = 0
+        pendingKeytermUpdate = nil
     }
 }

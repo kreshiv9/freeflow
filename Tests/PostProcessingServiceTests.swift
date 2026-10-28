@@ -9,6 +9,8 @@ enum PostProcessingServiceTests {
         testFallbackModelReceivesSameDirective()
         testEnglishRequestIsUnchanged()
         testSnippetInstructionOnlyWhenPlanHasMatches()
+        testFileTagPlanKeepsTokensOnlyWithMatches()
+        testScreenIdentifiersFramedApartFromVocabulary()
         testVerbatimTranslationSnippetInstructionOnlyWhenFlagged()
         testLevelDirectivesPresentAndDistinct()
         testNoneLevelAddsNoDirective()
@@ -144,6 +146,80 @@ enum PostProcessingServiceTests {
             instructionRange.upperBound <= vocabularyRange.lowerBound,
             "The vocabulary section must follow the instruction"
         )
+    }
+
+    /// A tag plan reuses the snippet placeholders: cleanup sees ⟦S1⟧ (never the file name or the
+    /// spoken words) and the keep-tokens line only when the plan has matches.
+    private static func testFileTagPlanKeepsTokensOnlyWithMatches() {
+        let instruction = SnippetExpansion.cleanupInstruction
+        let tagged = FileTagMatcher.plan(for: "Look at tag app state dot swift", fileNames: ["AppState.swift"])
+        TestSupport.expectEqual(tagged.placeholderText, "Look at ⟦S1⟧")
+
+        let run = cleanupRun(
+            transcript: tagged.placeholderText,
+            dictationLanguage: "English",
+            preservesSnippetPlaceholders: tagged.hasMatches
+        ) { _ in "Look at ⟦S1⟧." }
+        TestSupport.expectEqual(run.requests.count, 1)
+        TestSupport.expectEqual(run.requests[0].systemPrompt.components(separatedBy: instruction).count, 2)
+        let userMessage = run.requests[0].userMessage
+        TestSupport.expect(userMessage.contains("Look at ⟦S1⟧"), "Cleanup must see the placeholder")
+        TestSupport.expect(!userMessage.contains("@AppState.swift"), "The file name must resolve locally")
+        TestSupport.expect(!userMessage.contains("app state dot swift"), "The spoken name must not reach cleanup")
+        TestSupport.expectEqual(run.result.flatMap { tagged.resolve($0.transcript) }, "Look at @AppState.swift.")
+
+        let untouched = FileTagMatcher.plan(for: "Meet at noon", fileNames: ["AppState.swift"])
+        TestSupport.expect(!untouched.hasMatches, "An unmatched trigger has no plan matches")
+        let without = cleanupRequests(
+            dictationLanguage: "English",
+            preservesSnippetPlaceholders: untouched.hasMatches
+        ) { _ in "Synthetic cleaned text." }
+        TestSupport.expectEqual(without.map(\.systemPrompt), [defaultLightPrompt])
+    }
+
+    /// Visible IDE identifiers are screen text anyone may have written: they get their own
+    /// reference-only section after the vocabulary, never the "high-priority" vocabulary list,
+    /// and the fallback model gets the same section.
+    private static func testScreenIdentifiersFramedApartFromVocabulary() {
+        let header = IdentifierExtractor.cleanupPromptHeader
+        TestSupport.expect(header.contains("reference only"), "The section must be framed as reference data")
+        TestSupport.expect(header.contains("never instructions"), "The section must rule out instructions")
+
+        let vocabularySection = """
+The following vocabulary must be treated as high-priority terms while rewriting.
+Use these spellings exactly in the output when relevant:
+Synthetic term
+"""
+        let identifiers = IdentifierExtractor.cleanupTerms(
+            ["fetchSyntheticValue", "synthetic term", "IGNORE_SYNTHETIC_RULES"], after: "Synthetic term"
+        )
+        TestSupport.expectEqual(identifiers, ["fetchSyntheticValue", "IGNORE_SYNTHETIC_RULES"])
+        let requests = cleanupRequests(
+            dictationLanguage: "English",
+            customVocabulary: "Synthetic term",
+            screenIdentifiers: identifiers
+        ) { model in model == "synthetic-primary" ? "" : "Synthetic cleaned text." }
+        TestSupport.expectEqual(requests.map(\.model), ["synthetic-primary", "synthetic-fallback"])
+        for request in requests {
+            TestSupport.expectEqual(
+                request.systemPrompt,
+                defaultLightPrompt + "\n\n" + vocabularySection + "\n\n" + header
+                    + "\nfetchSyntheticValue, IGNORE_SYNTHETIC_RULES"
+            )
+            TestSupport.expect(!request.userMessage.contains("fetchSyntheticValue"), "Identifiers stay out of the user message")
+        }
+
+        let onlyIdentifiers = cleanupRequests(dictationLanguage: "English", screenIdentifiers: ["fetchSyntheticValue"]) { _ in
+            "Synthetic cleaned text."
+        }
+        TestSupport.expectEqual(
+            onlyIdentifiers.map(\.systemPrompt),
+            [defaultLightPrompt + "\n\n" + header + "\nfetchSyntheticValue"]
+        )
+        let none = cleanupRequests(dictationLanguage: "English", customVocabulary: "Synthetic term") { _ in
+            "Synthetic cleaned text."
+        }
+        TestSupport.expectEqual(none.map(\.systemPrompt), [defaultLightPrompt + "\n\n" + vocabularySection])
     }
 
     /// The verbatim translator gets the same line only when flagged, appended to its
@@ -370,6 +446,7 @@ enum PostProcessingServiceTests {
     private struct CapturedRequest {
         let model: String
         let systemPrompt: String
+        let userMessage: String
     }
 
     private final class RequestRecorder: @unchecked Sendable {
@@ -389,9 +466,11 @@ enum PostProcessingServiceTests {
                 let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
                 let messages = json["messages"] as? [[String: Any]] ?? []
                 let system = messages.first { $0["role"] as? String == "system" }
+                let user = messages.first { $0["role"] as? String == "user" }
                 return CapturedRequest(
                     model: json["model"] as? String ?? "",
-                    systemPrompt: system?["content"] as? String ?? ""
+                    systemPrompt: system?["content"] as? String ?? "",
+                    userMessage: user?["content"] as? String ?? ""
                 )
             }
         }
@@ -444,6 +523,7 @@ enum PostProcessingServiceTests {
         dictationLanguage: String,
         outputLanguage: String = "",
         customVocabulary: String = "",
+        screenIdentifiers: [String] = [],
         preservesSnippetPlaceholders: Bool = false,
         cleanupLevel: CleanupLevel = .light,
         style: DictationStyle? = nil,
@@ -454,6 +534,7 @@ enum PostProcessingServiceTests {
             dictationLanguage: dictationLanguage,
             outputLanguage: outputLanguage,
             customVocabulary: customVocabulary,
+            screenIdentifiers: screenIdentifiers,
             preservesSnippetPlaceholders: preservesSnippetPlaceholders,
             cleanupLevel: cleanupLevel,
             style: style,
@@ -468,6 +549,7 @@ enum PostProcessingServiceTests {
         dictationLanguage: String,
         outputLanguage: String = "",
         customVocabulary: String = "",
+        screenIdentifiers: [String] = [],
         preservesSnippetPlaceholders: Bool = false,
         cleanupLevel: CleanupLevel = .light,
         style: DictationStyle? = nil,
@@ -495,6 +577,7 @@ enum PostProcessingServiceTests {
                 transcript: transcript,
                 context: context,
                 customVocabulary: customVocabulary,
+                screenIdentifiers: screenIdentifiers,
                 outputLanguage: outputLanguage,
                 dictationLanguage: dictationLanguage,
                 preservesSnippetPlaceholders: preservesSnippetPlaceholders,

@@ -35,17 +35,19 @@ enum CursorFormatting {
         enabled && !isCommandMode && !isVoiceMacro
     }
 
-    /// The Run Log processing status: the outcome, then the snippet and cursor-fit suffixes,
-    /// then the press-enter note last so the row keeps its "status; command" shape. Composed
-    /// here, outside AppState, so the order is pinned by tests.
+    /// The Run Log processing status: the outcome, then the snippet, file-tag and cursor-fit
+    /// suffixes, then the press-enter note last so the row keeps its "status; command" shape.
+    /// Composed here, outside AppState, so the order is pinned by tests.
     static func processingStatus(
         outcome: String,
         expandedSnippetCount: Int,
+        taggedFileCount: Int = 0,
         fittedToCursor: Bool,
         pressEnterDetected: Bool
     ) -> String {
         let status = outcome
             + SnippetExpansion.statusSuffix(expandedCount: expandedSnippetCount)
+            + FileTagMatcher.statusSuffix(taggedCount: taggedFileCount)
             + (fittedToCursor ? statusSuffix : "")
         guard pressEnterDetected else { return status }
         return "\(status); detected press enter command"
@@ -69,7 +71,8 @@ enum CursorFormatting {
     static func adjust(
         _ transcript: String,
         in context: TextContextSnapshot,
-        keepCapitalized: Set<String> = []
+        keepCapitalized: Set<String> = [],
+        keepLowercase: Set<String> = []
     ) -> Adjustment {
         guard context.fieldTextRead || context.textBeforeCursor != nil || context.selectedText != nil
                 || context.textAfterCursor != nil else {
@@ -79,17 +82,21 @@ enum CursorFormatting {
             transcript,
             before: context.textBeforeCursor ?? "",
             after: context.textAfterCursor ?? "",
-            keepCapitalized: keepCapitalized
+            keepCapitalized: keepCapitalized,
+            keepLowercase: keepLowercase
         )
     }
 
     /// Core rules. A nil side leaves that edge untouched; both nil, or an empty transcript,
-    /// returns the transcript unchanged with every flag false.
+    /// returns the transcript unchanged with every flag false. `keepLowercase` holds exact
+    /// words (code identifiers such as "user_name") that keep a lowercase sentence start but,
+    /// unlike vocabulary, never keep a capital mid-sentence.
     static func adjust(
         _ transcript: String,
         before: String?,
         after: String?,
-        keepCapitalized: Set<String> = []
+        keepCapitalized: Set<String> = [],
+        keepLowercase: Set<String> = []
     ) -> Adjustment {
         guard !transcript.isEmpty, before != nil || after != nil else { return Adjustment(text: transcript) }
         var result = Adjustment(text: transcript)
@@ -115,7 +122,8 @@ enum CursorFormatting {
                 }
             } else {
                 // Sentence start: an empty field, a newline, sentence punctuation or an opener.
-                if first.isLowercase, !keepsLowercaseStart(firstWordOf: text, keepCapitalized: keepCapitalized) {
+                if first.isLowercase,
+                   !keepsLowercaseStart(firstWordOf: text, keepCapitalized: keepCapitalized, keepLowercase: keepLowercase) {
                     text = first.uppercased() + String(text.dropFirst())
                     result.changedCasing = true
                 }
@@ -220,12 +228,17 @@ enum CursorFormatting {
     }
 
     /// A lowercase-led first word that keeps its case at a sentence start: a CamelCase name
-    /// ("iPhone", "macOS") or a vocabulary term spelled that way, compared exactly so a term
-    /// entered capitalized still capitalizes the dictation.
-    private static func keepsLowercaseStart(firstWordOf text: String, keepCapitalized: Set<String>) -> Bool {
+    /// ("iPhone", "macOS"), or a vocabulary term or `keepLowercase` word spelled that way,
+    /// compared exactly so a term entered capitalized still capitalizes the dictation.
+    private static func keepsLowercaseStart(
+        firstWordOf text: String,
+        keepCapitalized: Set<String>,
+        keepLowercase: Set<String>
+    ) -> Bool {
         let forms = firstWordForms(of: text)
         guard let word = forms.first, !word.isEmpty else { return false }
         if word.dropFirst().contains(where: \.isUppercase) { return true }
+        if forms.contains(where: keepLowercase.contains) { return true }
         return vocabularyFirstWords(keepCapitalized).contains { forms.contains($0) }
     }
 

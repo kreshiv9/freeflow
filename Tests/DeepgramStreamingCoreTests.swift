@@ -20,6 +20,9 @@ enum DeepgramStreamingCoreTests {
         testKeytermEncoding()
         testKeytermNormalization()
         testKeytermsFromVocabularyText()
+        testConfigureMessage()
+        testMergedKeyterms()
+        testConfigureRepliesAreIgnored()
         testPendingAudioLimit()
         testParsesFinalAndInterimResults()
         testParsesMetadataUtteranceEndSpeechStartedAndError()
@@ -145,6 +148,55 @@ enum DeepgramStreamingCoreTests {
             merging: [DictionaryCorrection(from: "klaud", to: "Claude Code")]
         )
         TestSupport.expectEqual(Core.keyterms(fromVocabularyText: merged), ["Foo", "Bar", "Claude Code"])
+    }
+
+    /// The mid-stream keyterm update: fixed field names, normalized terms, never the key.
+    private static func testConfigureMessage() {
+        let configure = Core.configureMessage(keyterms: ["  Synthetic   Term ", "fooBar", "FOOBAR", "", "a/b", "say \"hi\""])
+        TestSupport.expectEqual(
+            configure,
+            #"{"keyterms":["Synthetic Term","fooBar","a/b","say \"hi\""],"type":"Configure"}"#
+        )
+        let decoded = (try? JSONSerialization.jsonObject(with: Data((configure ?? "").utf8))) as? [String: Any]
+        TestSupport.expectEqual(decoded?["type"] as? String, "Configure")
+        TestSupport.expectEqual(decoded?["keyterms"] as? [String], ["Synthetic Term", "fooBar", "a/b", "say \"hi\""])
+        TestSupport.expectEqual(Core.configureMessage(keyterms: []), nil)
+        TestSupport.expect(configure?.contains(syntheticKey) == false, "The Configure message must never carry the key")
+    }
+
+    /// The stream's vocabulary keyterms always come first; dotted paths and terms already
+    /// present add nothing, and nil means no update is sent.
+    private static func testMergedKeyterms() {
+        TestSupport.expectEqual(
+            Core.mergedKeyterms(base: ["Synthetic Term"], adding: ["fooBar", "appState.isRecording", "synthetic term"]),
+            ["Synthetic Term", "fooBar"]
+        )
+        TestSupport.expectEqual(Core.mergedKeyterms(base: ["Synthetic Term"], adding: ["synthetic term", "a.b"]), nil)
+        TestSupport.expectEqual(Core.mergedKeyterms(base: (0..<100).map { "term\($0)" }, adding: ["fooBar"]), nil)
+        TestSupport.expectEqual(Core.mergedKeyterms(base: [], adding: ["fooBar"]), ["fooBar"])
+        TestSupport.expectEqual(
+            Core.mergedKeyterms(base: [], adding: (0..<80).map { "syntheticName\($0)Value" })?.count,
+            Core.maxContextKeyterms
+        )
+        TestSupport.expectEqual(Core.maxContextKeyterms, 50)
+    }
+
+    /// Deepgram answers a Configure with ConfigureSuccess or ConfigureFailure; neither may
+    /// change the transcript or the commit decision, so a refused update keeps the stream.
+    private static func testConfigureRepliesAreIgnored() {
+        let success = message(#"{"type":"ConfigureSuccess","request_id":"synthetic","keyterms":["fooBar"]}"#)
+        let failure = message(
+            #"{"type":"ConfigureFailure","request_id":"synthetic","code":"CONFIGURE_KEYTERM_LIMIT_EXCEEDED","description":"synthetic"}"#
+        )
+        TestSupport.expectEqual(success, .unknown)
+        TestSupport.expectEqual(failure, .unknown)
+
+        var assembler = Core.TranscriptAssembler()
+        assembler.apply(success)
+        assembler.apply(failure)
+        TestSupport.expectEqual(assembler, Core.TranscriptAssembler())
+        TestSupport.expectEqual(decision(assembler), decision(Core.TranscriptAssembler()))
+        TestSupport.expectEqual(decision(assembler, elapsed: 5), .fallBack(.commitTimedOut))
     }
 
     private static func testPendingAudioLimit() {
