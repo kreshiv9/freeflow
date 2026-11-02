@@ -41,6 +41,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/RecordingTimerPreference.swift \
 	Sources/SilenceGatePreference.swift \
 	Sources/SnippetExpansion.swift \
+	Sources/SpokenListFormatter.swift \
 	Sources/SpeechActivityTracker.swift \
 	Sources/StreamingTranscriptionProvider.swift \
 	Sources/TranscriptionErrorPresentationCore.swift \

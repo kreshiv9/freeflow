@@ -3183,6 +3183,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case postProcessingSucceeded
         case postProcessingFailedFallback
         case postProcessingDroppedSnippetPlaceholders
+        case postProcessingDroppedContentFallback
         case preservedExactWording
         case preservedExactWordingTranslated
         case preservedExactWordingTranslationFailedFallback
@@ -3217,6 +3218,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return isRetry
                     ? "Post-processing dropped a snippet placeholder on retry, using raw transcript"
                     : "Post-processing dropped a snippet placeholder, using raw transcript"
+            case .postProcessingDroppedContentFallback:
+                return isRetry
+                    ? "Cleanup dropped part of the transcript on retry, using raw transcript"
+                    : "Cleanup dropped part of the transcript, using raw transcript"
             case .preservedExactWording:
                 return "Preserved exact wording, skipped post-processing"
             case .preservedExactWordingTranslated:
@@ -3428,7 +3433,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     taggedFileCount
                 )
             }
-            return (resolved, .postProcessingSucceeded, result.prompt, expandedSnippetCount, taggedFileCount)
+            // Local Smart Formatting: a clearly counted list the model left as prose becomes numbered lines.
+            let formatted = SpokenListFormatter.numberedList(from: resolved) ?? resolved
+            return (formatted, .postProcessingSucceeded, result.prompt, expandedSnippetCount, taggedFileCount)
+        } catch PostProcessingError.suspectedContentLoss {
+            // Like Wispr Flow, a failed format falls back to the raw transcript.
+            os_log(.error, log: recordingLog, "Post-processing dropped part of the transcript, using raw transcript")
+            return (snippetPlan.expandedText, .postProcessingDroppedContentFallback, "", expandedSnippetCount, taggedFileCount)
         } catch {
             os_log(.error, log: recordingLog, "Post-processing failed: %{public}@", error.localizedDescription)
             return (snippetPlan.expandedText, .postProcessingFailedFallback, "", expandedSnippetCount, taggedFileCount)
@@ -3792,6 +3803,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         switch result.outcome {
                         case .postProcessingFailedFallback,
                              .postProcessingDroppedSnippetPlaceholders,
+                             .postProcessingDroppedContentFallback,
                              .preservedExactWordingTranslationFailedFallback,
                              .verbatimTranslationDroppedSnippetPlaceholders:
                             shouldPersistRawDictationFallback = !trimmedFinalTranscript.isEmpty

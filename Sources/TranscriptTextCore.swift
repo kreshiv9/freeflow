@@ -242,8 +242,33 @@ enum TranscriptOutputSanitizer {
         return result
     }
 
+    /// Delimiter lines and labels from the cleanup user message. A model sometimes echoes them
+    /// ("store RAW_TRANSCRIPTION"); they never belong in pasted text.
+    private static let scaffoldingLines: Set<String> = [
+        "RAW_TRANSCRIPTION", "RAW_TRANSCRIPTION:", "<<<RAW_TRANSCRIPTION",
+        "CONTEXT", "CONTEXT:", "<<<CONTEXT"
+    ]
+
+    /// Removes echoed prompt scaffolding: whole delimiter lines, an echoed CONTEXT header line, and
+    /// a RAW_TRANSCRIPTION token at either end of the output. The uppercase underscore token cannot
+    /// come from dictated speech, so stripping it is safe.
+    static func strippingPromptScaffolding(_ value: String) -> String {
+        let keptLines = value.components(separatedBy: .newlines).filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return !scaffoldingLines.contains(trimmed) && !trimmed.hasPrefix(TextContextCore.promptHeader)
+        }
+        var result = keptLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        for pattern in [#"^(?:<<<)?RAW_TRANSCRIPTION:?\s*"#, #"\s*(?:<<<)?RAW_TRANSCRIPTION:?$"#] {
+            while let range = result.range(of: pattern, options: .regularExpression) {
+                result.removeSubrange(range)
+                result = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return result
+    }
+
     static func postProcessedTranscript(_ value: String) -> String {
-        var result = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        var result = strippingPromptScaffolding(value)
         guard !result.isEmpty else { return "" }
 
         if result.hasPrefix("\"") && result.hasSuffix("\"") && result.count > 1 {
@@ -299,23 +324,89 @@ enum TranscriptOutputSanitizer {
             || (preservedMarkers.isEmpty && overlapRatio < 0.35)
     }
 
+    private static let stopWords: Set<String> = [
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could",
+        "for", "from", "had", "has", "have", "he", "her", "him", "his", "i", "if",
+        "in", "into", "is", "it", "its", "just", "me", "my", "of", "on", "or", "our",
+        "please", "she", "so", "that", "the", "their", "them", "then", "there", "this",
+        "to", "um", "uh", "was", "we", "were", "what", "when", "where", "who", "with",
+        "would", "you", "your"
+    ]
+
     private static func significantTokens(in text: String) -> Set<String> {
-        let stopWords: Set<String> = [
-            "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could",
-            "for", "from", "had", "has", "have", "he", "her", "him", "his", "i", "if",
-            "in", "into", "is", "it", "its", "just", "me", "my", "of", "on", "or", "our",
-            "please", "she", "so", "that", "the", "their", "them", "then", "there", "this",
-            "to", "um", "uh", "was", "we", "were", "what", "when", "where", "who", "with",
-            "would", "you", "your"
-        ]
+        Set(words(in: text).filter { $0.count > 1 && !stopWords.contains($0) })
+    }
 
-        let normalized = text.lowercased()
-        let parts = normalized.split { character in
-            !character.isLetter && !character.isNumber
+    private static func words(in text: String) -> [String] {
+        text.lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .map(String.init)
+    }
+
+    // MARK: - Content-loss guard
+
+    /// Light keeps nearly every content word; Medium may reword, so its bar is lower.
+    static let lightContentRecallThreshold = 0.75
+    static let mediumContentRecallThreshold = 0.5
+    /// Shorter dictations are left alone: a few dropped fillers would swing the ratio.
+    static let minimumContentWordsForLossCheck = 10
+    /// A raw sentence with at least this many content words must keep some of them.
+    static let minimumSentenceWordsForLossCheck = 3
+    static let sentenceRecallThreshold = 0.4
+
+    /// Words cleanup is expected to remove or rewrite: fillers, spoken formatting commands
+    /// ("comma", "new line"), and number and currency words that become digits or symbols.
+    private static let rewrittenWords: Set<String> = [
+        "like", "basically", "literally", "yeah", "okay", "ok", "well", "right", "know", "mean",
+        "kind", "sort", "kinda", "sorta", "erm", "hmm", "mm", "ah", "oh", "really", "totally",
+        "honestly", "anyway", "not", "will", "am", "don", "doesn", "didn", "won", "isn", "aren",
+        "wasn", "weren", "let", "lets", "ll", "ve", "re",
+        "comma", "period", "colon", "semicolon", "question", "mark", "exclamation", "point",
+        "dash", "hyphen", "underscore", "quote", "unquote", "new", "next", "line", "paragraph",
+        "break", "skip", "bullet", "numbered", "list", "em", "full", "stop", "dot", "slash",
+        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
+        "tenth", "firstly", "secondly", "thirdly", "one", "two", "three", "four", "five", "six",
+        "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+        "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+        "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "billion",
+        "percent", "dollar", "dollars", "cent", "cents", "zero", "number"
+    ]
+
+    /// Explicit self-corrections legitimately delete the abandoned wording, so the guard steps aside.
+    private static let backtrackMarkerPattern =
+        #"(?i)\b(actually|scratch that|strike that|delete that|cancel that|never ?mind|i mean|sorry|wait|or rather|rather|instead|correction|let me rephrase|make that|de fapt|perd[oó]n)\b"#
+
+    /// True when cleanup dropped meaning the speaker never retracted: content-word recall fell below
+    /// the level's bar, or, at Light, a whole raw sentence with three or more content words lost most
+    /// of them. Skipped for translation and whenever the speaker used an explicit backtrack marker.
+    static func appearsToHaveDroppedContent(
+        rawTranscript: String,
+        cleanedTranscript: String,
+        allowsRewording: Bool,
+        outputLanguage: String
+    ) -> Bool {
+        guard outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              rawTranscript.range(of: backtrackMarkerPattern, options: .regularExpression) == nil else {
+            return false
         }
+        let rawWords = contentWords(in: rawTranscript)
+        guard rawWords.count >= minimumContentWordsForLossCheck else { return false }
+        let cleanedWords = contentWords(in: cleanedTranscript)
+        let recall = Double(rawWords.intersection(cleanedWords).count) / Double(rawWords.count)
+        if recall < (allowsRewording ? mediumContentRecallThreshold : lightContentRecallThreshold) {
+            return true
+        }
+        guard !allowsRewording else { return false }
+        for sentence in rawTranscript.components(separatedBy: CharacterSet(charactersIn: ".!?\n")) {
+            let sentenceWords = contentWords(in: sentence)
+            guard sentenceWords.count >= minimumSentenceWordsForLossCheck else { continue }
+            let kept = Double(sentenceWords.intersection(cleanedWords).count) / Double(sentenceWords.count)
+            if kept < sentenceRecallThreshold { return true }
+        }
+        return false
+    }
 
-        return Set(parts.map(String.init).filter { token in
-            token.count > 1 && !stopWords.contains(token)
-        })
+    private static func contentWords(in text: String) -> Set<String> {
+        Set(words(in: text).filter { $0.count > 1 && !stopWords.contains($0) && !rewrittenWords.contains($0) })
     }
 }

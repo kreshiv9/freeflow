@@ -19,6 +19,22 @@ enum PostProcessingServiceTests {
         testDirectiveOrdering()
         testDefaultPromptKeepsSafetyRules()
         testDefaultPromptHasSmartFormattingRules()
+        testEchoedDelimiterIsStrippedFromCleanup()
+        testDroppedSentenceFallsBackWithoutRetry()
+    }
+
+    private static func testEchoedDelimiterIsStrippedFromCleanup() {
+        let run = cleanupRun(transcript: "store", dictationLanguage: "") { _ in "store RAW_TRANSCRIPTION" }
+        TestSupport.expectEqual(run.result?.transcript, "store")
+    }
+
+    private static func testDroppedSentenceFallsBackWithoutRetry() {
+        let raw = "The line above this was me testing out number seven. I typed, I went to the, and then I said store. But then it also printed out raw transcription."
+        let run = cleanupRun(transcript: raw, dictationLanguage: "") { _ in
+            "I typed \"I went to the store\" but it also printed out raw transcription."
+        }
+        TestSupport.expect(run.result == nil, "A cleanup that drops a sentence must throw so the caller pastes the raw transcript")
+        TestSupport.expectEqual(run.requests.count, 1)
     }
 
     private static let directive = "The dictation is primarily in Russian"
@@ -408,7 +424,7 @@ Synthetic term
         ] {
             TestSupport.expect(prompt.contains(rule), "The default prompt must keep: \(rule)")
         }
-        TestSupport.expectEqual(PostProcessingService.defaultSystemPromptDate, "2026-10-27")
+        TestSupport.expectEqual(PostProcessingService.defaultSystemPromptDate, "2026-11-02")
         TestSupport.expect(
             PostProcessingService.defaultSystemPromptDate > "2026-10-10",
             "The bumped date must show the newer-default banner to custom-prompt users"
@@ -429,13 +445,19 @@ Synthetic term
             "skip a line",
             "Cleanup level:",
             "Style:",
-            "Apply the Style line only when the cleaned text is English; ignore it for any other language."
+            "Apply the Style line only when the cleaned text is English; ignore it for any other language.",
+            "1st... 2nd... 3rd...",
+            "\"things to buy first milk second eggs third bread\"",
+            "never a whole sentence or clause that adds information",
+            "Never drop a sentence or clause that carries meaning",
+            "Never repeat the RAW_TRANSCRIPTION or CONTEXT markers"
         ] {
             TestSupport.expect(prompt.contains(rule), "The default prompt must contain: \(rule)")
         }
         for removed in [
             "Do not turn prose into bullets",
-            "keep prose sentences rather than a list"
+            "keep prose sentences rather than a list",
+            "simply restating a word or phrase"
         ] {
             TestSupport.expect(!prompt.contains(removed), "The default prompt must drop: \(removed)")
         }
