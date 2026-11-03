@@ -557,6 +557,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Wispr-style: a dictation into an AI chat is pasted without cleanup. On by default.
+    @Published var aiAppsRawTranscriptEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(aiAppsRawTranscriptEnabled, forKey: AIAppRawTranscriptPreference.storageKey)
+        }
+    }
+
     @Published var keepDictationInClipboardHistory: Bool {
         didSet {
             UserDefaults.standard.set(keepDictationInClipboardHistory, forKey: keepDictationInClipboardHistoryStorageKey)
@@ -666,6 +673,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var textInsertionTargetID: UUID?
     private var currentSessionIntent: SessionIntent = .dictation
     private var pendingSelectionSnapshot: AppSelectionSnapshot?
+    /// Bundle identifier latched from the recording-start selection snapshot so the
+    /// stop path can classify the target app when text context did not arrive.
+    /// Every start passes through prepareRecordingStart, which overwrites it, and
+    /// stopAndTranscribe is the only consumer, which clears it.
+    private var activeRecordingBundleIdentifier: String?
     private var pendingManualCommandInvocation = false
     private var pendingShortcutStartTask: Task<Void, Never>?
     private var pendingShortcutStartMode: RecordingTriggerMode?
@@ -839,6 +851,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.realtimeStreamingModel = realtimeStreamingModel
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
+        self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
         self.isPressEnterVoiceCommandEnabled = isPressEnterVoiceCommandEnabled
         self.alertSoundsEnabled = alertSoundsEnabled
         self.soundVolume = soundVolume
@@ -2158,6 +2171,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         activeOriginalFieldInsertionEnabled = selectionSnapshot.usesOriginalFieldInsertion
         activeTextInsertionTarget = activeOriginalFieldInsertionEnabled ? selectionSnapshot.textInsertionTarget : nil
         textInsertionTargetID = activeTextInsertionTarget?.identifier
+        activeRecordingBundleIdentifier = selectionSnapshot.bundleIdentifier
         let manualCommandRequested = manualCommandRequested
             ?? hotkeyManager.currentPressedModifiers.contains(commandModeManualModifier.shortcutModifier)
         guard let resolvedIntent = resolveSessionIntent(
@@ -2591,6 +2605,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case preservedExactWording
         case preservedExactWordingTranslated
         case preservedExactWordingTranslationFailedFallback
+        case rawTranscriptInAIApp
+        case rawTranscriptInAIAppTranslated
         case commandModeSucceeded(invocation: CommandInvocation)
         case commandModeFailedFallback(invocation: CommandInvocation)
 
@@ -2612,6 +2628,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return "Preserved exact wording, translated to output language"
             case .preservedExactWordingTranslationFailedFallback:
                 return "Verbatim translation failed, using untranslated raw transcript"
+            case .rawTranscriptInAIApp:
+                return AIAppRawTranscriptPreference.rawTranscriptProcessingStatus
+            case .rawTranscriptInAIAppTranslated:
+                return AIAppRawTranscriptPreference.translatedProcessingStatus
             case .commandModeSucceeded(let invocation):
                 return "Edit mode succeeded (\(invocation.rawValue))"
             case .commandModeFailedFallback(let invocation):
@@ -2629,7 +2649,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         customSystemPrompt: String,
         outputLanguage: String = "",
         dictationLanguage: String = "",
-        preserveExactWording: Bool
+        preserveExactWording: Bool,
+        rawTranscriptForAIApp: Bool = false
     ) async -> (finalTranscript: String, outcome: TranscriptProcessingOutcome, prompt: String) {
         let trimmedRawTranscript = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -2669,17 +2690,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
         //      settings. The translate-only path preserves filler,
         //      informal wording, and profanity 1:1 while still hitting
         //      the target language.
-        if preserveExactWording {
+        //
+        // A dictation into an AI app takes the same path so the prompt is
+        // pasted as spoken, and reports its own status.
+        if preserveExactWording || rawTranscriptForAIApp {
             let targetLanguage = outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
             if targetLanguage.isEmpty {
-                return (trimmedRawTranscript, .preservedExactWording, "")
+                return (trimmedRawTranscript, preserveExactWording ? .preservedExactWording : .rawTranscriptInAIApp, "")
             }
             do {
                 let result = try await postProcessingService.translateVerbatim(
                     transcript: trimmedRawTranscript,
                     targetLanguage: targetLanguage
                 )
-                return (result.transcript, .preservedExactWordingTranslated, result.prompt)
+                return (
+                    result.transcript,
+                    preserveExactWording ? .preservedExactWordingTranslated : .rawTranscriptInAIAppTranslated,
+                    result.prompt
+                )
             } catch {
                 os_log(.error, log: recordingLog,
                        "Verbatim translation failed: %{public}@",
@@ -2747,6 +2775,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         activeTextInsertionTarget = nil
         let sessionIntent = currentSessionIntent
         currentSessionIntent = .dictation
+        let sessionBundleIdentifier = activeRecordingBundleIdentifier
+        activeRecordingBundleIdentifier = nil
         audioRecorder.onRecordingReady = nil
         audioRecorder.onRecordingFailure = nil
         audioLevelCancellable?.cancel()
@@ -2892,6 +2922,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     )
                     stageMarks.contextFinished = CFAbsoluteTimeGetCurrent()
                     try Task.checkCancellation()
+                    // Wispr-style: an AI chat gets the transcript as spoken. Text context
+                    // classifies the app (and recognizes AI web chats); without it the
+                    // recording-start bundle identifier still recognizes desktop AI apps.
+                    let rawTranscriptForAIApp = AIAppRawTranscriptPreference.shouldPasteRawTranscript(
+                        enabled: self.aiAppsRawTranscriptEnabled,
+                        category: AIAppRawTranscriptPreference.resolvedCategory(
+                            textContext: appContext.textContext,
+                            bundleIdentifier: sessionBundleIdentifier
+                        ),
+                        isCommandMode: sessionIntent.isCommandMode
+                    )
                     await MainActor.run { [weak self] in
                         self?.debugStatusMessage = "Running post-processing"
                     }
@@ -2905,7 +2946,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         customSystemPrompt: self.customSystemPrompt,
                         outputLanguage: self.outputLanguage,
                         dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
-                        preserveExactWording: self.preserveExactWording
+                        preserveExactWording: self.preserveExactWording,
+                        rawTranscriptForAIApp: rawTranscriptForAIApp
                     )
                     stageMarks.cleanupFinished = CFAbsoluteTimeGetCurrent()
                     // Immutable snapshot: the @Sendable MainActor closure must not capture the mutable marks.

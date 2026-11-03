@@ -1287,6 +1287,15 @@ struct GeneralSettingsView: View {
             Text("If Output Language is set, the transcript is still translated into that language, but the translation is literal: no rewording, no filler removal, no reformatting.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            Divider()
+                .padding(.vertical, 2)
+
+            Toggle("Paste the raw transcript in AI apps", isOn: $appState.aiAppsRawTranscriptEnabled)
+
+            Text("Matches Wispr Flow: in ChatGPT, Claude, Perplexity and similar AI chats the transcript is pasted without cleanup so your prompt stays exactly as spoken. Terminals and code editors still get cleanup.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
