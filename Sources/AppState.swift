@@ -562,6 +562,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Wispr-style: the pasted text takes the casing and spacing of the text at the cursor. On by default.
+    @Published var cursorFormattingEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(cursorFormattingEnabled, forKey: CursorFormatting.storageKey)
+        }
+    }
+
     /// Wispr-style tone per kind of app, applied as a prompt line for English dictations.
     @Published var dictationStyles: [StyleCategory: DictationStyle] {
         didSet { StyleCategory.saveStyles(dictationStyles, to: .standard) }
@@ -860,6 +867,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
+        self.cursorFormattingEnabled = CursorFormatting.load(from: .standard)
         self.dictationStyles = StyleCategory.loadStyles(from: .standard)
         self.isPressEnterVoiceCommandEnabled = isPressEnterVoiceCommandEnabled
         self.alertSoundsEnabled = alertSoundsEnabled
@@ -2608,12 +2616,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
         for outcome: TranscriptProcessingOutcome,
         parsedTranscript: TranscriptCommandParsingResult,
         isRetry: Bool = false,
-        expandedSnippetCount: Int = 0
+        expandedSnippetCount: Int = 0,
+        fittedToCursor: Bool = false
     ) -> String {
-        let status = outcome.statusMessage(isRetry: isRetry)
-            + SnippetExpansion.statusSuffix(expandedCount: expandedSnippetCount)
-        guard parsedTranscript.shouldPressEnterAfterPaste else { return status }
-        return "\(status); detected press enter command"
+        CursorFormatting.processingStatus(
+            outcome: outcome.statusMessage(isRetry: isRetry),
+            expandedSnippetCount: expandedSnippetCount,
+            fittedToCursor: fittedToCursor,
+            pressEnterDetected: parsedTranscript.shouldPressEnterAfterPaste
+        )
     }
 
     func playAlertSound(named name: String) {
@@ -2647,6 +2658,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case rawTranscriptInAIAppTranslated
         case commandModeSucceeded(invocation: CommandInvocation)
         case commandModeFailedFallback(invocation: CommandInvocation)
+
+        /// A macro payload is literal user-defined text (code, signatures, addresses).
+        var isVoiceMacro: Bool {
+            if case .voiceMacro = self { return true }
+            return false
+        }
 
         func statusMessage(isRetry: Bool = false) -> String {
             switch self {
@@ -3079,10 +3096,30 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.lastContextLLMPrompt = appContext.contextPrompt ?? ""
                         let trimmedRawTranscript = parsedTranscript.transcript
                         let trimmedFinalTranscript = result.finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                        // Local fit to the text around the cursor. Edit Mode replaces a selection and a
+                        // voice macro is literal text, so neither is fitted; the Run Log keeps the
+                        // cleaned text as produced.
+                        let cursorFit: CursorFormatting.Adjustment? = CursorFormatting.applies(
+                            enabled: self.cursorFormattingEnabled,
+                            isCommandMode: sessionIntent.isCommandMode,
+                            isVoiceMacro: result.outcome.isVoiceMacro
+                        ) && !trimmedFinalTranscript.isEmpty
+                            ? appContext.textContext.map {
+                                CursorFormatting.adjust(
+                                    trimmedFinalTranscript,
+                                    in: $0,
+                                    keepCapitalized: CursorFormatting.keepCapitalizedTerms(
+                                        from: DictionaryCorrection.vocabularyText(self.customVocabulary, merging: self.dictionaryCorrections)
+                                    )
+                                )
+                            }
+                            : nil
+                        let insertedTranscript = cursorFit?.text ?? trimmedFinalTranscript
                         let processingStatus = Self.statusMessage(
                             for: result.outcome,
                             parsedTranscript: parsedTranscript,
-                            expandedSnippetCount: result.expandedSnippetCount
+                            expandedSnippetCount: result.expandedSnippetCount,
+                            fittedToCursor: cursorFit?.changedAnything == true
                         )
                         self.lastPostProcessingPrompt = result.prompt
                         self.lastRawTranscript = trimmedRawTranscript
@@ -3103,7 +3140,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         )
                         self.transcriptionTask = nil
                         self.transcribingAudioFileName = nil
-                        self.lastTranscript = trimmedFinalTranscript
+                        self.lastTranscript = insertedTranscript
                         self.isTranscribing = false
                         self.endCriticalDictationActivity()
                         self.debugStatusMessage = "Done"
@@ -3164,9 +3201,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 self?.completeStageTimings(firedMarks.timings, entryID: entryID)
                             }
                             self.insertTranscriptWhenShortcutReleased(
-                                trimmedFinalTranscript, target: textInsertionTarget,
+                                insertedTranscript, target: textInsertionTarget,
                                 shouldPressEnter: shouldPressEnterAfterPaste,
-                                useOriginalField: useOriginalFieldInsertion
+                                useOriginalField: useOriginalFieldInsertion,
+                                appendsSpaceAfterSentenceMark: !(cursorFit?.handledTrailingEdge ?? false)
                             )
                         }
 
@@ -3704,12 +3742,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     /// Delivers using the start-time mode and target; only definite non-insertion permits fallback paste.
-    /// Unconfirmed writes leave recovery to Paste Again instead of risking a duplicate.
+    /// Unconfirmed writes leave recovery to Paste Again instead of risking a duplicate. A cursor fit
+    /// that already settled the trailing edge passes `appendsSpaceAfterSentenceMark: false`.
     private func insertTranscriptWhenShortcutReleased(
-        _ transcript: String, target: AppTextInsertionTarget?, shouldPressEnter: Bool, useOriginalField: Bool
+        _ transcript: String, target: AppTextInsertionTarget?, shouldPressEnter: Bool, useOriginalField: Bool,
+        appendsSpaceAfterSentenceMark: Bool = true
     ) {
         guard useOriginalField else {
-            let pendingRestore = writeTranscriptToPasteboard(transcript)
+            let pendingRestore = writeTranscriptToPasteboard(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark)
             pasteAtCursorWhenShortcutReleased {
                 if shouldPressEnter {
                     self.pressEnterAfterPaste { self.restoreClipboardIfNeeded(pendingRestore) }
@@ -3738,7 +3778,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 let pasted: Bool
                 if !target.allowsTextCapture, target.isSupportedTextControl {
                     if target.identifier == self.textInsertionTargetID, target.isFocused {
-                        pendingRestore = self.writeTranscriptToPasteboard(transcript)
+                        pendingRestore = self.writeTranscriptToPasteboard(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark)
                         pasted = target.identifier == self.textInsertionTargetID && target.isFocused
                         if pasted { self.pasteAtCursor(processIdentifier: target.processIdentifier) }
                     } else {
@@ -3748,7 +3788,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     pasted = target.pasteIfUnchanged(
                         restoringSelection: false,
                         isCurrent: { target.identifier == self.textInsertionTargetID },
-                        preparePaste: { pendingRestore = self.writeTranscriptToPasteboard(transcript) },
+                        preparePaste: { pendingRestore = self.writeTranscriptToPasteboard(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark) },
                         paste: { self.pasteAtCursor(processIdentifier: target.processIdentifier) }
                     )
                 }
@@ -3769,14 +3809,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return
             }
             target.insert(
-                self.transcriptTextForInsertion(transcript),
+                self.transcriptTextForInsertion(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark),
                 isCurrent: { target.identifier == self.textInsertionTargetID }
             ) { insertionResult in
                 guard target.identifier == self.textInsertionTargetID else { return }
                 switch insertionResult {
                 case .inserted:
                     if !self.preserveClipboard || self.keepDictationInClipboardHistory {
-                        let pendingRestore = self.writeTranscriptToPasteboard(transcript)
+                        let pendingRestore = self.writeTranscriptToPasteboard(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark)
                         self.restoreClipboardIfNeeded(pendingRestore)
                     }
                     finish("Inserted in original field")
@@ -3787,7 +3827,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         target.pasteIfUnchanged(
                             restoringSelection: true,
                             isCurrent: { target.identifier == self.textInsertionTargetID },
-                            preparePaste: { pendingRestore = self.writeTranscriptToPasteboard(transcript) },
+                            preparePaste: { pendingRestore = self.writeTranscriptToPasteboard(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark) },
                             paste: { self.pasteAtCursor(processIdentifier: target.processIdentifier) }
                         )
                     }) { pasted in
@@ -3995,8 +4035,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     /// Keeps trailing-space behavior identical for clipboard paste and Accessibility insertion.
-    private func transcriptTextForInsertion(_ transcript: String) -> String {
-        guard let last = transcript.last, ".!?".contains(last) else { return transcript }
+    /// The space is skipped when the cursor fit already settled the trailing edge.
+    private func transcriptTextForInsertion(_ transcript: String, appendsSpaceAfterSentenceMark: Bool = true) -> String {
+        guard appendsSpaceAfterSentenceMark, let last = transcript.last, ".!?".contains(last) else { return transcript }
         return transcript + " "
     }
 
@@ -4005,13 +4046,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// types for clipboard managers, and saving the clipboard state for later restoration.
     /// - Parameter transcript: The text to be pasted.
     /// - Returns: A `PendingClipboardRestore` object if clipboard preservation is enabled, otherwise nil.
-    private func writeTranscriptToPasteboard(_ transcript: String) -> PendingClipboardRestore? {
+    private func writeTranscriptToPasteboard(
+        _ transcript: String, appendsSpaceAfterSentenceMark: Bool = true
+    ) -> PendingClipboardRestore? {
         let pasteboard = NSPasteboard.general
         let snapshot = preserveClipboard ? PreservedPasteboardSnapshot(pasteboard: pasteboard) : nil
 
         // Append a space when ending with sentence-ending punctuation so the
         // next dictation does not jam against the prior period.
-        let textToWrite = transcriptTextForInsertion(transcript)
+        let textToWrite = transcriptTextForInsertion(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark)
 
         if keepDictationInClipboardHistory {
             // Plain write so clipboard managers record the dictation in history.

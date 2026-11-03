@@ -244,6 +244,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
 
         if AppTextInsertionCore.canCapture(role: role, subrole: subrole),
            let slices = cursorText(from: focused) {
+            snapshot.fieldTextRead = true
             snapshot.textBeforeCursor = slices.before
             snapshot.selectedText = slices.selected
             snapshot.textAfterCursor = slices.after

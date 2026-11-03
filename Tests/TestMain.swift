@@ -17,6 +17,7 @@ struct FreeFlowTests {
         DictationStyleTests.run()
         DictionaryCorrectionsTests.run()
         SnippetExpansionTests.run()
+        CursorFormattingTests.run()
         OriginalFieldInsertionPreferenceTests.run()
         ShortcutCoreTests.run()
         SemanticVersionTests.run()

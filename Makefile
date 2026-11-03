@@ -22,6 +22,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AppTextInsertionTarget.swift \
 	Sources/CleanupLevel.swift \
 	Sources/ContextInferenceFailure.swift \
+	Sources/CursorFormatting.swift \
 	Sources/DictationStyle.swift \
 	Sources/DictionaryCorrections.swift \
 	Sources/LLMAPITransport.swift \

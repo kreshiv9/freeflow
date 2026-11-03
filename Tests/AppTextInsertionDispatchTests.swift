@@ -33,6 +33,7 @@ enum AppTextInsertionDispatchTests {
         testFocusedUnsupportedUnreadableTargetSkipsEnter()
         testDelayedEnterCancelsForNewSession()
         testDisabledOriginalFieldUsesCurrentFieldPaste()
+        testFittedTranscriptKeepsItsTrailingEdge()
         testPasteTimingReportsSkippedOriginalFieldInsertion()
     }
 
@@ -552,6 +553,38 @@ enum AppTextInsertionDispatchTests {
         TestSupport.expectEqual(fixture.target.focusCallCount, 0)
     }
 
+    /// A cursor fit that inspected the text after the cursor owns the trailing edge: the
+    /// jam-space after a sentence mark is skipped on every delivery path, so " New sentence."
+    /// pasted before " Second sentence." never produces a double space.
+    private static func testFittedTranscriptKeepsItsTrailingEdge() {
+        for (appendsSpace, expected) in [(true, " New sentence. "), (false, " New sentence.")] {
+            let currentField = makeFixture(focused: true)
+            currentField.state.testDispatchInsertion(" New sentence.", target: currentField.target, shouldPressEnter: false,
+                                                     useOriginalField: false, appendsSpaceAfterSentenceMark: appendsSpace)
+            TestDispatchQueue.runAll()
+            TestSupport.expectEqual(currentField.state.clipboardTexts, [expected])
+
+            let originalField = makeFixture(focused: true)
+            originalField.state.testDispatchInsertion(" New sentence.", target: originalField.target, shouldPressEnter: false,
+                                                      useOriginalField: true, appendsSpaceAfterSentenceMark: appendsSpace)
+            TestDispatchQueue.runAll()
+            TestSupport.expectEqual(originalField.state.clipboardTexts, [expected])
+            TestSupport.expectEqual(originalField.state.pasteCalls.count, 1)
+
+            let accessibility = makeFixture(focused: false)
+            accessibility.target.insertionResult = .inserted
+            accessibility.state.testDispatchInsertion(" New sentence.", target: accessibility.target, shouldPressEnter: false,
+                                                      useOriginalField: true, appendsSpaceAfterSentenceMark: appendsSpace)
+            TestDispatchQueue.runAll()
+            TestSupport.expectEqual(accessibility.target.insertedTexts, [expected])
+            TestSupport.expectEqual(accessibility.state.clipboardTexts, [expected])
+        }
+        let unfitted = makeFixture(focused: true)
+        unfitted.state.testDispatchInsertion("dictation.", target: unfitted.target, shouldPressEnter: false, useOriginalField: false)
+        TestDispatchQueue.runAll()
+        TestSupport.expectEqual(unfitted.state.clipboardTexts, ["dictation. "])
+    }
+
     /// The paste stage may only be reported for a dispatch that pasted or
     /// inserted. An original-field action that returns early must hand the
     /// timing handler nil so the Run Log never claims a paste that never happened.
@@ -677,6 +710,7 @@ final class TestInsertionState {
     var preserveClipboard = false
     var keepDictationInClipboardHistory = false
     var clipboardWriteCount = 0
+    var clipboardTexts: [String] = []
     var clipboardRestoreCount = 0
     var pasteCalls: [pid_t?] = []
     var enterCalls: [pid_t?] = []
@@ -700,8 +734,11 @@ final class TestInsertionState {
     func pasteAtCursor(processIdentifier: pid_t? = nil) { pasteCalls.append(processIdentifier) }
     func pressEnter(processIdentifier: pid_t? = nil) { enterCalls.append(processIdentifier) }
 
-    func writeTranscriptToPasteboard(_ transcript: String) -> TestPendingClipboardRestore? {
+    func writeTranscriptToPasteboard(
+        _ transcript: String, appendsSpaceAfterSentenceMark: Bool = true
+    ) -> TestPendingClipboardRestore? {
         clipboardWriteCount += 1
+        clipboardTexts.append(transcriptTextForInsertion(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark))
         let pending = preserveClipboard ? TestPendingClipboardRestore(state: self) : nil
         afterClipboardWrite?()
         return pending
@@ -718,8 +755,8 @@ final class TestInsertionState {
 
     func scheduleReadyStatusReset(after delay: TimeInterval, matching statuses: Set<String>? = nil) {}
 
-    func transcriptTextForInsertion(_ transcript: String) -> String {
-        guard let last = transcript.last, ".!?".contains(last) else { return transcript }
+    func transcriptTextForInsertion(_ transcript: String, appendsSpaceAfterSentenceMark: Bool = true) -> String {
+        guard appendsSpaceAfterSentenceMark, let last = transcript.last, ".!?".contains(last) else { return transcript }
         return transcript + " "
     }
 }
@@ -742,6 +779,7 @@ final class TestInsertionTarget {
     var isMinimized = false
     var insertionResult: AppTextInsertionResult = .notInserted
     var insertCallCount = 0
+    var insertedTexts: [String] = []
     var focusCallCount = 0
     var selectionRestoreCount = 0
     var minimizeChangeCount = 0
@@ -781,6 +819,7 @@ final class TestInsertionTarget {
 
     func insert(_ text: String, isCurrent: @escaping () -> Bool, completion: @escaping (AppTextInsertionResult) -> Void) {
         insertCallCount += 1
+        insertedTexts.append(text)
         completion(isCurrent() ? insertionResult : .unavailable)
     }
 

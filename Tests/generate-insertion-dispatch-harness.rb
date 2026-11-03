@@ -74,10 +74,12 @@ generated = <<~SWIFT
       }
 
       func testDispatchInsertion(
-          _ transcript: String, target: TestInsertionTarget?, shouldPressEnter: Bool, useOriginalField: Bool
+          _ transcript: String, target: TestInsertionTarget?, shouldPressEnter: Bool, useOriginalField: Bool,
+          appendsSpaceAfterSentenceMark: Bool = true
       ) {
           insertTranscriptWhenShortcutReleased(
-              transcript, target: target, shouldPressEnter: shouldPressEnter, useOriginalField: useOriginalField
+              transcript, target: target, shouldPressEnter: shouldPressEnter, useOriginalField: useOriginalField,
+              appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark
           )
       }
 
