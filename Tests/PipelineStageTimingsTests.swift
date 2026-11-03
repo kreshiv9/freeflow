@@ -90,6 +90,13 @@ enum PipelineStageTimingsTests {
             "audio 40 ms · transcription 820 ms (realtime) · context 0 ms · cleanup 610 ms · paste 35 ms · total 1.5 s"
         )
 
+        TestSupport.expectEqual(PipelineStageTimings.deepgramTranscriptionSource, "deepgram")
+        sourced.transcriptionSource = "deepgram"
+        TestSupport.expectEqual(
+            sourced.summaryLine,
+            "audio 40 ms · transcription 820 ms (deepgram) · context 0 ms · cleanup 610 ms · paste 35 ms · total 1.5 s"
+        )
+
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 0), "0 ms")
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 999), "999 ms")
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 1000), "1.0 s")

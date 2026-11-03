@@ -19,13 +19,15 @@ enum RealtimeTranscriptionError: LocalizedError {
     }
 }
 
-final class RealtimeTranscriptionService {
+final class RealtimeTranscriptionService: StreamingTranscriptionSession {
     struct Configuration {
         let baseURL: String
         let apiKey: String
         let model: String
         let language: String?
     }
+
+    let transcriptionSource = PipelineStageTimings.realtimeTranscriptionSource
 
     private let config: Configuration
     private let session: URLSession

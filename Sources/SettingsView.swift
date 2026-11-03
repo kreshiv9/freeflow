@@ -51,8 +51,12 @@ struct ProviderSettingsFields: View {
     @FocusState private var isEditingContextModel: Bool
     @FocusState private var transcriptionAPIURLFocused: Bool
     @FocusState private var transcriptionAPIKeyFocused: Bool
+    @FocusState private var isEditingDeepgramAPIKey: Bool
     @State private var transcriptionModelDraft: String = ""
     @State private var realtimeStreamingModelDraft: String = ""
+    @State private var deepgramAPIKeyDraft: String = ""
+    @State private var isValidatingDeepgramKey = false
+    @State private var deepgramKeyValidation: DeepgramStreamingCore.KeyValidation?
     @State private var postProcessingModelDraft: String = ""
     @State private var postProcessingFallbackModelDraft: String = ""
     @State private var contextModelDraft: String = ""
@@ -80,6 +84,53 @@ struct ProviderSettingsFields: View {
         realtimeStreamingModelDraft = trimmed
         guard appState.realtimeStreamingModel != trimmed else { return }
         appState.realtimeStreamingModel = trimmed
+    }
+
+    private func commitDeepgramAPIKey() {
+        let trimmed = deepgramAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        deepgramAPIKeyDraft = trimmed
+        guard appState.deepgramAPIKey != trimmed else { return }
+        appState.deepgramAPIKey = trimmed
+    }
+
+    /// Stores the draft first so the validated key is the stored key; the result
+    /// is shown only while the draft is still that key.
+    private func validateDeepgramAPIKey() {
+        guard !isValidatingDeepgramKey else { return }
+        commitDeepgramAPIKey()
+        let key = deepgramAPIKeyDraft
+        guard !key.isEmpty else { return }
+        isValidatingDeepgramKey = true
+        deepgramKeyValidation = nil
+
+        Task { @MainActor in
+            let result = await DeepgramStreamingCore.validateAPIKey(key)
+            isValidatingDeepgramKey = false
+            if deepgramAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines) == key {
+                deepgramKeyValidation = result
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func deepgramKeyValidationLabel(_ validation: DeepgramStreamingCore.KeyValidation) -> some View {
+        switch validation {
+        case .valid:
+            Label(validation.statusText, systemImage: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+        case .limitedScope:
+            Label(validation.statusText, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+            Text("The key works but cannot list projects; streaming should still work.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .invalid, .unreachable:
+            Label(validation.statusText, systemImage: "xmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
     }
 
     private func commitPostProcessingModel() {
@@ -322,45 +373,98 @@ struct ProviderSettingsFields: View {
 
             Divider()
 
-            Toggle(
-                "Stream audio while recording (realtime)",
-                isOn: $appState.realtimeStreamingEnabled
-            )
-            Text("Streams audio through the provider's OpenAI-compatible /v1/realtime WebSocket so transcription runs while you speak.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
             VStack(alignment: .leading, spacing: 6) {
-                Text("Realtime Transcription Model")
+                Text("Stream audio while speaking")
                     .font(.caption.weight(.semibold))
-                HStack(spacing: 8) {
-                    TextField("Required by some providers, e.g. gpt-4o-transcribe", text: $realtimeStreamingModelDraft)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($isEditingRealtimeStreamingModel)
-                        .onSubmit {
-                            commitRealtimeStreamingModel()
-                        }
-                        .onChange(of: isEditingRealtimeStreamingModel) { isEditing in
-                            if !isEditing {
-                                commitRealtimeStreamingModel()
-                            }
-                        }
-                    if !realtimeStreamingModelDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Button("Reset") {
-                            realtimeStreamingModelDraft = ""
-                            appState.realtimeStreamingModel = ""
-                        }
-                        .font(.caption)
+                Picker("", selection: $appState.streamingProvider) {
+                    ForEach(StreamingTranscriptionProvider.allCases) { provider in
+                        Text(provider.displayName).tag(provider)
                     }
                 }
-                Text("Used only for realtime streaming. Leave empty for providers that supply a server default.")
+                .accessibilityLabel("Stream audio while speaking")
+                .labelsHidden()
+                Text(appState.streamingProvider.caption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if appState.streamingProvider.usesRealtimeStreamingModel {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Realtime Transcription Model")
+                        .font(.caption.weight(.semibold))
+                    HStack(spacing: 8) {
+                        TextField("Required by some providers, e.g. gpt-4o-transcribe", text: $realtimeStreamingModelDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($isEditingRealtimeStreamingModel)
+                            .onSubmit {
+                                commitRealtimeStreamingModel()
+                            }
+                            .onChange(of: isEditingRealtimeStreamingModel) { isEditing in
+                                if !isEditing {
+                                    commitRealtimeStreamingModel()
+                                }
+                            }
+                        if !realtimeStreamingModelDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Button("Reset") {
+                                realtimeStreamingModelDraft = ""
+                                appState.realtimeStreamingModel = ""
+                            }
+                            .font(.caption)
+                        }
+                    }
+                    Text("Used only for realtime streaming. Leave empty for providers that supply a server default.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if appState.streamingProvider == .deepgram {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Deepgram API Key")
+                        .font(.caption.weight(.semibold))
+                    HStack(spacing: 8) {
+                        SecureField("Enter your Deepgram API key", text: $deepgramAPIKeyDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                            .focused($isEditingDeepgramAPIKey)
+                            .onSubmit {
+                                commitDeepgramAPIKey()
+                            }
+                            .onChange(of: isEditingDeepgramAPIKey) { isEditing in
+                                if !isEditing {
+                                    commitDeepgramAPIKey()
+                                }
+                            }
+                            .onChange(of: deepgramAPIKeyDraft) { _ in
+                                deepgramKeyValidation = nil
+                            }
+                            .disabled(isValidatingDeepgramKey)
+                        Button(isValidatingDeepgramKey ? "Validating..." : "Validate") {
+                            validateDeepgramAPIKey()
+                        }
+                        .disabled(deepgramAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isValidatingDeepgramKey)
+                        if !deepgramAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Button("Clear") {
+                                deepgramAPIKeyDraft = ""
+                                appState.deepgramAPIKey = ""
+                            }
+                            .font(.caption)
+                        }
+                    }
+                    if let deepgramKeyValidation {
+                        deepgramKeyValidationLabel(deepgramKeyValidation)
+                    } else if appState.deepgramAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Label(StreamingTranscriptionProvider.deepgramMissingKeyWarning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
             }
         }
         .onAppear {
             transcriptionModelDraft = appState.transcriptionModel
             realtimeStreamingModelDraft = appState.realtimeStreamingModel
+            deepgramAPIKeyDraft = appState.deepgramAPIKey
             postProcessingModelDraft = appState.postProcessingModel
             postProcessingFallbackModelDraft = appState.postProcessingFallbackModel
             contextModelDraft = appState.contextModel
@@ -373,6 +477,11 @@ struct ProviderSettingsFields: View {
         .onChange(of: appState.realtimeStreamingModel) { value in
             if !isEditingRealtimeStreamingModel {
                 realtimeStreamingModelDraft = value
+            }
+        }
+        .onChange(of: appState.deepgramAPIKey) { value in
+            if !isEditingDeepgramAPIKey {
+                deepgramAPIKeyDraft = value
             }
         }
         .onChange(of: appState.postProcessingModel) { value in
@@ -1456,7 +1565,7 @@ struct GeneralSettingsView: View {
 
             Toggle("Skip transcription when no speech is detected", isOn: $appState.silenceGateEnabled)
 
-            Text("When a recording holds only silence or quiet background noise, \(AppName.displayName) ends the dictation locally instead of requesting a transcript; louder steady noise cannot be told apart from speech and is still transcribed. The silent audio is not uploaded unless realtime streaming is on, which streams audio while you hold the shortcut. Turn this off if quiet dictations are being skipped.")
+            Text("When a recording holds only silence or quiet background noise, \(AppName.displayName) ends the dictation locally instead of requesting a transcript; louder steady noise cannot be told apart from speech and is still transcribed. The silent audio is not uploaded unless Stream audio while speaking is on, which streams audio while you hold the shortcut. Turn this off if quiet dictations are being skipped.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
