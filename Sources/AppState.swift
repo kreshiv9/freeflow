@@ -627,6 +627,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         voiceIsolation.effective(isSystemSupported: VoiceIsolationFilter.isAvailable, captureFormat: captureFormat)
     }
 
+    /// Experimental Apple voice-processing capture; read when each recording
+    /// starts. The recorder falls back to Standard on its own.
+    @Published var captureBackend: CaptureBackendPreference {
+        didSet {
+            captureBackend.save(to: .standard)
+        }
+    }
+
     /// Engine opened by an Edit Mode web search.
     @Published var webSearchEngine: WebSearchEngine {
         didSet {
@@ -1029,6 +1037,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
         self.captureFormat = CaptureFormatPreference.load(from: .standard)
         self.voiceIsolation = VoiceIsolationPreference.load(from: .standard)
+        self.captureBackend = CaptureBackendPreference.load(from: .standard)
         self.webSearchEngine = WebSearchEngine.load(from: .standard)
         self.handsFreeSilenceTimeoutSeconds = HandsFreeAutoStop.loadSilenceTimeoutSeconds(from: .standard)
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
@@ -3009,6 +3018,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let streamSampleRate = realtimeService == nil ? nil : streamingProvider.streamSampleRate
         let captureFormat = self.captureFormat
         let voiceIsolation = effectiveVoiceIsolation
+        let captureBackend = self.captureBackend
 
         // Start engine on background thread so UI isn't blocked
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -3020,7 +3030,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     timingGeneration: timingGeneration,
                     captureFormat: captureFormat,
                     streamSampleRate: streamSampleRate,
-                    voiceIsolation: voiceIsolation
+                    voiceIsolation: voiceIsolation,
+                    captureBackend: captureBackend
                 )
                 os_log(.info, log: recordingLog, "audioRecorder.startRecording() done: %.3fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
                 DispatchQueue.main.async { [self] in
