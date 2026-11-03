@@ -38,9 +38,10 @@ final class DictationShortcutSessionController {
     }
 
     func handle(event: ShortcutEvent, isTranscribing: Bool) -> DictationShortcutAction? {
-        // Paste Again is handled before this controller runs; if it ever
-        // reaches here, treat as a no-op so dictation state is unaffected.
+        // Paste Again and transforms are handled before this controller runs; if
+        // one ever reaches here, treat it as a no-op so dictation state is unaffected.
         if event == .copyAgainTriggered { return nil }
+        if case .transformTriggered = event { return nil }
 
         // The matcher emits a batch's activations before its deactivations, so
         // the keypress that ended a session is over once any release arrives.
@@ -66,6 +67,8 @@ final class DictationShortcutSessionController {
             case .holdDeactivated, .toggleDeactivated:
                 return nil
             case .copyAgainTriggered:
+                return nil
+            case .transformTriggered:
                 return nil
             }
         }
@@ -107,6 +110,8 @@ final class DictationShortcutSessionController {
                 return nil
             case .copyAgainTriggered:
                 return nil
+            case .transformTriggered:
+                return nil
             }
 
         case .toggle:
@@ -124,6 +129,8 @@ final class DictationShortcutSessionController {
                 guard holdStopArmed else { return nil }
                 return endToggleSession()
             case .copyAgainTriggered:
+                return nil
+            case .transformTriggered:
                 return nil
             }
         }

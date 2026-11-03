@@ -830,6 +830,9 @@ struct GeneralSettingsView: View {
                 SettingsCard("Edit Mode", icon: "pencil") {
                     commandModeSection
                 }
+                SettingsCard("Transforms", icon: "wand.and.stars") {
+                    TransformsSettingsSection()
+                }
                 SettingsCard("Cleanup", icon: "sparkles") {
                     cleanupSection
                 }

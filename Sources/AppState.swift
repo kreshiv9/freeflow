@@ -152,10 +152,12 @@ private enum CommandScope {
 private enum SessionIntent {
     case dictation
     case command(invocation: CommandInvocation, selectedText: String, scope: CommandScope)
+    /// A shortcut-triggered transform. Its row has no audio, so a stored one re-loads as a dictation.
+    case transform
 
     var isCommandMode: Bool {
         switch self {
-        case .dictation:
+        case .dictation, .transform:
             return false
         case .command:
             return true
@@ -166,6 +168,8 @@ private enum SessionIntent {
         switch self {
         case .dictation:
             return .dictation
+        case .transform:
+            return .transform
         case .command(let invocation, _, _):
             switch invocation {
             case .automatic:
@@ -178,7 +182,7 @@ private enum SessionIntent {
 
     var persistedSelectedText: String? {
         switch self {
-        case .dictation:
+        case .dictation, .transform:
             return nil
         case .command(_, let selectedText, _):
             return selectedText
@@ -200,6 +204,8 @@ private enum SessionIntent {
         switch self {
         case .dictation:
             return .dictation
+        case .transform:
+            return .transform
         case .command(let invocation, _, _):
             return .command(invocation: invocation, selectedText: "", scope: CommandScope.none)
         }
@@ -241,6 +247,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let holdShortcutStorageKey = "hold_shortcut"
     private let toggleShortcutStorageKey = "toggle_shortcut"
     private let copyAgainShortcutStorageKey = "copy_again_shortcut"
+    private let transformPolishShortcutStorageKey = "transform_polish_shortcut"
+    private let transformPromptEngineerShortcutStorageKey = "transform_prompt_engineer_shortcut"
     private let savedHoldCustomShortcutStorageKey = "saved_hold_custom_shortcut"
     private let savedToggleCustomShortcutStorageKey = "saved_toggle_custom_shortcut"
     private let savedCopyAgainCustomShortcutStorageKey = "saved_copy_again_custom_shortcut"
@@ -403,6 +411,47 @@ final class AppState: ObservableObject, @unchecked Sendable {
             restartHotkeyMonitoring()
         }
     }
+
+    @Published var polishTransformShortcut: ShortcutBinding {
+        didSet {
+            persistShortcut(polishTransformShortcut, key: transformPolishShortcutStorageKey)
+            restartHotkeyMonitoring()
+        }
+    }
+
+    @Published var promptEngineerTransformShortcut: ShortcutBinding {
+        didSet {
+            persistShortcut(promptEngineerTransformShortcut, key: transformPromptEngineerShortcutStorageKey)
+            restartHotkeyMonitoring()
+        }
+    }
+
+    /// Custom prompts carry their own shortcut; only an id or shortcut change re-arms the hotkeys.
+    @Published var customTransforms: [CustomTransform] = [] {
+        didSet {
+            CustomTransform.save(customTransforms, to: .standard)
+            if oldValue.map(\.id) != customTransforms.map(\.id)
+                || oldValue.map(\.shortcut) != customTransforms.map(\.shortcut) {
+                restartHotkeyMonitoring()
+            }
+        }
+    }
+
+    @Published var transformAutoApply: TransformAutoApplyPreference {
+        didSet { transformAutoApply.save(to: .standard) }
+    }
+
+    @Published var transformAutoApplyAIAppsOnly: Bool {
+        didSet {
+            UserDefaults.standard.set(transformAutoApplyAIAppsOnly, forKey: TransformAutoApplyPreference.aiAppsOnlyStorageKey)
+        }
+    }
+
+    /// A shortcut transform is in flight; a second one is refused until it finishes.
+    @Published private(set) var isTransforming = false
+    /// The running shortcut transform's claim on the cursor and the insertion target. Every dictation
+    /// start or cancel clears it, so a result that arrives afterwards is copied instead of delivered.
+    private var activeTransformToken: UUID?
 
     @Published private(set) var savedHoldCustomShortcut: ShortcutBinding? {
         didSet {
@@ -670,7 +719,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
     @Published var isTranscribing = false
     @Published var retryingItemIDs: Set<UUID> = []
-    @Published var lastTranscript: String = ""
+    @Published var lastTranscript: String = "" {
+        didSet { lastTranscriptUpdatedAt = lastTranscript.isEmpty ? nil : Date() }
+    }
+    /// When text last became the last transcript: the "last dictation" window for transforms.
+    private var lastTranscriptUpdatedAt: Date?
     @Published var errorMessage: String?
     @Published var statusText: String = "Ready"
     @Published var hasAccessibility = false
@@ -823,6 +876,28 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let commandModeManualModifier = CommandModeManualModifier(
             rawValue: UserDefaults.standard.string(forKey: commandModeManualModifierStorageKey) ?? ""
         ) ?? .option
+        // The built-in transform defaults are resolved at launch and never persisted: they stay out of
+        // the way of the dictation shortcuts, Paste Again, the manual Edit Mode presses, the custom
+        // prompt shortcuts and each other, and come back once a conflict is gone. An explicit choice in
+        // Settings, including Disabled, is stored by the setter and wins; an unreadable one is Disabled.
+        let customTransforms = CustomTransform.load(from: .standard)
+        let storedPolishShortcut = Self.loadShortcut(forKey: transformPolishShortcutStorageKey)
+        let storedPromptEngineerShortcut = Self.loadShortcut(forKey: transformPromptEngineerShortcutStorageKey)
+        let launchTransformShortcuts = TransformCore.launchShortcuts(
+            storedPolish: storedPolishShortcut.binding
+                ?? (storedPolishShortcut.hadStoredValue ? .disabled : nil),
+            storedPromptEngineer: storedPromptEngineerShortcut.binding
+                ?? (storedPromptEngineerShortcut.hadStoredValue ? .disabled : nil),
+            hold: shortcuts.hold,
+            toggle: shortcuts.toggle,
+            copyAgain: shortcuts.copyAgain,
+            manualModifier: isCommandModeEnabled && commandModeStyle == .manual
+                ? commandModeManualModifier.shortcutModifier
+                : nil,
+            customShortcuts: customTransforms.compactMap(\.shortcut)
+        )
+        let polishShortcut = launchTransformShortcuts.polish
+        let promptEngineerShortcut = launchTransformShortcuts.promptEngineer
         let preserveClipboard = UserDefaults.standard.object(forKey: preserveClipboardStorageKey) == nil
             ? true
             : UserDefaults.standard.bool(forKey: preserveClipboardStorageKey)
@@ -890,6 +965,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.holdShortcut = shortcuts.hold
         self.toggleShortcut = shortcuts.toggle
         self.copyAgainShortcut = shortcuts.copyAgain
+        self.polishTransformShortcut = polishShortcut
+        self.promptEngineerTransformShortcut = promptEngineerShortcut
+        self.customTransforms = customTransforms
+        self.transformAutoApply = TransformAutoApplyPreference.load(from: .standard)
+        self.transformAutoApplyAIAppsOnly = TransformAutoApplyPreference.loadAIAppsOnly(from: .standard)
         self.savedHoldCustomShortcut = savedHoldCustomShortcut.binding
         self.savedToggleCustomShortcut = savedToggleCustomShortcut.binding
         self.savedCopyAgainCustomShortcut = savedCopyAgainCustomShortcut.binding
@@ -945,6 +1025,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
         if shortcuts.didUpdateCopyAgainStoredValue {
             persistShortcut(shortcuts.copyAgain, key: copyAgainShortcutStorageKey)
+        }
+        // Only a normalized stored value is written back; an applied or skipped default never is.
+        if storedPolishShortcut.didNormalize {
+            persistShortcut(polishShortcut, key: transformPolishShortcutStorageKey)
+        }
+        if storedPromptEngineerShortcut.didNormalize {
+            persistShortcut(promptEngineerShortcut, key: transformPromptEngineerShortcutStorageKey)
         }
         if savedHoldCustomShortcut.didUpdateStoredValue {
             persistOptionalShortcut(savedHoldCustomShortcut.binding, key: savedHoldCustomShortcutStorageKey)
@@ -1733,7 +1820,79 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return savedToggleCustomShortcut
         case .copyAgain:
             return savedCopyAgainCustomShortcut
+        // Transforms keep no separate saved-custom value: the current binding is it when custom.
+        case .polishTransform:
+            return polishTransformShortcut.isCustom ? polishTransformShortcut : nil
+        case .promptEngineerTransform:
+            return promptEngineerTransformShortcut.isCustom ? promptEngineerTransformShortcut : nil
+        case .customTransform(let id):
+            let shortcut = customTransforms.first { $0.id == id }?.shortcut
+            return shortcut?.isCustom == true ? shortcut : nil
         }
+    }
+
+    func transformShortcut(for id: TransformID) -> ShortcutBinding {
+        switch id {
+        case .polish:
+            return polishTransformShortcut
+        case .promptEngineer:
+            return promptEngineerTransformShortcut
+        case .custom(let recordID):
+            return customTransforms.first { $0.id == recordID }?.shortcut ?? .disabled
+        }
+    }
+
+    /// nil for a custom id whose record no longer exists.
+    func transformKind(for id: TransformID) -> TransformKind? {
+        switch id {
+        case .polish:
+            return .polish
+        case .promptEngineer:
+            return .promptEngineer
+        case .custom(let recordID):
+            return customTransforms.first { $0.id == recordID }.map { .custom($0) }
+        }
+    }
+
+    /// Every enabled transform binding, keyed for the matcher; custom prompts by their record id.
+    private var transformBindings: [TransformID: ShortcutBinding] {
+        var bindings: [TransformID: ShortcutBinding] = [:]
+        if !polishTransformShortcut.isDisabled {
+            bindings[.polish] = polishTransformShortcut
+        }
+        if !promptEngineerTransformShortcut.isDisabled {
+            bindings[.promptEngineer] = promptEngineerTransformShortcut
+        }
+        for transform in customTransforms {
+            if let shortcut = transform.shortcut, !shortcut.isDisabled {
+                bindings[.custom(transform.id)] = shortcut
+            }
+        }
+        return bindings
+    }
+
+    /// `transformBindings` in a stable order, so a conflict message always names the same transform.
+    private var orderedTransformBindings: [TransformShortcutEntry] {
+        transformBindings.sorted { $0.key.sortKey < $1.key.sortKey }.map {
+            TransformShortcutEntry(id: $0.key, title: transformTitle(for: $0.key), binding: $0.value)
+        }
+    }
+
+    /// The current bindings the Settings conflict rules check a new shortcut against.
+    private var shortcutAssignments: ShortcutAssignments {
+        ShortcutAssignments(
+            hold: holdShortcut,
+            toggle: toggleShortcut,
+            copyAgain: copyAgainShortcut,
+            transforms: orderedTransformBindings,
+            manualModifier: isCommandModeEnabled && commandModeStyle == .manual
+                ? commandModeManualModifier.shortcutModifier
+                : nil
+        )
+    }
+
+    private func transformTitle(for id: TransformID) -> String {
+        transformKind(for: id)?.title ?? "a custom prompt"
     }
 
     var commandModeManualModifierValidationMessage: String? {
@@ -1786,31 +1945,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
         return nil
     }
 
+    /// The message that refuses `binding` for `role`, or nil when it may be assigned. Non-mutating so
+    /// the custom prompt editor can validate a draft's shortcut before the record exists.
+    func shortcutValidationMessage(_ binding: ShortcutBinding, for role: ShortcutRole) -> String? {
+        TransformCore.shortcutValidationMessage(binding, for: role, assignments: shortcutAssignments)
+    }
+
     @discardableResult
     func setShortcut(_ binding: ShortcutBinding, for role: ShortcutRole) -> String? {
         let binding = binding.normalizedForStorageMigration()
-
-        if role == .hold || role == .toggle {
-            let otherDictationBinding = role == .hold ? toggleShortcut : holdShortcut
-            guard !binding.conflicts(with: otherDictationBinding) else {
-                return "Hold and tap shortcuts must be distinct."
-            }
-        }
-
-        if role != .copyAgain, binding.conflicts(with: copyAgainShortcut) {
-            return "This shortcut is already used by Paste Again."
-        }
-        if role == .copyAgain {
-            if binding.conflicts(with: holdShortcut) {
-                return "Paste Again cannot share a shortcut with Hold to Talk."
-            }
-            if binding.conflicts(with: toggleShortcut) {
-                return "Paste Again cannot share a shortcut with Tap to Toggle."
-            }
-            if isCommandModeEnabled, commandModeStyle == .manual,
-               bindingCollides(binding, with: commandModeManualModifier) {
-                return "Paste Again cannot share the Edit Mode modifier."
-            }
+        if let message = shortcutValidationMessage(binding, for: role) {
+            return message
         }
 
         switch role {
@@ -1829,9 +1974,48 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 savedCopyAgainCustomShortcut = binding
             }
             copyAgainShortcut = binding
+        case .polishTransform:
+            polishTransformShortcut = binding
+        case .promptEngineerTransform:
+            promptEngineerTransformShortcut = binding
+        case .customTransform(let id):
+            guard let index = customTransforms.firstIndex(where: { $0.id == id }) else {
+                return "This custom prompt no longer exists."
+            }
+            customTransforms[index].shortcut = binding.isDisabled ? nil : binding
         }
 
         return nil
+    }
+
+    /// Validates and upserts a custom prompt; returns the message that blocked the save, nil on success.
+    @discardableResult
+    func saveCustomTransform(_ draft: CustomTransform) -> String? {
+        if let message = draft.validationMessage {
+            return message
+        }
+        if let shortcut = draft.shortcut, !shortcut.isDisabled,
+           let message = shortcutValidationMessage(shortcut, for: .customTransform(draft.id)) {
+            return message
+        }
+        var record = draft.normalized
+        record.shortcut = record.shortcut?.normalizedForStorageMigration()
+        if let index = customTransforms.firstIndex(where: { $0.id == record.id }) {
+            customTransforms[index] = record
+        } else {
+            guard customTransforms.count < CustomTransform.maxCount else {
+                return "You can have up to eight custom prompts."
+            }
+            customTransforms.append(record)
+        }
+        return nil
+    }
+
+    func removeCustomTransform(id: UUID) {
+        customTransforms.removeAll { $0.id == id }
+        if transformAutoApply == .custom(id) {
+            transformAutoApply = .off
+        }
     }
 
     private func commandModeManualModifierCollisionMessage(
@@ -1873,20 +2057,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
            bindingModifier == manualModifier {
             return "That modifier is already the Paste Again shortcut."
         }
-
-        return nil
-    }
-
-    private func bindingCollides(_ binding: ShortcutBinding, with modifier: CommandModeManualModifier) -> Bool {
-        guard !binding.isDisabled else { return false }
-        let manualModifier = modifier.shortcutModifier
-        if binding.modifiers.contains(manualModifier) { return true }
-        if binding.kind == .modifierKey,
-           let bindingModifier = ShortcutBinding.modifier(forKeyCode: binding.keyCode),
-           bindingModifier == manualModifier {
-            return true
-        }
-        return false
+        // The same two transform rules as shortcutValidationMessage, seen from the modifier's side.
+        return TransformCore.manualModifierTransformCollisionMessage(
+            manualModifier, hold: holdBinding, toggle: toggleBinding, transforms: orderedTransformBindings
+        )
     }
 
     func startHotkeyMonitoring() {
@@ -1954,6 +2128,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             hold: holdShortcut,
             toggle: toggleShortcut,
             copyAgain: copyAgainShortcut,
+            transforms: transformBindings,
             permittedAdditionalExactMatchModifiers: permittedAdditionalExactMatchModifiers
         )
     }
@@ -1976,6 +2151,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private func handleShortcutEvent(_ event: ShortcutEvent) {
         if event == .copyAgainTriggered {
             copyLastTranscriptToPasteboard()
+            return
+        }
+        if case .transformTriggered(let id) = event {
+            runTransformShortcut(id)
             return
         }
 
@@ -2056,6 +2235,203 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    private func makeTransformService() -> TransformService {
+        TransformService(
+            apiKey: apiKey,
+            baseURL: apiBaseURL,
+            preferredModel: postProcessingModel,
+            preferredFallbackModel: postProcessingFallbackModel,
+            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
+        )
+    }
+
+    /// A transform shortcut while idle: the selection, else the focused field's text, else the last
+    /// dictation from the past minute, rewritten and delivered through the dictation paste paths. The
+    /// press is ignored while recording or transcribing, and a second transform while one runs.
+    private func runTransformShortcut(_ id: TransformID) {
+        guard !isRecording, !isTranscribing, !isTransforming, pendingShortcutStartMode == nil,
+              let kind = transformKind(for: id) else { return }
+        let isAccessibilityTrusted = AXIsProcessTrusted()
+        hasAccessibility = isAccessibilityTrusted
+        guard isAccessibilityTrusted else {
+            errorMessage = "Accessibility permission required. Grant access in System Settings > Privacy & Security > Accessibility."
+            statusText = "No Accessibility"
+            showAccessibilityAlert()
+            return
+        }
+
+        // The same capture as a manual Edit Mode press: the focused field is read so its text can
+        // stand in for a selection, with the secure-field exclusion and the length cap it applies.
+        let snapshot = contextService.collectSelectionSnapshot(
+            captureInsertionTarget: originalFieldInsertionEnabled, manualCommandRequested: true
+        )
+        let target = snapshot.textInsertionTarget
+        let fieldText = target?.allowsTextCapture == true ? CommandModeIntent.wholeFieldText(target?.valueAtCapture) : nil
+        guard let scope = TransformCore.resolveScope(
+            selection: snapshot.selectedText,
+            fieldText: fieldText,
+            lastDictation: lastTranscript,
+            lastDictationAge: lastTranscriptUpdatedAt.map { Date().timeIntervalSince($0) }
+        ) else {
+            let status = TransformCore.nothingToTransformStatusText
+            statusText = status
+            clearPendingOverlayDismissToken()
+            overlayManager.showError(status)
+            scheduleReadyStatusReset(after: 3, matching: [status])
+            return
+        }
+
+        isTransforming = true
+        // The paste and the whole-field write belong to this transform; a dictation start clears both.
+        let token = UUID()
+        activeTransformToken = token
+        textInsertionTargetID = target?.identifier
+        statusText = TransformCore.transformingStatusText
+        debugStatusMessage = "Transforming"
+        errorMessage = nil
+        clearPendingOverlayDismissToken()
+        overlayManager.showTranscribing()
+        let useOriginalField = snapshot.usesOriginalFieldInsertion
+        // Only app metadata for the Run Log row; the request carries the chosen text alone.
+        let context = AppContext(
+            appName: snapshot.appName,
+            bundleIdentifier: snapshot.bundleIdentifier,
+            windowTitle: snapshot.windowTitle,
+            selectedText: nil,
+            currentActivity: "",
+            contextSystemPrompt: nil,
+            contextPrompt: nil,
+            screenshotDataURL: nil,
+            screenshotMimeType: nil,
+            screenshotError: "Not captured (transform)"
+        )
+        let service = makeTransformService()
+        Task { [weak self] in
+            let outcome: Result<PostProcessingResult, Error>
+            do {
+                outcome = .success(try await service.transform(scope.text, kind: kind))
+            } catch {
+                outcome = .failure(error)
+            }
+            await MainActor.run { [weak self] in
+                self?.finishTransform(
+                    token: token, kind: kind, scope: scope, target: target, useOriginalField: useOriginalField,
+                    context: context, outcome: outcome
+                )
+            }
+        }
+    }
+
+    @MainActor
+    private func finishTransform(
+        token: UUID,
+        kind: TransformKind,
+        scope: TransformScope,
+        target: AppTextInsertionTarget?,
+        useOriginalField: Bool,
+        context: AppContext,
+        outcome: Result<PostProcessingResult, Error>
+    ) {
+        isTransforming = false
+        // A dictation started since the press owns the overlay, the status, the cursor and the insertion
+        // target while it runs; one that already ended took the cursor and the target with it.
+        let ownsDelivery = activeTransformToken == token
+        activeTransformToken = nil
+        let dictationInProgress = isRecording || isTranscribing || pendingShortcutStartMode != nil
+        let systemPrompt = TransformCore.systemPrompt(for: kind)
+
+        switch outcome {
+        case .failure(let error):
+            os_log(.error, log: recordingLog, "Transform failed: %{public}@", error.localizedDescription)
+            recordPipelineHistoryEntry(
+                rawTranscript: scope.text,
+                postProcessedTranscript: "",
+                postProcessingPrompt: "",
+                systemPrompt: systemPrompt,
+                context: context,
+                processingStatus: TransformCore.failedProcessingStatus(for: kind, error: error),
+                intent: .transform
+            )
+            // The Run Log row records the failure; a running dictation keeps its overlay and status.
+            guard !dictationInProgress else { return }
+            debugStatusMessage = "Done"
+            let status = TransformCore.failedStatusText
+            let message = formattedTranscriptionError(error)
+            statusText = status
+            errorMessage = message
+            clearPendingOverlayDismissToken()
+            overlayManager.showError(message)
+            scheduleReadyStatusReset(after: 3, matching: [status])
+
+        case .success(let result):
+            let output = result.transcript
+            recordPipelineHistoryEntry(
+                rawTranscript: scope.text,
+                postProcessedTranscript: output,
+                postProcessingPrompt: result.prompt,
+                systemPrompt: systemPrompt,
+                context: context,
+                processingStatus: kind.processingStatus,
+                intent: .transform
+            )
+            guard !dictationInProgress else {
+                // Copied only: the overlay, the status and lastTranscript, which the dictation sets as
+                // its Paste Again fallback while it is processed, stay the dictation's.
+                _ = writeTranscriptToPasteboard(output, appendsSpaceAfterSentenceMark: false)
+                return
+            }
+            // Paste Again recovers a failed delivery, and a follow-up transform can chain within the window.
+            lastTranscript = output
+            debugStatusMessage = "Done"
+            clearPendingOverlayDismissToken()
+            overlayManager.dismiss()
+            let completionStatusText = preserveClipboard ? "Pasted at cursor!" : "Copied to clipboard!"
+            let resultCopiedStatusText = TransformCore.resultCopiedStatusText
+            let copyResult = {
+                _ = self.writeTranscriptToPasteboard(output, appendsSpaceAfterSentenceMark: false)
+                self.statusText = resultCopiedStatusText
+                self.overlayManager.showError(resultCopiedStatusText)
+            }
+
+            // A dictation that started and ended meanwhile moved the cursor and took the insertion target.
+            guard ownsDelivery else {
+                copyResult()
+                scheduleReadyStatusReset(after: 3, matching: [resultCopiedStatusText])
+                return
+            }
+
+            switch scope {
+            case .selection:
+                // A plain Cmd-V over the selection, or the original-field path, which re-checks the
+                // captured value and range first.
+                statusText = completionStatusText
+                insertTranscriptWhenShortcutReleased(
+                    output, target: useOriginalField ? target : nil, shouldPressEnter: false,
+                    useOriginalField: useOriginalField, appendsSpaceAfterSentenceMark: false
+                )
+            case .wholeField:
+                guard let target else {
+                    copyResult()
+                    break
+                }
+                // Verified AX write-back; any refusal copies the result instead.
+                statusText = completionStatusText
+                replaceWholeFieldWhenShortcutReleased(output, target: target, shouldPressEnter: false)
+            case .lastDictation:
+                statusText = completionStatusText
+                insertTranscriptWhenShortcutReleased(
+                    output, target: useOriginalField ? target : nil, shouldPressEnter: false,
+                    useOriginalField: useOriginalField
+                )
+            }
+
+            scheduleReadyStatusReset(after: 3, matching: [
+                completionStatusText, CommandModeIntent.wholeFieldReplacedStatusText,
+                CommandModeIntent.fieldChangedOverlayMessage, resultCopiedStatusText
+            ])
+        }
+    }
+
     func toggleRecording() {
         os_log(.info, log: recordingLog, "toggleRecording() called, isRecording=%{public}d", isRecording)
         cancelPendingShortcutStart()
@@ -2132,6 +2508,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         guard isTranscribing else { return }
 
         textInsertionTargetID = nil
+        activeTransformToken = nil
         transcriptionTask?.cancel()
         transcriptionTask = nil
         contextCaptureTask?.cancel()
@@ -2162,6 +2539,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// Invalidates prior insertion actions before taking the new start-time snapshot, including during delays.
     private func scheduleShortcutStart(mode: RecordingTriggerMode) {
         textInsertionTargetID = nil
+        activeTransformToken = nil
         cancelPendingShortcutStart(resetMode: false)
         pendingManualCommandInvocation = hotkeyManager.currentPressedModifiers.contains(
             commandModeManualModifier.shortcutModifier
@@ -2318,6 +2696,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         startedAt: CFAbsoluteTime? = nil
     ) -> Bool {
         textInsertionTargetID = nil
+        activeTransformToken = nil
         activeRecordingTriggerMode = triggerMode
         let isAccessibilityTrusted = AXIsProcessTrusted()
         hasAccessibility = isAccessibilityTrusted
@@ -2753,15 +3132,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
         )
     }
 
+    /// `transformStatusSuffix` (Auto Apply's ", polished" or ", transform failed") follows the outcome
+    /// text and precedes the snippet, cursor-fit and press-enter suffixes.
     private static func statusMessage(
         for outcome: TranscriptProcessingOutcome,
         parsedTranscript: TranscriptCommandParsingResult,
         isRetry: Bool = false,
         expandedSnippetCount: Int = 0,
-        fittedToCursor: Bool = false
+        fittedToCursor: Bool = false,
+        transformStatusSuffix: String = ""
     ) -> String {
         CursorFormatting.processingStatus(
-            outcome: outcome.statusMessage(isRetry: isRetry),
+            outcome: outcome.statusMessage(isRetry: isRetry) + transformStatusSuffix,
             expandedSnippetCount: expandedSnippetCount,
             fittedToCursor: fittedToCursor,
             pressEnterDetected: parsedTranscript.shouldPressEnterAfterPaste
@@ -3124,6 +3506,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             preferredFallbackModel: postProcessingFallbackModel,
             instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
         )
+            let transformService = self.makeTransformService()
 
             let activeRealtime = self.realtimeService
             self.realtimeService = nil
@@ -3248,6 +3631,41 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         rawTranscriptForAIApp: rawTranscriptForAIApp,
                         webSearchEngine: self.webSearchEngine
                     )
+                    // Auto Apply After Dictation: runs on whatever the final transcript is (cleaned,
+                    // raw-in-AI-app or verbatim) and before the cursor fit; a failure delivers the
+                    // untransformed text. It runs before the cleanup mark so the second round trip
+                    // counts as cleanup time rather than inflating the paste stage.
+                    let autoApplyKind = TransformCore.autoApplyKind(
+                        preference: self.transformAutoApply,
+                        customTransforms: self.customTransforms,
+                        text: result.finalTranscript,
+                        isCommandMode: sessionIntent.isCommandMode,
+                        isVoiceMacro: result.outcome.isVoiceMacro,
+                        category: sessionCategory,
+                        aiAppsOnly: self.transformAutoApplyAIAppsOnly
+                    )
+                    var deliveredTranscript = result.finalTranscript
+                    var deliveredPrompt = result.prompt
+                    var transformStatusSuffix = ""
+                    if let autoApplyKind {
+                        await MainActor.run { [weak self] in
+                            self?.debugStatusMessage = "Applying transform"
+                        }
+                        do {
+                            let transformed = try await transformService.transform(result.finalTranscript, kind: autoApplyKind)
+                            deliveredTranscript = transformed.transcript
+                            deliveredPrompt = result.prompt.isEmpty
+                                ? transformed.prompt
+                                : result.prompt + "\n\n[Transform]\n" + transformed.prompt
+                            transformStatusSuffix = autoApplyKind.autoApplyStatusSuffix
+                        } catch {
+                            os_log(.error, log: recordingLog, "Auto-apply transform failed: %{public}@", error.localizedDescription)
+                            transformStatusSuffix = TransformCore.autoApplyFailedStatusSuffix
+                        }
+                    }
+                    let finalTranscriptForDelivery = deliveredTranscript
+                    let promptForDelivery = deliveredPrompt
+                    let recordedTransformStatusSuffix = transformStatusSuffix
                     stageMarks.cleanupFinished = CFAbsoluteTimeGetCurrent()
                     // Immutable snapshot: the @Sendable MainActor closure must not capture the mutable marks.
                     let recordedMarks = stageMarks
@@ -3265,7 +3683,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.lastContextSelectedText = appContext.selectedText ?? ""
                         self.lastContextLLMPrompt = appContext.contextPrompt ?? ""
                         let trimmedRawTranscript = parsedTranscript.transcript
-                        let trimmedFinalTranscript = result.finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let trimmedFinalTranscript = finalTranscriptForDelivery.trimmingCharacters(in: .whitespacesAndNewlines)
                         // Local fit to the text around the cursor. Edit Mode replaces a selection and a
                         // voice macro is literal text, so neither is fitted; the Run Log keeps the
                         // cleaned text as produced.
@@ -3289,9 +3707,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             for: result.outcome,
                             parsedTranscript: parsedTranscript,
                             expandedSnippetCount: result.expandedSnippetCount,
-                            fittedToCursor: cursorFit?.changedAnything == true
+                            fittedToCursor: cursorFit?.changedAnything == true,
+                            transformStatusSuffix: recordedTransformStatusSuffix
                         )
-                        self.lastPostProcessingPrompt = result.prompt
+                        self.lastPostProcessingPrompt = promptForDelivery
                         self.lastRawTranscript = trimmedRawTranscript
                         self.lastPostProcessedTranscript = trimmedFinalTranscript
                         self.lastPostProcessingStatus = processingStatus
@@ -3308,7 +3727,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.recordPipelineHistoryEntry(
                             rawTranscript: trimmedRawTranscript,
                             postProcessedTranscript: trimmedFinalTranscript,
-                            postProcessingPrompt: result.prompt,
+                            postProcessingPrompt: promptForDelivery,
                             systemPrompt: Self.resolvedSystemPrompt(self.customSystemPrompt),
                             context: appContext,
                             processingStatus: processingStatus,
