@@ -25,6 +25,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/CursorFormatting.swift \
 	Sources/DictationStyle.swift \
 	Sources/DictionaryCorrections.swift \
+	Sources/HandsFreeAutoStop.swift \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
 	Sources/ModelConfiguration.swift \

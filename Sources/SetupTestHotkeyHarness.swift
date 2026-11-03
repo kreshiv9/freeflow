@@ -52,6 +52,13 @@ final class SetupTestHotkeyHarness: ObservableObject {
             DispatchQueue.main.async {
                 self.onAction?(action)
             }
+        case .stopUnlessRetapped, .cancel:
+            // The setup test has no hands-free or cancel path: end the take now.
+            sessionController.reset()
+            cancelPendingStart()
+            DispatchQueue.main.async {
+                self.onAction?(.stop)
+            }
         }
     }
 

@@ -93,7 +93,7 @@ struct MenuBarView: View {
 
             // Status
             if appState.isRecording {
-                Label("Recording...", systemImage: "record.circle")
+                Label(appState.statusText, systemImage: "record.circle")
                     .foregroundStyle(.red)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 6)
