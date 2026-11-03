@@ -742,6 +742,9 @@ struct GeneralSettingsView: View {
                 SettingsCard("Custom Vocabulary", icon: "text.book.closed.fill") {
                     vocabularySection
                 }
+                SettingsCard("Corrections", icon: "arrow.left.arrow.right") {
+                    DictionaryCorrectionsSection()
+                }
                 SettingsCard("Permissions", icon: "lock.shield.fill") {
                     permissionsSection
                 }
@@ -1280,7 +1283,7 @@ struct GeneralSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Preserve exact wording", isOn: $appState.preserveExactWording)
 
-            Text("When on, \(AppName.displayName) skips the LLM cleanup step and pastes the transcript verbatim — filler words, informal phrasing, and explicit language are all preserved. Voice macros and Edit Mode still run.")
+            Text("When on, \(AppName.displayName) skips the LLM cleanup step and pastes the transcript verbatim — filler words, informal phrasing, and explicit language are all preserved. Voice macros, Corrections and Edit Mode still run.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -1293,7 +1296,7 @@ struct GeneralSettingsView: View {
 
             Toggle("Paste the raw transcript in AI apps", isOn: $appState.aiAppsRawTranscriptEnabled)
 
-            Text("Matches Wispr Flow: in ChatGPT, Claude, Perplexity and similar AI chats the transcript is pasted without cleanup so your prompt stays exactly as spoken. Terminals and code editors still get cleanup.")
+            Text("Matches Wispr Flow: in ChatGPT, Claude, Perplexity and similar AI chats the transcript is pasted without cleanup (voice macros and Corrections still apply) so your prompt stays as spoken. Terminals and code editors still get cleanup.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1576,6 +1579,84 @@ struct MicrophoneOptionRow: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Dictionary Corrections
+
+/// Edits `AppState.dictionaryCorrections` through a local copy, like the vocabulary
+/// editor: rows are committed (trimmed, cut to the limit, blank rows left out) when a
+/// field loses focus, on Return, and when the view disappears.
+struct DictionaryCorrectionsSection: View {
+    private enum Field: Hashable {
+        case heard(UUID)
+        case replacement(UUID)
+    }
+
+    @EnvironmentObject var appState: AppState
+    @State private var rows: [DictionaryCorrection] = []
+    @FocusState private var focusedField: Field?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("When a word is heard wrong every time, replace it with the spelling you want. Matches whole words, ignoring capitalization.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Add Correction") {
+                    addRow()
+                }
+            }
+
+            VStack(spacing: 6) {
+                ForEach($rows) { $row in
+                    HStack(spacing: 8) {
+                        TextField("Heard", text: $row.from)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focusedField, equals: .heard(row.id))
+                            .onSubmit(commit)
+                        Image(systemName: "arrow.right")
+                            .foregroundStyle(.secondary)
+                        TextField("Replace with", text: $row.to)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focusedField, equals: .replacement(row.id))
+                            .onSubmit(commit)
+                        Button {
+                            remove(row.id)
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.red)
+                        .help("Remove correction")
+                        .accessibilityLabel("Remove correction")
+                    }
+                }
+            }
+        }
+        .onAppear { rows = appState.dictionaryCorrections }
+        .onChange(of: focusedField) { _ in commit() }
+        .onDisappear { commit() }
+    }
+
+    private func commit() {
+        rows = rows.map(\.normalized)
+        let persisted = rows.filter { !$0.isBlank }
+        if appState.dictionaryCorrections != persisted {
+            appState.dictionaryCorrections = persisted
+        }
+    }
+
+    private func addRow() {
+        let row = DictionaryCorrection(from: "", to: "")
+        rows.append(row)
+        focusedField = .heard(row.id)
+    }
+
+    private func remove(_ id: UUID) {
+        rows.removeAll { $0.id == id }
+        commit()
     }
 }
 
@@ -2826,7 +2907,7 @@ struct VoiceMacrosSettingsView: View {
     private var macrosSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Bypass post-processing and immediately paste your predefined text.")
+                Text("Bypass post-processing and immediately paste your predefined text. A trigger also works inside a sentence; the expansion replaces the spoken trigger.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()

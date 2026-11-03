@@ -589,6 +589,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private var precomputedMacros: [PrecomputedMacro] = []
+    private var precomputedSnippets: [SnippetExpansion.Snippet] = []
 
     @Published var voiceMacros: [VoiceMacro] = [] {
         didSet {
@@ -597,6 +598,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
             precomputeMacros()
         }
+    }
+
+    /// Dictionary "correct a misspelling" rules; persisted as JSON like voice macros.
+    @Published var dictionaryCorrections: [DictionaryCorrection] = [] {
+        didSet { DictionaryCorrection.save(dictionaryCorrections, to: .standard) }
     }
 
     @Published var isRecording = false {
@@ -856,6 +862,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.alertSoundsEnabled = alertSoundsEnabled
         self.soundVolume = soundVolume
         self.voiceMacros = initialMacros
+        self.dictionaryCorrections = DictionaryCorrection.load(from: .standard)
         self.pipelineHistory = savedHistory
         self.hasAccessibility = initialAccessibility
         self.hasScreenRecordingPermission = initialScreenCapturePermission
@@ -1344,6 +1351,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     context: restoredContext,
                     postProcessingService: postProcessingService,
                     customVocabulary: capturedCustomVocabulary,
+                    dictionaryCorrections: self.dictionaryCorrections,
                     customSystemPrompt: capturedCustomSystemPrompt,
                     outputLanguage: self.outputLanguage,
                     dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
@@ -1353,7 +1361,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 processingStatus = Self.statusMessage(
                     for: result.outcome,
                     parsedTranscript: parsedTranscript,
-                    isRetry: true
+                    isRetry: true,
+                    expandedSnippetCount: result.expandedSnippetCount
                 )
                 postProcessingPrompt = result.prompt
 
@@ -2531,6 +2540,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 normalizedCommand: normalize(macro.command)
             )
         }
+        precomputedSnippets = voiceMacros.map { SnippetExpansion.Snippet(trigger: $0.command, expansion: $0.payload) }
     }
 
     private func normalize(_ text: String) -> String {
@@ -2573,9 +2583,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private static func statusMessage(
         for outcome: TranscriptProcessingOutcome,
         parsedTranscript: TranscriptCommandParsingResult,
-        isRetry: Bool = false
+        isRetry: Bool = false,
+        expandedSnippetCount: Int = 0
     ) -> String {
         let status = outcome.statusMessage(isRetry: isRetry)
+            + SnippetExpansion.statusSuffix(expandedCount: expandedSnippetCount)
         guard parsedTranscript.shouldPressEnterAfterPaste else { return status }
         return "\(status); detected press enter command"
     }
@@ -2602,9 +2614,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case voiceMacro(command: String)
         case postProcessingSucceeded
         case postProcessingFailedFallback
+        case postProcessingDroppedSnippetPlaceholders
         case preservedExactWording
         case preservedExactWordingTranslated
         case preservedExactWordingTranslationFailedFallback
+        case verbatimTranslationDroppedSnippetPlaceholders
         case rawTranscriptInAIApp
         case rawTranscriptInAIAppTranslated
         case commandModeSucceeded(invocation: CommandInvocation)
@@ -2622,12 +2636,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return isRetry
                     ? "Post-processing failed on retry, using raw transcript"
                     : "Post-processing failed, using raw transcript"
+            case .postProcessingDroppedSnippetPlaceholders:
+                return isRetry
+                    ? "Post-processing dropped a snippet placeholder on retry, using raw transcript"
+                    : "Post-processing dropped a snippet placeholder, using raw transcript"
             case .preservedExactWording:
                 return "Preserved exact wording, skipped post-processing"
             case .preservedExactWordingTranslated:
                 return "Preserved exact wording, translated to output language"
             case .preservedExactWordingTranslationFailedFallback:
                 return "Verbatim translation failed, using untranslated raw transcript"
+            case .verbatimTranslationDroppedSnippetPlaceholders:
+                return "Verbatim translation dropped a snippet placeholder, using untranslated raw transcript"
             case .rawTranscriptInAIApp:
                 return AIAppRawTranscriptPreference.rawTranscriptProcessingStatus
             case .rawTranscriptInAIAppTranslated:
@@ -2646,16 +2666,22 @@ final class AppState: ObservableObject, @unchecked Sendable {
         context: AppContext,
         postProcessingService: PostProcessingService,
         customVocabulary: String,
+        dictionaryCorrections: [DictionaryCorrection],
         customSystemPrompt: String,
         outputLanguage: String = "",
         dictationLanguage: String = "",
         preserveExactWording: Bool,
         rawTranscriptForAIApp: Bool = false
-    ) async -> (finalTranscript: String, outcome: TranscriptProcessingOutcome, prompt: String) {
+    ) async -> (
+        finalTranscript: String,
+        outcome: TranscriptProcessingOutcome,
+        prompt: String,
+        expandedSnippetCount: Int
+    ) {
         let trimmedRawTranscript = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !trimmedRawTranscript.isEmpty else {
-            return ("", .skippedEmptyRawTranscript, "")
+            return ("", .skippedEmptyRawTranscript, "", 0)
         }
 
         if case .command(let invocation, let selectedText) = intent {
@@ -2667,17 +2693,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     customVocabulary: customVocabulary,
                     outputLanguage: outputLanguage
                 )
-                return (result.transcript, .commandModeSucceeded(invocation: invocation), result.prompt)
+                return (result.transcript, .commandModeSucceeded(invocation: invocation), result.prompt, 0)
             } catch {
                 os_log(.error, log: recordingLog, "Edit mode failed: %{public}@", error.localizedDescription)
-                return (selectedText, .commandModeFailedFallback(invocation: invocation), "")
+                return (selectedText, .commandModeFailedFallback(invocation: invocation), "", 0)
             }
         }
 
-        if let macro = findMatchingMacro(for: trimmedRawTranscript) {
+        // Corrections run on the raw text so a macro command or snippet trigger is
+        // matched in the corrected spelling and the model never sees the misheard word.
+        let correctedTranscript = DictionaryCorrection.apply(dictionaryCorrections, to: trimmedRawTranscript)
+
+        if let macro = findMatchingMacro(for: correctedTranscript) {
             os_log(.info, log: recordingLog, "Voice macro triggered: %{public}@", macro.command)
-            return (macro.payload, .voiceMacro(command: macro.command), "")
+            return (macro.payload, .voiceMacro(command: macro.command), "", 0)
         }
+
+        let snippetPlan = SnippetExpansion.plan(for: correctedTranscript, snippets: precomputedSnippets)
+        let expandedSnippetCount = snippetPlan.expansions.count
 
         // Preserve-exact-wording mode. Two sub-cases so translation
         // stays honored:
@@ -2693,42 +2726,83 @@ final class AppState: ObservableObject, @unchecked Sendable {
         //
         // A dictation into an AI app takes the same path so the prompt is
         // pasted as spoken, and reports its own status.
+        //
+        // Snippets resolve directly here. With an Output Language the
+        // placeholder text is translated, as in cleanup, so a macro
+        // payload never reaches the provider and is never reworded.
         if preserveExactWording || rawTranscriptForAIApp {
             let targetLanguage = outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
             if targetLanguage.isEmpty {
-                return (trimmedRawTranscript, preserveExactWording ? .preservedExactWording : .rawTranscriptInAIApp, "")
+                return (
+                    snippetPlan.expandedText,
+                    preserveExactWording ? .preservedExactWording : .rawTranscriptInAIApp,
+                    "",
+                    expandedSnippetCount
+                )
             }
             do {
                 let result = try await postProcessingService.translateVerbatim(
-                    transcript: trimmedRawTranscript,
-                    targetLanguage: targetLanguage
+                    transcript: snippetPlan.placeholderText,
+                    targetLanguage: targetLanguage,
+                    preservesSnippetPlaceholders: snippetPlan.hasMatches
                 )
+                guard let resolved = snippetPlan.resolve(result.transcript) else {
+                    os_log(.error, log: recordingLog,
+                           "Verbatim translation dropped a snippet placeholder, using raw transcript with %d snippet(s) expanded",
+                           expandedSnippetCount)
+                    return (
+                        snippetPlan.expandedText,
+                        .verbatimTranslationDroppedSnippetPlaceholders,
+                        result.prompt,
+                        expandedSnippetCount
+                    )
+                }
                 return (
-                    result.transcript,
+                    resolved,
                     preserveExactWording ? .preservedExactWordingTranslated : .rawTranscriptInAIAppTranslated,
-                    result.prompt
+                    result.prompt,
+                    expandedSnippetCount
                 )
             } catch {
                 os_log(.error, log: recordingLog,
                        "Verbatim translation failed: %{public}@",
                        error.localizedDescription)
-                return (trimmedRawTranscript, .preservedExactWordingTranslationFailedFallback, "")
+                return (
+                    snippetPlan.expandedText,
+                    .preservedExactWordingTranslationFailedFallback,
+                    "",
+                    expandedSnippetCount
+                )
             }
         }
 
         do {
             let result = try await postProcessingService.postProcess(
-                transcript: trimmedRawTranscript,
+                transcript: snippetPlan.placeholderText,
                 context: context,
-                customVocabulary: customVocabulary,
+                customVocabulary: DictionaryCorrection.vocabularyText(customVocabulary, merging: dictionaryCorrections),
                 customSystemPrompt: customSystemPrompt,
                 outputLanguage: outputLanguage,
-                dictationLanguage: dictationLanguage
+                dictationLanguage: dictationLanguage,
+                preservesSnippetPlaceholders: snippetPlan.hasMatches
             )
-            return (result.transcript, .postProcessingSucceeded, result.prompt)
+            // The second pass runs before the placeholders resolve so a rule never rewrites snippet text.
+            let correctedOutput = DictionaryCorrection.apply(dictionaryCorrections, to: result.transcript)
+            guard let resolved = snippetPlan.resolve(correctedOutput) else {
+                os_log(.error, log: recordingLog,
+                       "Post-processing dropped a snippet placeholder, using raw transcript with %d snippet(s) expanded",
+                       expandedSnippetCount)
+                return (
+                    snippetPlan.expandedText,
+                    .postProcessingDroppedSnippetPlaceholders,
+                    result.prompt,
+                    expandedSnippetCount
+                )
+            }
+            return (resolved, .postProcessingSucceeded, result.prompt, expandedSnippetCount)
         } catch {
             os_log(.error, log: recordingLog, "Post-processing failed: %{public}@", error.localizedDescription)
-            return (trimmedRawTranscript, .postProcessingFailedFallback, "")
+            return (snippetPlan.expandedText, .postProcessingFailedFallback, "", expandedSnippetCount)
         }
     }
 
@@ -2943,6 +3017,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         context: appContext,
                         postProcessingService: postProcessingService,
                         customVocabulary: self.customVocabulary,
+                        dictionaryCorrections: self.dictionaryCorrections,
                         customSystemPrompt: self.customSystemPrompt,
                         outputLanguage: self.outputLanguage,
                         dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
@@ -2969,7 +3044,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         let trimmedFinalTranscript = result.finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
                         let processingStatus = Self.statusMessage(
                             for: result.outcome,
-                            parsedTranscript: parsedTranscript
+                            parsedTranscript: parsedTranscript,
+                            expandedSnippetCount: result.expandedSnippetCount
                         )
                         self.lastPostProcessingPrompt = result.prompt
                         self.lastRawTranscript = trimmedRawTranscript
@@ -3001,7 +3077,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         let shouldPersistRawDictationFallback: Bool
                         switch result.outcome {
                         case .postProcessingFailedFallback,
-                             .preservedExactWordingTranslationFailedFallback:
+                             .postProcessingDroppedSnippetPlaceholders,
+                             .preservedExactWordingTranslationFailedFallback,
+                             .verbatimTranslationDroppedSnippetPlaceholders:
                             shouldPersistRawDictationFallback = !trimmedFinalTranscript.isEmpty
                         default:
                             shouldPersistRawDictationFallback = false
