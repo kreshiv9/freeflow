@@ -1,0 +1,77 @@
+FreeFlow audio lab script
+Every name, address and number below is invented.
+
+Every line comes twice:
+  SAY: what you read aloud. Words in parentheses are instructions: do not read them.
+  REF: the reference text for that line, written the way Deepgram's smart_format
+       prints it: digits, times like 6:30, money like $18,500, emails like
+       priya@example.com.
+
+Read the SAY lines of a take in order, with a short pause between lines. The
+take's reference .txt file holds the REF text of the same lines, in order, one
+per line, without the "REF:" label and the line number. Punctuation and case
+do not matter for the main WER; the words, and how numbers are written, do.
+The REF forms of numbers, dates, times, emails and URLs are smart_format's
+likely output: check them against a first small run with --save-transcripts
+and fix only how such items are written, never which words you said.
+
+1  SAY: Sasha fixed the flaky staging deploy on Thursday at six thirty.
+   REF: Sasha fixed the flaky staging deploy on Thursday at 6:30.
+2  SAY: Set the Kubernetes namespace to freeflow dev and restart the worker pod.
+   REF: Set the Kubernetes namespace to freeflow dev and restart the worker pod.
+3  SAY: Francesca's sister sells seashells, and she says it's surprisingly successful.
+   REF: Francesca's sister sells seashells, and she says it's surprisingly successful.
+4  SAY: Run make check, then git diff check, then push the branch.
+   REF: Run make check, then git diff check, then push the branch.
+5  SAY: Yes.
+   REF: Yes.
+6  SAY: Email Priya Shah at priya at example dot com about invoice forty four seventy one.
+   REF: Email Priya Shah at priya@example.com about invoice 4471.
+7  SAY: I think we should ship this on Friday (pause one second) but only if the replay numbers look good.
+   REF: I think we should ship this on Friday, but only if the replay numbers look good.
+8  SAY: (quietly) This sentence is spoken quietly, about a foot from the laptop.
+   REF: This sentence is spoken quietly, about a foot from the laptop.
+9  SAY: The design review moved to March fourteenth at two forty five in the afternoon, room three twelve.
+   REF: The design review moved to March 14th at 2:45 in the afternoon, room 312.
+10 SAY: The budget is eighteen thousand five hundred dollars, roughly twelve percent above last quarter.
+   REF: The budget is $18,500, roughly 12% above last quarter.
+11 SAY: Release two point four point one was tagged on October third and the hotfix on the ninth.
+   REF: Release 2.4.1 was tagged on October 3rd and the hotfix on the 9th.
+12 SAY: Call the front desk at five five five, zero one four two after nine fifteen tomorrow morning.
+   REF: Call the front desk at 555-0142 after 9:15 tomorrow morning.
+13 SAY: Send the draft to team at example dot com and copy ops at example dot com.
+   REF: Send the draft to team@example.com and copy ops@example.com.
+14 SAY: The setup notes are at docs dot example dot com slash replay slash setup.
+   REF: The setup notes are at docs.example.com/replay/setup.
+15 SAY: Open a pull request, then rebase it onto main before the review.
+   REF: Open a pull request, then rebase it onto main before the review.
+16 SAY: Parse the JSON response and log only the status code.
+   REF: Parse the JSON response and log only the status code.
+17 SAY: Mark the function async and await each result from the task group.
+   REF: Mark the function async and await each result from the task group.
+18 SAY: Build it with swiftc and treat every warning as an error.
+   REF: Build it with swiftc and treat every warning as an error.
+19 SAY: The WebSocket closes cleanly after the CloseStream message.
+   REF: The WebSocket closes cleanly after the CloseStream message.
+20 SAY: No.
+   REF: No.
+21 SAY: Undo that.
+   REF: Undo that.
+22 SAY: New line.
+   REF: New line.
+23 SAY: Okay, send it.
+   REF: Okay, send it.
+24 SAY: Scratch that, make it Wednesday instead.
+   REF: Scratch that, make it Wednesday instead.
+25 SAY: When you get a chance, and there's really no rush, could you compare the replay numbers with yesterday's run (pause) and tell me whether the endpointing change actually helped?
+   REF: When you get a chance, and there's really no rush, could you compare the replay numbers with yesterday's run and tell me whether the endpointing change actually helped?
+26 SAY: (stay silent for two seconds, then start at once) Quarterly numbers look strong this time.
+   REF: Quarterly numbers look strong this time.
+27 SAY: Sixteen, twenty four and forty eight kilohertz are the sample rates we compare.
+   REF: 16, 24 and 48 kilohertz are the sample rates we compare.
+28 SAY: The kettle whistled while the cat slept on the windowsill.
+   REF: The kettle whistled while the cat slept on the windowsill.
+29 SAY: Please book the follow-up for the second Tuesday in December at ten in the morning.
+   REF: Please book the follow-up for the second Tuesday in December at 10 in the morning.
+30 SAY: Thanks, that's everything for today.
+   REF: Thanks, that's everything for today.

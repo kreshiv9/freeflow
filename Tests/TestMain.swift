@@ -33,6 +33,7 @@ struct FreeFlowTests {
         TransformServiceTests.run()
         TranscriptionErrorPresentationCoreTests.run()
         TranscriptTextCoreTests.run()
+        ReplayEvalCoreTests.run()
         AppTextInsertionCoreTests.run()
         AppTextInsertionDispatchTests.run()
         await TextContextCoreTests.run()

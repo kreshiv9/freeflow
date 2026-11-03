@@ -55,7 +55,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/WordBoundedText.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \
 	Sources/ShortcutCore/ShortcutMatcher.swift \
-	Sources/ShortcutCore/ShortcutModels.swift
+	Sources/ShortcutCore/ShortcutModels.swift \
+	Tools/AudioReplay/ReplayEvalCore.swift
 TEST_SOURCES = $(shell find Tests -name '*.swift' -type f | LC_ALL=C sort)
 SHELL_SCRIPTS = $(shell find .github/scripts .agents/skills -name '*.sh' -type f | LC_ALL=C sort)
 YAML_FILES = $(shell find .github -type f \( -name '*.yml' -o -name '*.yaml' \) | LC_ALL=C sort)
@@ -73,7 +74,7 @@ ICON_SOURCE = Resources/AppIcon-Source.png
 ICON_ICNS = Resources/AppIcon.icns
 endif
 
-.PHONY: all check clean run icon dmg codesign-dmg notarize test typecheck validate
+.PHONY: all check clean run icon dmg codesign-dmg notarize test typecheck validate audio-replay typecheck-tools
 
 all: $(APP_EXECUTABLE_TARGET)
 
@@ -116,7 +117,7 @@ endif
 	@codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" --entitlements FreeFlow.entitlements "$(APP_BUNDLE)"
 	@echo "Built $(APP_BUNDLE)"
 
-check: typecheck test validate
+check: typecheck typecheck-tools test validate
 
 typecheck:
 	swiftc \
@@ -205,3 +206,34 @@ clean:
 
 run: all
 	open "$(APP_BUNDLE)"
+
+AUDIO_REPLAY = $(BUILD_DIR)/audio-replay
+AUDIO_REPLAY_SOURCES = $(shell find Tools/AudioReplay -name '*.swift' -type f | LC_ALL=C sort)
+# Production files the replay tool compiles in. The tool is never part of the app bundle.
+AUDIO_REPLAY_PRODUCTION_SOURCES = \
+	Sources/DeepgramStreamingCore.swift \
+	Sources/LLMAPITransport.swift \
+	Sources/TemperatureCapabilityCache.swift
+
+# Developer tool (Tools/AudioReplay/README.md). make check only type-checks it.
+audio-replay:
+	@mkdir -p "$(BUILD_DIR)"
+	swiftc \
+		-parse-as-library \
+		-warnings-as-errors \
+		-o "$(AUDIO_REPLAY)" \
+		-sdk $(shell xcrun --show-sdk-path) \
+		-target $(ARCH)-apple-macosx13.0 \
+		$(AUDIO_REPLAY_PRODUCTION_SOURCES) \
+		$(AUDIO_REPLAY_SOURCES)
+	@echo "Built $(AUDIO_REPLAY)"
+
+typecheck-tools:
+	swiftc \
+		-parse-as-library \
+		-typecheck \
+		-warnings-as-errors \
+		-sdk $(shell xcrun --show-sdk-path) \
+		-target $(ARCH)-apple-macosx13.0 \
+		$(AUDIO_REPLAY_PRODUCTION_SOURCES) \
+		$(AUDIO_REPLAY_SOURCES)
