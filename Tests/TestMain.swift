@@ -16,6 +16,7 @@ struct FreeFlowTests {
         HandsFreeAutoStopTests.run()
         AIAppRawTranscriptPreferenceTests.run()
         CleanupLevelTests.run()
+        CommandModeIntentTests.run()
         DictationStyleTests.run()
         DictionaryCorrectionsTests.run()
         SnippetExpansionTests.run()

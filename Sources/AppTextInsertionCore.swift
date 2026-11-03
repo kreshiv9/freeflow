@@ -103,6 +103,43 @@ enum AppTextInsertionCore {
         return result
     }
 
+    /// The UTF-16 range a whole-field replacement selects before writing.
+    static func fullRange(of value: String) -> NSRange {
+        NSRange(location: 0, length: (value as NSString).length)
+    }
+
+    /// Replaces the entire captured value through `insert`, so the snapshot and readback checks are shared.
+    /// The select-all step can leave a refused or unverified write with the whole field selected, so
+    /// `restoreSelection` gets the captured selection (a caret at the start without one) while the value
+    /// still equals the capture; a field that changed is never touched again.
+    static func replaceAll(
+        _ text: String,
+        capturedValue: String?,
+        capturedSelection: NSRange?,
+        requiresFocus: Bool = false,
+        isTargetFocused: () -> Bool = { true },
+        readValue: () -> String?,
+        replaceText: (_ range: NSRange, _ text: String, _ expectedValue: String) -> Bool,
+        placeCursor: (NSRange) -> Void,
+        restoreSelection: (NSRange) -> Void
+    ) -> AppTextInsertionResult {
+        let result = insert(
+            text,
+            capturedValue: capturedValue,
+            range: capturedValue.map(fullRange(of:)),
+            requiresFocus: requiresFocus,
+            isTargetFocused: isTargetFocused,
+            readValue: readValue,
+            replaceText: replaceText,
+            placeCursor: placeCursor
+        )
+        if result == .notInserted || result == .unverified,
+           let capturedValue, matches(actual: readValue(), expected: capturedValue) {
+            restoreSelection(capturedSelection ?? NSRange(location: 0, length: 0))
+        }
+        return result
+    }
+
     /// Validates the snapshot/range before clipboard preparation, then rechecks before issuing one paste.
     static func pasteIfTargetMatches(
         capturedValue: String?,

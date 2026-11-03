@@ -137,9 +137,21 @@ private enum CommandInvocation: String {
     case manual
 }
 
+/// Where a command's source text came from; `wholeField` keeps the capture that verifies the write-back.
+private enum CommandScope {
+    case selection
+    case wholeField(target: AppTextInsertionTarget)
+    case none
+
+    var hasEditableText: Bool {
+        if case CommandScope.none = self { return false }
+        return true
+    }
+}
+
 private enum SessionIntent {
     case dictation
-    case command(invocation: CommandInvocation, selectedText: String)
+    case command(invocation: CommandInvocation, selectedText: String, scope: CommandScope)
 
     var isCommandMode: Bool {
         switch self {
@@ -154,7 +166,7 @@ private enum SessionIntent {
         switch self {
         case .dictation:
             return .dictation
-        case .command(let invocation, _):
+        case .command(let invocation, _, _):
             switch invocation {
             case .automatic:
                 return .commandAutomatic
@@ -168,26 +180,45 @@ private enum SessionIntent {
         switch self {
         case .dictation:
             return nil
-        case .command(_, let selectedText):
+        case .command(_, let selectedText, _):
             return selectedText
         }
     }
 
     var isManualCommand: Bool {
         switch self {
-        case .command(invocation: .manual, _):
+        case .command(invocation: .manual, _, _):
             return true
         default:
             return false
         }
     }
 
+    /// The same invocation with no source text, for a row whose outcome never used the field or
+    /// selection; a retry of it re-classifies as a no-field press.
+    var droppingSelectedText: SessionIntent {
+        switch self {
+        case .dictation:
+            return .dictation
+        case .command(let invocation, _, _):
+            return .command(invocation: invocation, selectedText: "", scope: CommandScope.none)
+        }
+    }
+
+    /// A stored row keeps no field capture, so a retry re-classifies the command against the
+    /// stored text alone: an empty string was a no-field press, anything else edits as a selection.
     static func fromPersisted(intent: PipelineHistoryItemIntent, selectedText: String?) -> SessionIntent {
         if intent == .commandAutomatic, let selectedText {
-            return .command(invocation: .automatic, selectedText: selectedText)
+            return .command(
+                invocation: .automatic, selectedText: selectedText,
+                scope: selectedText.isEmpty ? CommandScope.none : .selection
+            )
         }
         if intent == .commandManual, let selectedText {
-            return .command(invocation: .manual, selectedText: selectedText)
+            return .command(
+                invocation: .manual, selectedText: selectedText,
+                scope: selectedText.isEmpty ? CommandScope.none : .selection
+            )
         }
         return .dictation
     }
@@ -521,6 +552,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var silenceGateEnabled: Bool {
         didSet {
             UserDefaults.standard.set(silenceGateEnabled, forKey: SilenceGatePreference.storageKey)
+        }
+    }
+
+    /// Engine opened by an Edit Mode web search.
+    @Published var webSearchEngine: WebSearchEngine {
+        didSet {
+            UserDefaults.standard.set(webSearchEngine.rawValue, forKey: WebSearchEngine.storageKey)
         }
     }
 
@@ -879,6 +917,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.realtimeStreamingModel = realtimeStreamingModel
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
+        self.webSearchEngine = WebSearchEngine.load(from: .standard)
         self.handsFreeSilenceTimeoutSeconds = HandsFreeAutoStop.loadSilenceTimeoutSeconds(from: .standard)
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
         self.cursorFormattingEnabled = CursorFormatting.load(from: .standard)
@@ -1389,7 +1428,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     outputLanguage: self.outputLanguage,
                     dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
                     cleanupLevel: self.cleanupLevel,
-                    style: capturedStyle
+                    style: capturedStyle,
+                    webSearchEngine: self.webSearchEngine
                 )
                 finalTranscript = result.finalTranscript
                 processingStatus = Self.statusMessage(
@@ -1699,6 +1739,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
     var commandModeManualModifierValidationMessage: String? {
         guard isCommandModeEnabled, commandModeStyle == .manual else { return nil }
         return commandModeManualModifierCollisionMessage(for: commandModeManualModifier)
+    }
+
+    /// When the binding IS the manual modifier, the "modifier pressed" signal is the binding's own press.
+    private func dictationBindingIsManualModifier(triggerMode: RecordingTriggerMode) -> Bool {
+        let activeBinding: ShortcutBinding = (triggerMode == .toggle) ? toggleShortcut : holdShortcut
+        guard activeBinding.kind == .modifierKey,
+              let bindingModifier = ShortcutBinding.modifier(forKeyCode: activeBinding.keyCode) else { return false }
+        return bindingModifier == commandModeManualModifier.shortcutModifier
+    }
+
+    /// Whole-field capture reads the focused field, so it runs only for a press that
+    /// `resolveSessionIntent` can turn into a manual command: Edit Mode on in its manual style, the
+    /// modifier held, a binding that is not the modifier itself and no modifier collision.
+    private func wholeFieldCaptureRequested(triggerMode: RecordingTriggerMode, manualCommandRequested: Bool) -> Bool {
+        guard manualCommandRequested, isCommandModeEnabled, commandModeStyle == .manual,
+              !dictationBindingIsManualModifier(triggerMode: triggerMode) else { return false }
+        return commandModeManualModifierCollisionMessage(for: commandModeManualModifier) == nil
     }
 
     @discardableResult
@@ -2106,9 +2163,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private func scheduleShortcutStart(mode: RecordingTriggerMode) {
         textInsertionTargetID = nil
         cancelPendingShortcutStart(resetMode: false)
-        pendingSelectionSnapshot = contextService.collectSelectionSnapshot(captureInsertionTarget: originalFieldInsertionEnabled)
         pendingManualCommandInvocation = hotkeyManager.currentPressedModifiers.contains(
             commandModeManualModifier.shortcutModifier
+        )
+        pendingSelectionSnapshot = contextService.collectSelectionSnapshot(
+            captureInsertionTarget: originalFieldInsertionEnabled,
+            manualCommandRequested: wholeFieldCaptureRequested(
+                triggerMode: mode, manualCommandRequested: pendingManualCommandInvocation
+            )
         )
         pendingShortcutStartMode = mode
         let delay = shortcutStartDelay
@@ -2173,16 +2235,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
         switch commandModeStyle {
         case .automatic:
             if !trimmedSelectedText.isEmpty {
-                return .command(invocation: .automatic, selectedText: rawSelectedText)
+                return .command(invocation: .automatic, selectedText: rawSelectedText, scope: .selection)
             }
             return .dictation
         case .manual:
-            // If the binding IS the manual modifier, the "modifier pressed"
-            // signal is the binding's own press. Fall back to plain dictation.
-            let activeBinding: ShortcutBinding = (triggerMode == .toggle) ? toggleShortcut : holdShortcut
-            if activeBinding.kind == .modifierKey,
-               let bindingModifier = ShortcutBinding.modifier(forKeyCode: activeBinding.keyCode),
-               bindingModifier == commandModeManualModifier.shortcutModifier {
+            // The binding's own press cannot request a command. Fall back to plain dictation.
+            if dictationBindingIsManualModifier(triggerMode: triggerMode) {
                 return .dictation
             }
             if let message = commandModeManualModifierCollisionMessage(for: commandModeManualModifier) {
@@ -2192,29 +2250,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
             guard manualCommandRequested else {
                 return .dictation
             }
-            guard !trimmedSelectedText.isEmpty else {
-                rejectCommandModeSelectionRequirement(triggerMode: triggerMode)
-                return nil
+            if !trimmedSelectedText.isEmpty {
+                return .command(invocation: .manual, selectedText: rawSelectedText, scope: .selection)
             }
-            return .command(invocation: .manual, selectedText: rawSelectedText)
+            // No selection: the focused field's text stands in when it has any. Secure fields and
+            // unknown roles never capture a value, so they count as no field, as does an empty or
+            // over-cap one.
+            if let target = selectionSnapshot.textInsertionTarget, target.allowsTextCapture,
+               let fieldText = CommandModeIntent.wholeFieldText(target.valueAtCapture) {
+                return .command(invocation: .manual, selectedText: fieldText, scope: .wholeField(target: target))
+            }
+            return .command(invocation: .manual, selectedText: "", scope: CommandScope.none)
         }
-    }
-
-    private func rejectCommandModeSelectionRequirement(triggerMode: RecordingTriggerMode) {
-        currentSessionIntent = .dictation
-        activeRecordingTriggerMode = nil
-        activeTextInsertionTarget = nil
-        pendingSelectionSnapshot = nil
-        pendingManualCommandInvocation = false
-        errorMessage = "Select text to transform first."
-        statusText = "Select text to transform first"
-        debugStatusMessage = "Edit mode requires selected text"
-        shortcutSessionController.reset()
-        if triggerMode == .toggle {
-            cancelPendingShortcutStart()
-        }
-        playAlertSound(named: "Basso")
-        scheduleReadyStatusReset(after: 2, matching: ["Select text to transform first"])
     }
 
     private func rejectInvalidCommandModeModifier(triggerMode: RecordingTriggerMode, message: String) {
@@ -2239,16 +2286,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
         os_log(.info, log: recordingLog, "startRecording() entered")
         guard !isRecording && !isTranscribing else { return }
         let scheduledSelectionSnapshot = pendingSelectionSnapshot
+        let manualCommandRequested = scheduledSelectionSnapshot == nil
+            ? hotkeyManager.currentPressedModifiers.contains(commandModeManualModifier.shortcutModifier)
+            : pendingManualCommandInvocation
         let selectionSnapshot = scheduledSelectionSnapshot
-            ?? contextService.collectSelectionSnapshot(captureInsertionTarget: originalFieldInsertionEnabled)
-        let scheduledManualCommandInvocation = pendingManualCommandInvocation
+            ?? contextService.collectSelectionSnapshot(
+                captureInsertionTarget: originalFieldInsertionEnabled,
+                manualCommandRequested: wholeFieldCaptureRequested(
+                    triggerMode: triggerMode, manualCommandRequested: manualCommandRequested
+                )
+            )
         cancelPendingShortcutStart()
         guard prepareRecordingStart(
             triggerMode: triggerMode,
             selectionSnapshot: selectionSnapshot,
-            manualCommandRequested: scheduledSelectionSnapshot == nil
-                ? hotkeyManager.currentPressedModifiers.contains(commandModeManualModifier.shortcutModifier)
-                : scheduledManualCommandInvocation,
+            manualCommandRequested: manualCommandRequested,
             startedAt: t0
         ) else { return }
         guard ensureMicrophoneAccess(selectionSnapshot: selectionSnapshot) else { return }
@@ -2283,13 +2335,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
             os_log(.info, log: recordingLog, "accessibility check passed: %.3fms", (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
         }
 
-        let selectionSnapshot = selectionSnapshot ?? contextService.collectSelectionSnapshot(captureInsertionTarget: originalFieldInsertionEnabled)
+        let manualCommandRequested = manualCommandRequested
+            ?? hotkeyManager.currentPressedModifiers.contains(commandModeManualModifier.shortcutModifier)
+        let selectionSnapshot = selectionSnapshot ?? contextService.collectSelectionSnapshot(
+            captureInsertionTarget: originalFieldInsertionEnabled,
+            manualCommandRequested: wholeFieldCaptureRequested(
+                triggerMode: triggerMode, manualCommandRequested: manualCommandRequested
+            )
+        )
         activeOriginalFieldInsertionEnabled = selectionSnapshot.usesOriginalFieldInsertion
         activeTextInsertionTarget = activeOriginalFieldInsertionEnabled ? selectionSnapshot.textInsertionTarget : nil
         textInsertionTargetID = activeTextInsertionTarget?.identifier
         activeRecordingBundleIdentifier = selectionSnapshot.bundleIdentifier
-        let manualCommandRequested = manualCommandRequested
-            ?? hotkeyManager.currentPressedModifiers.contains(commandModeManualModifier.shortcutModifier)
         guard let resolvedIntent = resolveSessionIntent(
             triggerMode: triggerMode,
             selectionSnapshot: selectionSnapshot,
@@ -2307,6 +2364,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
 
         currentSessionIntent = resolvedIntent
+        // The whole-field write-back belongs to this session; every later start or cancel clears the identifier.
+        if case .command(_, _, .wholeField(let target)) = resolvedIntent {
+            textInsertionTargetID = target.identifier
+        }
         overlayManager.setRecordingTriggerMode(triggerMode, animated: false)
         return true
     }
@@ -2738,6 +2799,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case rawTranscriptInAIAppTranslated
         case commandModeSucceeded(invocation: CommandInvocation)
         case commandModeFailedFallback(invocation: CommandInvocation)
+        case commandModeFailedWholeField
+        case commandModeWebSearch
+        case commandModeNoTarget
 
         /// A macro payload is literal user-defined text (code, signatures, addresses).
         var isVoiceMacro: Bool {
@@ -2777,6 +2841,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return "Edit mode succeeded (\(invocation.rawValue))"
             case .commandModeFailedFallback(let invocation):
                 return "Edit mode failed, using selected text (\(invocation.rawValue))"
+            case .commandModeFailedWholeField:
+                return CommandModeIntent.wholeFieldFailedProcessingStatus
+            case .commandModeWebSearch:
+                return CommandModeIntent.webSearchProcessingStatus
+            case .commandModeNoTarget:
+                return CommandModeIntent.noTargetProcessingStatus
             }
         }
     }
@@ -2793,7 +2863,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         dictationLanguage: String = "",
         cleanupLevel: CleanupLevel,
         style: DictationStyle? = nil,
-        rawTranscriptForAIApp: Bool = false
+        rawTranscriptForAIApp: Bool = false,
+        webSearchEngine: WebSearchEngine
     ) async -> (
         finalTranscript: String,
         outcome: TranscriptProcessingOutcome,
@@ -2806,7 +2877,20 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return ("", .skippedEmptyRawTranscript, "", 0)
         }
 
-        if case .command(let invocation, let selectedText) = intent {
+        if case .command(let invocation, let selectedText, let scope) = intent {
+            switch CommandModeIntent.classify(command: trimmedRawTranscript, hasEditableText: scope.hasEditableText) {
+            case .webSearch(let query):
+                // Only the percent-encoded query comes from the transcript; no model call, nothing pasted.
+                if let url = webSearchEngine.url(for: query) {
+                    await MainActor.run { _ = NSWorkspace.shared.open(url) }
+                }
+                return ("", .commandModeWebSearch, "", 0)
+            case .noTarget:
+                // The spoken command is the result; the stop path copies it to the clipboard.
+                return (trimmedRawTranscript, .commandModeNoTarget, "", 0)
+            case .editText:
+                break
+            }
             do {
                 let result = try await postProcessingService.commandTransform(
                     selectedText: selectedText,
@@ -2818,6 +2902,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return (result.transcript, .commandModeSucceeded(invocation: invocation), result.prompt, 0)
             } catch {
                 os_log(.error, log: recordingLog, "Edit mode failed: %{public}@", error.localizedDescription)
+                // Field text the user never selected is not a result: nothing to paste or Paste Again.
+                if case .wholeField = scope {
+                    return ("", .commandModeFailedWholeField, "", 0)
+                }
                 return (selectedText, .commandModeFailedFallback(invocation: invocation), "", 0)
             }
         }
@@ -3157,7 +3245,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
                         cleanupLevel: self.cleanupLevel,
                         style: dictationStyle,
-                        rawTranscriptForAIApp: rawTranscriptForAIApp
+                        rawTranscriptForAIApp: rawTranscriptForAIApp,
+                        webSearchEngine: self.webSearchEngine
                     )
                     stageMarks.cleanupFinished = CFAbsoluteTimeGetCurrent()
                     // Immutable snapshot: the @Sendable MainActor closure must not capture the mutable marks.
@@ -3207,6 +3296,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.lastPostProcessedTranscript = trimmedFinalTranscript
                         self.lastPostProcessingStatus = processingStatus
                         let entryID = UUID()
+                        // A search or no-field row never sent the field or selection anywhere; only
+                        // a row whose text reached the provider keeps it.
+                        let recordedIntent: SessionIntent
+                        switch result.outcome {
+                        case .commandModeWebSearch, .commandModeNoTarget:
+                            recordedIntent = sessionIntent.droppingSelectedText
+                        default:
+                            recordedIntent = sessionIntent
+                        }
                         self.recordPipelineHistoryEntry(
                             rawTranscript: trimmedRawTranscript,
                             postProcessedTranscript: trimmedFinalTranscript,
@@ -3214,14 +3312,19 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             systemPrompt: Self.resolvedSystemPrompt(self.customSystemPrompt),
                             context: appContext,
                             processingStatus: processingStatus,
-                            intent: sessionIntent,
+                            intent: recordedIntent,
                             audioFileName: savedAudioFile?.fileName,
                             id: entryID,
                             stageTimings: recordedMarks.timings
                         )
                         self.transcriptionTask = nil
                         self.transcribingAudioFileName = nil
-                        self.lastTranscript = insertedTranscript
+                        // A failed whole-field transform has no result; Paste Again keeps the spoken command.
+                        let isWholeFieldFailure: Bool = {
+                            if case .commandModeFailedWholeField = result.outcome { return true }
+                            return false
+                        }()
+                        self.lastTranscript = isWholeFieldFailure ? bootstrapTranscript : insertedTranscript
                         self.isTranscribing = false
                         self.endCriticalDictationActivity()
                         self.debugStatusMessage = "Done"
@@ -3240,14 +3343,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             shouldPersistRawDictationFallback = false
                         }
 
-                        if trimmedFinalTranscript.isEmpty {
+                        // A web search already opened the browser; nothing is pasted and no Enter is
+                        // sent into whatever is frontmost now.
+                        let isWebSearch: Bool = {
+                            if case .commandModeWebSearch = result.outcome { return true }
+                            return false
+                        }()
+
+                        if trimmedFinalTranscript.isEmpty, !isWholeFieldFailure {
                             self.completeStageTimings(recordedMarks.timings, entryID: nil)
-                            self.statusText = shouldPressEnterAfterPaste ? enterOnlyStatusText : "Nothing to transcribe"
+                            self.statusText = isWebSearch
+                                ? CommandModeIntent.webSearchStatusText
+                                : shouldPressEnterAfterPaste ? enterOnlyStatusText : "Nothing to transcribe"
                             self.clearPendingOverlayDismissToken()
                             if !self.showPostTranscriptionUpdateReminderIfNeeded() {
                                 self.overlayManager.dismiss()
                             }
-                            if shouldPressEnterAfterPaste {
+                            if shouldPressEnterAfterPaste && !isWebSearch {
                                 if useOriginalFieldInsertion {
                                     if let textInsertionTarget {
                                         self.pressEnterWhenShortcutReleased(target: textInsertionTarget)
@@ -3259,6 +3371,38 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 } else {
                                     self.pressEnterWhenShortcutReleased()
                                 }
+                            }
+                        } else if case .commandModeNoTarget = result.outcome {
+                            // The copy is the result, so the clipboard is deliberately not restored.
+                            self.completeStageTimings(recordedMarks.timings, entryID: nil)
+                            _ = self.writeTranscriptToPasteboard(insertedTranscript, appendsSpaceAfterSentenceMark: false)
+                            self.statusText = CommandModeIntent.noTargetOverlayMessage
+                            self.clearPendingOverlayDismissToken()
+                            self.overlayManager.showError(CommandModeIntent.noTargetOverlayMessage)
+                        } else if case .command(_, _, .wholeField(let target)) = sessionIntent {
+                            if case .commandModeSucceeded = result.outcome {
+                                self.statusText = completionStatusText
+                                self.clearPendingOverlayDismissToken()
+                                if !self.showPostTranscriptionUpdateReminderIfNeeded() {
+                                    self.overlayManager.dismiss()
+                                }
+                                self.pasteGate.schedule { [weak self] firedAt in
+                                    guard let firedAt else {
+                                        self?.completeStageTimings(recordedMarks.timings, entryID: nil)
+                                        return
+                                    }
+                                    var firedMarks = recordedMarks
+                                    firedMarks.pasteFired = firedAt
+                                    self?.completeStageTimings(firedMarks.timings, entryID: entryID)
+                                }
+                                self.replaceWholeFieldWhenShortcutReleased(
+                                    insertedTranscript, target: target, shouldPressEnter: shouldPressEnterAfterPaste
+                                )
+                            } else {
+                                // A failed transform has no text to deliver and never writes anything back.
+                                self.completeStageTimings(recordedMarks.timings, entryID: nil)
+                                self.statusText = CommandModeIntent.wholeFieldFailedStatusText
+                                self.scheduleOverlayDismissAfterFailureIndicator(after: 2.5)
                             }
                         } else {
                             self.statusText = completionStatusText
@@ -3292,7 +3436,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.audioRecorder.cleanup()
                         self.refreshAvailableMicrophonesIfNeeded()
 
-                        self.scheduleReadyStatusReset(after: 3, matching: [completionStatusText, "Nothing to transcribe", enterOnlyStatusText])
+                        self.scheduleReadyStatusReset(after: 3, matching: [
+                            completionStatusText, "Nothing to transcribe", enterOnlyStatusText,
+                            CommandModeIntent.webSearchStatusText, CommandModeIntent.noTargetOverlayMessage,
+                            CommandModeIntent.wholeFieldFailedStatusText
+                        ])
                     }
                 } catch is CancellationError {
                     await MainActor.run {
@@ -3974,6 +4122,39 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 case .unavailable:
                     finish("Original field changed or unavailable — use Paste Again")
                 }
+            }
+        }
+    }
+
+    /// Whole-field Edit Mode writes back only through the verified AX path. Any refusal or doubt leaves the
+    /// field alone and hands the result to the clipboard; it never selects all and pastes.
+    private func replaceWholeFieldWhenShortcutReleased(
+        _ text: String, target: AppTextInsertionTarget, shouldPressEnter: Bool
+    ) {
+        performAfterShortcutReleased { [weak self] in
+            guard let self, target.identifier == self.textInsertionTargetID else {
+                self?.pasteGate.report(dispatched: false)
+                return
+            }
+            target.replaceAll(text, isCurrent: { target.identifier == self.textInsertionTargetID }) { result in
+                guard target.identifier == self.textInsertionTargetID else { return }
+                let status: String
+                if result == .inserted {
+                    status = CommandModeIntent.wholeFieldReplacedStatusText
+                    if !self.preserveClipboard || self.keepDictationInClipboardHistory {
+                        self.restoreClipboardIfNeeded(self.writeTranscriptToPasteboard(text, appendsSpaceAfterSentenceMark: false))
+                    }
+                    if shouldPressEnter { self.pressEnterAfterPaste(target: target) }
+                } else {
+                    // notInserted, unverified and unavailable all copy: a paste after an
+                    // unverified write could duplicate the text.
+                    self.pasteGate.report(dispatched: false)
+                    _ = self.writeTranscriptToPasteboard(text, appendsSpaceAfterSentenceMark: false)
+                    status = CommandModeIntent.fieldChangedOverlayMessage
+                    self.overlayManager.showError(status)
+                }
+                self.statusText = status
+                self.scheduleReadyStatusReset(after: 3, matching: [status])
             }
         }
     }

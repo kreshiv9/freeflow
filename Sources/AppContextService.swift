@@ -110,7 +110,10 @@ Return only two sentences, no labels, no markdown, no extra commentary.
     }
 
     /// Captures the mode and optional target together; off skips insertion-target reads.
-    func collectSelectionSnapshot(captureInsertionTarget: Bool = false) -> AppSelectionSnapshot {
+    /// A manual Edit Mode press also captures the focused field so its text can stand in for a selection.
+    func collectSelectionSnapshot(
+        captureInsertionTarget: Bool = false, manualCommandRequested: Bool = false
+    ) -> AppSelectionSnapshot {
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
             return AppSelectionSnapshot(
                 appName: nil,
@@ -123,7 +126,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         }
 
         let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
-        let textInsertionTarget = captureInsertionTarget ? AppTextInsertionTarget.capture(
+        let textInsertionTarget = captureInsertionTarget || manualCommandRequested ? AppTextInsertionTarget.capture(
             from: appElement, processIdentifier: frontmostApp.processIdentifier
         ) : nil
         return AppSelectionSnapshot(

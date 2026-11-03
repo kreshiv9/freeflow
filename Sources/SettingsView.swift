@@ -1397,6 +1397,21 @@ struct GeneralSettingsView: View {
             }
             .opacity(appState.isCommandModeEnabled ? 1 : 0.5)
 
+            Picker("Web search engine", selection: $appState.webSearchEngine) {
+                ForEach(WebSearchEngine.allCases) { engine in
+                    Text(engine.displayName).tag(engine)
+                }
+            }
+            .disabled(!appState.isCommandModeEnabled)
+            .opacity(appState.isCommandModeEnabled ? 1 : 0.5)
+
+            Text(appState.commandModeStyle == .manual
+                 ? "With no selection, Edit Mode edits the whole text field. Say 'search for …' to open a web search instead."
+                 : "Say 'search for …' to open a web search instead.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .opacity(appState.isCommandModeEnabled ? 1 : 0.5)
+
             if let validationMessage = appState.commandModeManualModifierValidationMessage {
                 Label(validationMessage, systemImage: "xmark.circle.fill")
                     .font(.caption)
