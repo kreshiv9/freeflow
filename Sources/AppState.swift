@@ -608,7 +608,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var captureFormat: CaptureFormatPreference {
         didSet {
             captureFormat.save(to: .standard)
+            // The 16 kHz format turns voice isolation off; Native brings it back.
+            audioRecorder.prepareVoiceIsolation(effectiveVoiceIsolation)
         }
+    }
+
+    /// Optional on-device voice isolation; changing it builds or releases the filter off the capture path.
+    @Published var voiceIsolation: VoiceIsolationPreference {
+        didSet {
+            voiceIsolation.save(to: .standard)
+            audioRecorder.prepareVoiceIsolation(effectiveVoiceIsolation)
+        }
+    }
+
+    /// The voice isolation mode recordings use: Off while this Mac or the
+    /// recording format cannot run it, so no unusable filter stays loaded.
+    var effectiveVoiceIsolation: VoiceIsolationPreference {
+        voiceIsolation.effective(isSystemSupported: VoiceIsolationFilter.isAvailable, captureFormat: captureFormat)
     }
 
     /// Engine opened by an Edit Mode web search.
@@ -1012,6 +1028,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
         self.captureFormat = CaptureFormatPreference.load(from: .standard)
+        self.voiceIsolation = VoiceIsolationPreference.load(from: .standard)
         self.webSearchEngine = WebSearchEngine.load(from: .standard)
         self.handsFreeSilenceTimeoutSeconds = HandsFreeAutoStop.loadSilenceTimeoutSeconds(from: .standard)
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
@@ -1032,6 +1049,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         refreshAvailableMicrophones()
         installAudioDeviceObservers()
+        // didSet does not run in init, so build the selected filter at launch.
+        audioRecorder.prepareVoiceIsolation(effectiveVoiceIsolation)
 
         if shortcuts.didUpdateHoldStoredValue {
             persistShortcut(shortcuts.hold, key: holdShortcutStorageKey)
@@ -2989,6 +3008,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // Only a stream that actually started gets a rate; nil skips the stream conversion.
         let streamSampleRate = realtimeService == nil ? nil : streamingProvider.streamSampleRate
         let captureFormat = self.captureFormat
+        let voiceIsolation = effectiveVoiceIsolation
 
         // Start engine on background thread so UI isn't blocked
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -2999,7 +3019,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     deviceUID: deviceUID,
                     timingGeneration: timingGeneration,
                     captureFormat: captureFormat,
-                    streamSampleRate: streamSampleRate
+                    streamSampleRate: streamSampleRate,
+                    voiceIsolation: voiceIsolation
                 )
                 os_log(.info, log: recordingLog, "audioRecorder.startRecording() done: %.3fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
                 DispatchQueue.main.async { [self] in

@@ -1602,6 +1602,33 @@ struct GeneralSettingsView: View {
             Divider()
                 .padding(.vertical, 2)
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Voice isolation")
+                    .font(.caption.weight(.semibold))
+                Picker("", selection: voiceIsolationSelection) {
+                    ForEach(VoiceIsolationPreference.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .accessibilityLabel("Voice isolation")
+                .labelsHidden()
+                .disabled(voiceIsolationUnavailableReason != nil)
+                if let reason = voiceIsolationUnavailableReason {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text(VoiceIsolationPreference.caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("macOS Mic Mode for this app: \(VoiceIsolationPreference.micModeDisplayName(rawValue: AVCaptureDevice.preferredMicrophoneMode.rawValue))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+                .padding(.vertical, 2)
+
             Toggle("Skip transcription when no speech is detected", isOn: $appState.silenceGateEnabled)
 
             Text("When a recording holds only silence or quiet background noise, \(AppName.displayName) ends the dictation locally instead of requesting a transcript; louder steady noise cannot be told apart from speech and is still transcribed. The silent audio is not uploaded unless Stream audio while speaking is on, which streams audio while you hold the shortcut. Turn this off if quiet dictations are being skipped.")
@@ -1611,6 +1638,22 @@ struct GeneralSettingsView: View {
         .onAppear {
             appState.refreshAvailableMicrophones()
         }
+    }
+
+    private var voiceIsolationUnavailableReason: String? {
+        VoiceIsolationPreference.unavailableReason(
+            isSystemSupported: VoiceIsolationFilter.isAvailable,
+            captureFormat: appState.captureFormat
+        )
+    }
+
+    /// Shows the mode recordings use, so the disabled picker reads Off; the
+    /// saved choice returns when the picker is enabled again.
+    private var voiceIsolationSelection: Binding<VoiceIsolationPreference> {
+        Binding(
+            get: { appState.effectiveVoiceIsolation },
+            set: { appState.voiceIsolation = $0 }
+        )
     }
 
     // MARK: Sound Volume

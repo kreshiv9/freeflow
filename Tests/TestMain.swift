@@ -17,6 +17,7 @@ struct FreeFlowTests {
         SilenceGatePreferenceTests.run()
         StreamingTranscriptionProviderTests.run()
         HandsFreeAutoStopTests.run()
+        VoiceIsolationFilterTests.run()
         AIAppRawTranscriptPreferenceTests.run()
         CleanupLevelTests.run()
         CommandModeIntentTests.run()

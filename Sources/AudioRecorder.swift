@@ -116,9 +116,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             interleaved: true
         )!
     }()
-    /// Capture pipeline state. Set in makeSession before capture starts,
-    /// otherwise touched only on the sample-buffer queue, then flushed and
-    /// cleared in finishAudioFileLocked.
+    /// Capture pipeline state, including the voice isolation mode and filter.
+    /// Set in makeSession before capture starts, otherwise touched only on the
+    /// sample-buffer queue, then flushed and cleared in finishAudioFileLocked.
     private var requestedCaptureFormat: CaptureFormatPreference = .native
     private var streamSampleRate: Int?
     private var pipelineSourceFormat: AVAudioFormat?
@@ -126,6 +126,18 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private var streamResampler: PCMStreamResampler?
     private var pipelineBuildCount = 0
     private let streamFailed = OSAllocatedUnfairLock(initialState: false)
+    private var voiceIsolationMode: VoiceIsolationPreference = .off
+    /// This recording's filter; nil sends the raw audio straight to the converters.
+    private var voiceIsolationFilter: VoiceIsolationFilter?
+    /// The filter built ahead of time by prepareVoiceIsolation for the
+    /// selected mode, so no recording waits for the model to load.
+    private struct PreparedVoiceIsolation {
+        var requestedMode: VoiceIsolationPreference = .off
+        var builtMode: VoiceIsolationPreference = .off
+        var filter: VoiceIsolationFilter?
+    }
+    private let preparedVoiceIsolation = OSAllocatedUnfairLock(initialState: PreparedVoiceIsolation())
+    private let voiceIsolationQueue = DispatchQueue(label: "com.zachlatta.freeflow.capture.isolation", qos: .utility)
     private let captureTiming = OSAllocatedUnfairLock(initialState: RecordingCaptureTiming())
     private var failureReported = false
     private static let watchdogTimeout: TimeInterval = 2.0
@@ -321,6 +333,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             if !discard {
                 self.flushCapturePipeline()
             }
+            self.voiceIsolationFilter = nil
             self.wavResampler = nil
             self.streamResampler = nil
             self.pipelineSourceFormat = nil
@@ -383,9 +396,12 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         return try makePCMBuffer(from: sampleBuffer, format: sourceFormat, frameCount: frameCount)
     }
 
-    /// Converts one capture buffer into the 16 kHz WAV (which also feeds the
-    /// speech tracker and a 16 kHz stream) and, for another stream rate, into
-    /// the stream. WAV errors throw; stream errors only stop the stream.
+    /// Runs one capture buffer through voice isolation when it is on, then
+    /// converts the result into the 16 kHz WAV (which also feeds the speech
+    /// tracker and a 16 kHz stream) and, for another stream rate, into the
+    /// stream. A filter error only bypasses the filter (the raw audio it still
+    /// held goes on unprocessed); WAV errors throw; stream errors only stop
+    /// the stream.
     private func processCaptureBuffer(_ buffer: AVAudioPCMBuffer) throws {
         if let fileWriteError = fileWriteErrorLock.withLock({ _ in
             self.fileWriteError
@@ -396,19 +412,41 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         if pipelineSourceFormat != buffer.format {
             try rebuildCapturePipeline(for: buffer.format)
         }
-        try wavResampler?.process(buffer) { try self.writeRecordingChunk($0) }
+        if let voiceIsolationFilter {
+            do {
+                try voiceIsolationFilter.process(buffer) { try self.convertCaptureChunk($0) }
+                return
+            } catch let error as VoiceIsolationFilter.FilterError {
+                bypassVoiceIsolation("error \(error)")
+                if let unemitted = voiceIsolationFilter.takeUnemittedInput() {
+                    try convertCaptureChunk(unemitted)
+                }
+                // After a render failure the unemitted audio included this buffer.
+                if case .renderFailed = error { return }
+            }
+        }
+        try convertCaptureChunk(buffer)
+    }
+
+    /// Feeds one capture-format chunk to the WAV and stream converters.
+    private func convertCaptureChunk(_ chunk: AVAudioPCMBuffer) throws {
+        try wavResampler?.process(chunk) { try self.writeRecordingChunk($0) }
         if let streamResampler {
             do {
-                try streamResampler.process(buffer) { self.emitStreamChunk($0) }
+                try streamResampler.process(chunk) { self.emitStreamChunk($0) }
             } catch {
                 markStreamFailed(error)
             }
         }
     }
 
-    /// Flushes the converters built for the previous source format, then builds
-    /// new ones for `sourceFormat`.
+    /// Flushes voice isolation and the converters built for the previous
+    /// source format, then builds new ones for `sourceFormat`.
     private func rebuildCapturePipeline(for sourceFormat: AVAudioFormat) throws {
+        if pipelineSourceFormat != nil {
+            // The held-back isolation tail belongs to the old format's converters.
+            try finishVoiceIsolation()
+        }
         let previousWAVResampler = wavResampler
         let previousStreamResampler = streamResampler
         wavResampler = nil
@@ -451,6 +489,19 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             streamSampleRate.map { "\($0)Hz" } ?? "off",
             pipelineBuildCount
         )
+
+        if let voiceIsolationFilter {
+            if VoiceIsolationPreference.isSupported(
+                sourceSampleRate: sourceFormat.sampleRate,
+                channelCount: sourceFormat.channelCount,
+                isFloat32: sourceFormat.commonFormat == .pcmFormatFloat32
+            ) {
+                // Re-arms the filter after the previous recording's finish or cancel.
+                voiceIsolationFilter.reset()
+            } else {
+                bypassVoiceIsolation("unsupported format \(PCMStreamResampler.formatSummary(sourceFormat))")
+            }
+        }
     }
 
     /// Writes one 16 kHz chunk to the lazily created WAV, tracks its speech
@@ -510,9 +561,35 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
     }
 
-    /// Writes and streams the converters' held-back tails at stop.
+    /// Sends voice isolation's held-back tail through the current converters.
+    /// A filter error bypasses it and sends the rest of the tail raw;
+    /// converter and WAV errors throw.
+    private func finishVoiceIsolation() throws {
+        guard let voiceIsolationFilter else { return }
+        do {
+            try voiceIsolationFilter.finish { try self.convertCaptureChunk($0) }
+        } catch let error as VoiceIsolationFilter.FilterError {
+            bypassVoiceIsolation("error \(error)")
+            if let unemitted = voiceIsolationFilter.takeUnemittedInput() {
+                try convertCaptureChunk(unemitted)
+            }
+        }
+    }
+
+    /// Sends raw audio to the converters for the rest of this recording.
+    /// The reason is content-free and logged once.
+    private func bypassVoiceIsolation(_ reason: String) {
+        guard voiceIsolationFilter != nil else { return }
+        voiceIsolationFilter = nil
+        let type: OSLogType = reason.hasPrefix("error") ? .error : .info
+        os_log(type, log: recordingLog, "voice isolation bypassed: %{public}@ (mode=%{public}@)", reason, voiceIsolationMode.rawValue)
+    }
+
+    /// Writes and streams voice isolation's and the converters' held-back
+    /// tails at stop, in that order.
     private func flushCapturePipeline() {
         do {
+            try finishVoiceIsolation()
             try wavResampler?.finish { try self.writeRecordingChunk($0) }
         } catch {
             fileWriteErrorLock.withLock { _ in
@@ -614,7 +691,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         deviceUID: String?,
         outputURL: URL,
         captureFormat: CaptureFormatPreference,
-        streamSampleRate: Int?
+        streamSampleRate: Int?,
+        voiceIsolation: VoiceIsolationPreference
     ) throws {
         teardownSessionLocked()
 
@@ -666,6 +744,13 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         streamResampler = nil
         pipelineBuildCount = 0
         streamFailed.withLock { $0 = false }
+        // Only a filter already built for this mode is used; it is reset
+        // when the first buffer builds the pipeline.
+        let prepared = preparedVoiceIsolation.withLock { ($0.builtMode, $0.filter) }
+        let isIsolationBuilt = voiceIsolation != .off && prepared.0 == voiceIsolation
+        let isolationFilter = isIsolationBuilt ? prepared.1 : nil
+        voiceIsolationMode = voiceIsolation
+        voiceIsolationFilter = isolationFilter
         recordedFrameCount = 0
         fileWriteErrorLock.withLock { _ in
             fileWriteError = nil
@@ -680,7 +765,39 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
 
         os_log(.info, log: recordingLog, "capture session running with device %{public}@ [uid=%{public}@]", device.localizedName, device.uniqueID)
+        logVoiceIsolationStart(mode: voiceIsolation, filter: isolationFilter, isBuilt: isIsolationBuilt)
         tempFileURL = outputURL
+    }
+
+    /// Content-free: the isolation mode, model, wet mix and latency, and the
+    /// raw macOS Mic Mode values (read-only class properties, no permission).
+    private func logVoiceIsolationStart(mode: VoiceIsolationPreference, filter: VoiceIsolationFilter?, isBuilt: Bool) {
+        let preferredMicMode = AVCaptureDevice.preferredMicrophoneMode.rawValue
+        let activeMicMode = AVCaptureDevice.activeMicrophoneMode.rawValue
+        if let filter {
+            os_log(
+                .info,
+                log: recordingLog,
+                "voice isolation mode=%{public}@ model=highQualityVoice wet=%.0f%% latency=%.1fms micMode preferred=%ld active=%ld",
+                mode.rawValue,
+                Double(filter.wetDryPercent),
+                Double(filter.latencyFrames) / VoiceIsolationFilter.sampleRate * 1000,
+                preferredMicMode,
+                activeMicMode
+            )
+        } else if mode == .off {
+            os_log(.info, log: recordingLog, "voice isolation mode=off micMode preferred=%ld active=%ld", preferredMicMode, activeMicMode)
+        } else {
+            os_log(
+                .info,
+                log: recordingLog,
+                "voice isolation bypassed: %{public}@ (mode=%{public}@) micMode preferred=%ld active=%ld",
+                isBuilt ? "unavailable" : "not ready",
+                mode.rawValue,
+                preferredMicMode,
+                activeMicMode
+            )
+        }
     }
 
     /// Called before scheduling capture setup so cancellation also invalidates pending starts.
@@ -688,13 +805,64 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         captureTiming.withLock { $0.prepare() }
     }
 
+    /// Builds the voice isolation filter for `mode` on a utility queue (a
+    /// cold setup takes about 0.3 s), or releases it for `.off`, so starting
+    /// a recording never waits for the model. Fast toggling skips stale builds.
+    func prepareVoiceIsolation(_ mode: VoiceIsolationPreference) {
+        let released = preparedVoiceIsolation.withLock { state -> VoiceIsolationFilter? in
+            state.requestedMode = mode
+            guard mode == .off else { return nil }
+            defer {
+                state.builtMode = .off
+                state.filter = nil
+            }
+            return state.filter
+        }
+        voiceIsolationQueue.async { [weak self] in
+            // A released model is freed here, off the caller's queue.
+            withExtendedLifetime(released) {}
+            guard let self, let wetDryPercent = mode.wetDryPercent else { return }
+            let needsBuild = self.preparedVoiceIsolation.withLock { state in
+                state.requestedMode == mode && !(state.builtMode == mode && state.filter != nil)
+            }
+            guard needsBuild else { return }
+
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let filter = VoiceIsolationFilter(wetDryPercent: wetDryPercent)
+            let setupMilliseconds = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            // Stored only if the mode is still wanted. The replaced filter is
+            // returned so it is freed outside the lock.
+            let (isStored, replaced) = self.preparedVoiceIsolation.withLock { state -> (Bool, VoiceIsolationFilter?) in
+                guard state.requestedMode == mode else { return (false, nil) }
+                defer {
+                    state.builtMode = mode
+                    state.filter = filter
+                }
+                return (true, state.filter)
+            }
+            withExtendedLifetime(replaced) {}
+            guard isStored else { return }
+            os_log(
+                .info,
+                log: recordingLog,
+                "voice isolation prepared: mode=%{public}@ ready=%{public}@ latency=%.1fms setup=%.0fms",
+                mode.rawValue,
+                String(filter != nil),
+                filter.map { Double($0.latencyFrames) / VoiceIsolationFilter.sampleRate * 1000 } ?? 0,
+                setupMilliseconds
+            )
+        }
+    }
+
     /// `streamSampleRate` is the rate `onPCM16Samples` delivers; nil skips
-    /// the stream conversion.
+    /// the stream conversion. `voiceIsolation` applies only when
+    /// prepareVoiceIsolation has built the filter for that mode.
     func startRecording(
         deviceUID: String? = nil,
         timingGeneration: UInt64? = nil,
         captureFormat: CaptureFormatPreference = .load(from: .standard),
-        streamSampleRate: Int? = nil
+        streamSampleRate: Int? = nil,
+        voiceIsolation: VoiceIsolationPreference = .off
     ) throws {
         let timingGeneration = timingGeneration ?? prepareRecordingTiming()
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -715,7 +883,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                     deviceUID: deviceUID,
                     outputURL: outputURL,
                     captureFormat: captureFormat,
-                    streamSampleRate: streamSampleRate
+                    streamSampleRate: streamSampleRate,
+                    voiceIsolation: voiceIsolation
                 )
                 self.captureTiming.withLock { $0.start(at: .now, generation: timingGeneration) }
                 self._recording.withLock { $0 = true }
@@ -844,8 +1013,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             return value
         }
 
-        // The meter and readiness use the raw capture buffer; the speech
-        // tracker is fed the 16 kHz chunks in writeRecordingChunk.
+        // The meter and readiness use the raw capture buffer, before voice
+        // isolation; the speech tracker is fed the converted 16 kHz chunks
+        // (isolated when it is on) in writeRecordingChunk.
         let rms = buffer.map { AudioLevelMeter.rms($0) } ?? 0
         if buffer != nil {
             let normalizedDisplayLevel = liveLevelNormalizerLock.withLock {
