@@ -28,6 +28,8 @@ struct PipelineHistoryItem: Identifiable, Codable {
     let contextAppName: String?
     let contextBundleIdentifier: String?
     let contextWindowTitle: String?
+    // The only mutable field: the stop path completes it in place once the paste fires.
+    var stageTimings: PipelineStageTimings?
 
     init(
         intent: PipelineHistoryItemIntent = .dictation,
@@ -50,7 +52,8 @@ struct PipelineHistoryItem: Identifiable, Codable {
         audioFileName: String? = nil,
         contextAppName: String? = nil,
         contextBundleIdentifier: String? = nil,
-        contextWindowTitle: String? = nil
+        contextWindowTitle: String? = nil,
+        stageTimings: PipelineStageTimings? = nil
     ) {
         self.intent = intent
         self.selectedText = selectedText
@@ -73,5 +76,6 @@ struct PipelineHistoryItem: Identifiable, Codable {
         self.contextAppName = contextAppName
         self.contextBundleIdentifier = contextBundleIdentifier
         self.contextWindowTitle = contextWindowTitle
+        self.stageTimings = stageTimings
     }
 }

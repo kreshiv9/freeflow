@@ -24,6 +24,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/LLMCooldownManager.swift \
 	Sources/ModelConfiguration.swift \
 	Sources/OriginalFieldInsertionPreference.swift \
+	Sources/PipelineHistoryItem.swift \
+	Sources/PipelineStageTimings.swift \
 	Sources/PostProcessingService.swift \
 	Sources/RecordingCaptureTiming.swift \
 	Sources/RecordingTimerPreference.swift \

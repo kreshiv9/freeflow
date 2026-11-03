@@ -8,6 +8,7 @@ struct FreeFlowTests {
         TemperatureCapabilityCacheTests.run()
         ModelConfigurationTests.run()
         RecordingCaptureTimingTests.run()
+        PipelineStageTimingsTests.run()
         RecordingTimerPreferenceTests.run()
         OriginalFieldInsertionPreferenceTests.run()
         ShortcutCoreTests.run()

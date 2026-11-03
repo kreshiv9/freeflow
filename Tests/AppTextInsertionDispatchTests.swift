@@ -33,6 +33,7 @@ enum AppTextInsertionDispatchTests {
         testFocusedUnsupportedUnreadableTargetSkipsEnter()
         testDelayedEnterCancelsForNewSession()
         testDisabledOriginalFieldUsesCurrentFieldPaste()
+        testPasteTimingReportsSkippedOriginalFieldInsertion()
     }
 
     private static func testAccessibilityPreparationRequiresEnabledMonitoringAndPermission() {
@@ -551,6 +552,70 @@ enum AppTextInsertionDispatchTests {
         TestSupport.expectEqual(fixture.target.focusCallCount, 0)
     }
 
+    /// The paste stage may only be reported for a dispatch that pasted or
+    /// inserted. An original-field action that returns early must hand the
+    /// timing handler nil so the Run Log never claims a paste that never happened.
+    private static func testPasteTimingReportsSkippedOriginalFieldInsertion() {
+        let mark = TestInsertionState.pasteFiredMark
+
+        // A focused, unchanged target pastes and carries the mark sampled at the gate.
+        let pasted = makeFixture(focused: true)
+        pasted.state.preserveClipboard = true
+        TestSupport.expectEqual(dispatchThroughPasteGate(pasted, target: pasted.target), [mark])
+        TestSupport.expectEqual(pasted.state.pasteCalls, [pasted.target.processIdentifier])
+
+        // A background AX insertion is the insert action firing.
+        let inserted = makeFixture(focused: false)
+        inserted.target.insertionResult = .inserted
+        TestSupport.expectEqual(dispatchThroughPasteGate(inserted, target: inserted.target), [mark])
+        TestSupport.expectEqual(inserted.target.insertCallCount, 1)
+
+        // Disabled original-field insertion keeps the plain current-field paste.
+        let legacy = makeFixture(focused: true)
+        TestSupport.expectEqual(dispatchThroughPasteGate(legacy, target: legacy.target, useOriginalField: false), [mark])
+        TestSupport.expectEqual(legacy.state.pasteCalls, [nil])
+
+        // A session that moved on before the gate opened never pastes.
+        let staleSession = makeFixture(focused: true)
+        staleSession.state.textInsertionTargetID = UUID()
+        TestSupport.expectEqual(dispatchThroughPasteGate(staleSession, target: staleSession.target), [nil])
+        TestSupport.expectEqual(staleSession.state.pasteCalls.count, 0)
+
+        // No original field was captured for the session.
+        let missingTarget = makeFixture(focused: true)
+        missingTarget.state.textInsertionTargetID = nil
+        TestSupport.expectEqual(dispatchThroughPasteGate(missingTarget, target: nil), [nil])
+        TestSupport.expectEqual(missingTarget.state.statusText, "Original field unavailable — use Paste Again")
+        TestSupport.expectEqual(missingTarget.state.pasteCalls.count, 0)
+
+        // The focused paste was abandoned after the clipboard write.
+        let changedSession = makeFixture(focused: true)
+        changedSession.state.preserveClipboard = true
+        changedSession.state.afterClipboardWrite = { changedSession.state.textInsertionTargetID = UUID() }
+        TestSupport.expectEqual(dispatchThroughPasteGate(changedSession, target: changedSession.target), [nil])
+        TestSupport.expectEqual(changedSession.state.clipboardWriteCount, 1)
+        TestSupport.expectEqual(changedSession.state.pasteCalls.count, 0)
+    }
+
+    /// Runs a dispatch through the paste-timing gate the way
+    /// performAfterShortcutReleased does in production and returns what the
+    /// scheduled handler received: the mark for a dispatched paste or insert,
+    /// nil for a skipped one.
+    private static func dispatchThroughPasteGate(
+        _ fixture: Fixture, target: TestInsertionTarget?, useOriginalField: Bool = true
+    ) -> [CFAbsoluteTime?] {
+        var reported: [CFAbsoluteTime?] = []
+        fixture.state.pasteGate.schedule { reported.append($0) }
+        let gated = fixture.state.pasteGate.wrappingScheduledPaste {
+            fixture.state.testDispatchInsertion(
+                "dictation", target: target, shouldPressEnter: false, useOriginalField: useOriginalField
+            )
+        }
+        gated()
+        TestDispatchQueue.runAll()
+        return reported
+    }
+
     private static func expectActivationAbort(_ fixture: Fixture) {
         TestDispatchQueue.runAll()
         TestSupport.expectEqual(fixture.target.focusCallCount, 0)
@@ -601,9 +666,12 @@ enum AppTextInsertionDispatchTests {
 }
 
 final class TestInsertionState {
+    static let pasteFiredMark: CFAbsoluteTime = 700_000_000
+
     var originalFieldInsertionEnabled = false
     var shouldMonitorHotkeys = false
     let insertionAccessibilityQueue = TestDispatchQueue.main
+    let pasteGate = PipelineStageTimings.PasteGate(now: { TestInsertionState.pasteFiredMark })
     var textInsertionTargetID: UUID?
     var statusText = ""
     var preserveClipboard = false
