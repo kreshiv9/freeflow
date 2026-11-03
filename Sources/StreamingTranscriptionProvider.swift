@@ -38,6 +38,20 @@ enum StreamingTranscriptionProvider: String, CaseIterable, Identifiable {
     /// The Realtime Transcription Model field only applies to the OpenAI-compatible socket.
     var usesRealtimeStreamingModel: Bool { self == .openAIRealtime }
 
+    /// OpenAI's `audio/pcm` input accepts 24 kHz only.
+    static let openAIRealtimeSampleRate = 24_000
+    /// Deepgram's documented sweet spot; the same samples as the saved WAV.
+    static let deepgramSampleRate = 16_000
+
+    /// Rate of the PCM16 chunks this provider's stream takes; nil when nothing streams.
+    var streamSampleRate: Int? {
+        switch self {
+        case .off: nil
+        case .openAIRealtime: Self.openAIRealtimeSampleRate
+        case .deepgram: Self.deepgramSampleRate
+        }
+    }
+
     /// Inline warning while Deepgram is selected without a key; pinned by tests.
     static let deepgramMissingKeyWarning = "Add a Deepgram API key to stream audio. Until then, audio is uploaded after you release the shortcut."
 

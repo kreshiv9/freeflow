@@ -5,6 +5,7 @@ enum StreamingTranscriptionProviderTests {
         testDefaultAndStorage()
         testMigrationFromRealtimeToggle()
         testSaveWritesBothKeysAndRoundTrips()
+        testStreamSampleRates()
     }
 
     private static func testDefaultAndStorage() {
@@ -112,5 +113,16 @@ enum StreamingTranscriptionProviderTests {
         TestSupport.expectEqual(defaults.object(forKey: legacyKey) as? Bool, true)
         StreamingTranscriptionProvider.deepgram.save(to: defaults)
         TestSupport.expectEqual(defaults.object(forKey: legacyKey) as? Bool, false)
+    }
+
+    /// OpenAI accepts 24 kHz PCM only; Deepgram gets the same 16 kHz samples as the WAV.
+    private static func testStreamSampleRates() {
+        TestSupport.expectEqual(StreamingTranscriptionProvider.openAIRealtimeSampleRate, 24_000)
+        TestSupport.expectEqual(StreamingTranscriptionProvider.deepgramSampleRate, 16_000)
+        TestSupport.expectEqual(StreamingTranscriptionProvider.allCases.map(\.streamSampleRate), [nil, 24_000, 16_000])
+        TestSupport.expectEqual(
+            DeepgramStreamingCore.maxPendingAudioBytes(sampleRate: StreamingTranscriptionProvider.deepgramSampleRate),
+            320_000
+        )
     }
 }
