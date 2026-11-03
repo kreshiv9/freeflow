@@ -724,6 +724,9 @@ struct GeneralSettingsView: View {
                 SettingsCard("Cleanup", icon: "sparkles") {
                     cleanupSection
                 }
+                SettingsCard("Styles", icon: "textformat") {
+                    stylesSection
+                }
                 SettingsCard("Context Awareness", icon: "text.viewfinder") {
                     contextAwarenessSection
                 }
@@ -1281,15 +1284,22 @@ struct GeneralSettingsView: View {
 
     private var cleanupSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Toggle("Preserve exact wording", isOn: $appState.preserveExactWording)
+            Picker("Cleanup", selection: $appState.cleanupLevel) {
+                ForEach(CleanupLevel.allCases) { level in
+                    Text(level.displayName).tag(level)
+                }
+            }
+            .pickerStyle(.segmented)
 
-            Text("When on, \(AppName.displayName) skips the LLM cleanup step and pastes the transcript verbatim — filler words, informal phrasing, and explicit language are all preserved. Voice macros, Corrections and Edit Mode still run.")
+            Text(appState.cleanupLevel.caption)
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Text("If Output Language is set, the transcript is still translated into that language, but the translation is literal: no rewording, no filler removal, no reformatting.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if appState.cleanupLevel.skipsCleanup {
+                Text("If Output Language is set, the transcript is still translated into that language, but the translation is literal: no rewording, no filler removal, no reformatting.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             Divider()
                 .padding(.vertical, 2)
@@ -1300,6 +1310,33 @@ struct GeneralSettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    // MARK: Styles
+
+    private var stylesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(StyleCategory.allCases) { category in
+                Picker(category.displayName, selection: styleBinding(for: category)) {
+                    ForEach(category.allowedStyles) { style in
+                        Text(style.displayName).tag(style)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            Text("Sets the tone for new dictations in each kind of app. English only, like Wispr Flow.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Falls back to the category default so a missing or disallowed choice still shows a selection.
+    private func styleBinding(for category: StyleCategory) -> Binding<DictationStyle> {
+        Binding(
+            get: { category.style(in: appState.dictationStyles) },
+            set: { appState.dictationStyles[category] = $0 }
+        )
     }
 
     // MARK: Context awareness
@@ -2269,6 +2306,8 @@ struct RunLogEntryView: View {
     @State private var copiedRawTranscriptResetWorkItem: DispatchWorkItem?
     @State private var copiedCleanedTranscript = false
     @State private var copiedCleanedTranscriptResetWorkItem: DispatchWorkItem?
+    @State private var undidAIEdit = false
+    @State private var undidAIEditResetWorkItem: DispatchWorkItem?
 
     private var isError: Bool {
         item.postProcessingStatus.hasPrefix("Error:")
@@ -2384,6 +2423,19 @@ struct RunLogEntryView: View {
                         disabled: copyableTranscript.isEmpty
                     ) {
                         copyTranscriptToPasteboard()
+                    }
+
+                    if item.canUndoAIEdit {
+                        actionIconButton(
+                            systemName: undidAIEdit ? "checkmark" : "arrow.uturn.backward",
+                            color: undidAIEdit ? .green : .secondary,
+                            help: undidAIEdit ? CleanupLevel.rawTranscriptCopiedStatusText : "Undo AI edit"
+                        ) {
+                            undoAIEdit()
+                        }
+                    } else {
+                        Color.clear
+                            .frame(width: actionIconSize, height: actionIconSize)
                     }
 
                     actionIconButton(systemName: "trash", help: "Delete this run") {
@@ -2691,6 +2743,19 @@ struct RunLogEntryView: View {
             copiedCleanedTranscriptResetWorkItem = nil
         }
         copiedCleanedTranscriptResetWorkItem = resetWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: resetWorkItem)
+    }
+
+    private func undoAIEdit() {
+        appState.undoAIEdit(item: item)
+        undidAIEdit = true
+
+        undidAIEditResetWorkItem?.cancel()
+        let resetWorkItem = DispatchWorkItem {
+            undidAIEdit = false
+            undidAIEditResetWorkItem = nil
+        }
+        undidAIEditResetWorkItem = resetWorkItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: resetWorkItem)
     }
 }

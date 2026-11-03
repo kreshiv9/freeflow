@@ -223,7 +223,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let contextScreenshotMaxDimensionStorageKey = "context_screenshot_max_dimension"
     private let shortcutStartDelayStorageKey = "shortcut_start_delay"
     private let preserveClipboardStorageKey = "preserve_clipboard"
-    private let preserveExactWordingStorageKey = "preserve_exact_wording"
     private let keepDictationInClipboardHistoryStorageKey = "keep_dictation_in_clipboard_history"
     private let pressEnterVoiceCommandStorageKey = "press_enter_voice_command_enabled"
     private let alertSoundsEnabledStorageKey = "alert_sounds_enabled"
@@ -551,10 +550,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    @Published var preserveExactWording: Bool {
-        didSet {
-            UserDefaults.standard.set(preserveExactWording, forKey: preserveExactWordingStorageKey)
-        }
+    /// Wispr-style Auto Cleanup level; None is the former "Preserve exact wording" toggle.
+    @Published var cleanupLevel: CleanupLevel {
+        didSet { cleanupLevel.save(to: .standard) }
     }
 
     /// Wispr-style: a dictation into an AI chat is pasted without cleanup. On by default.
@@ -562,6 +560,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
         didSet {
             UserDefaults.standard.set(aiAppsRawTranscriptEnabled, forKey: AIAppRawTranscriptPreference.storageKey)
         }
+    }
+
+    /// Wispr-style tone per kind of app, applied as a prompt line for English dictations.
+    @Published var dictationStyles: [StyleCategory: DictationStyle] {
+        didSet { StyleCategory.saveStyles(dictationStyles, to: .standard) }
     }
 
     @Published var keepDictationInClipboardHistory: Bool {
@@ -765,7 +768,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let preserveClipboard = UserDefaults.standard.object(forKey: preserveClipboardStorageKey) == nil
             ? true
             : UserDefaults.standard.bool(forKey: preserveClipboardStorageKey)
-        let preserveExactWording = UserDefaults.standard.bool(forKey: preserveExactWordingStorageKey)
         let keepDictationInClipboardHistory = UserDefaults.standard.bool(forKey: keepDictationInClipboardHistoryStorageKey)
         let realtimeStreamingEnabled = UserDefaults.standard.bool(forKey: realtimeStreamingEnabledStorageKey)
         let realtimeStreamingModel = UserDefaults.standard.string(forKey: realtimeStreamingModelStorageKey) ?? ""
@@ -851,13 +853,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.contextAwarenessEnabled = ContextCapturePreferences.loadContextAwareness(from: .standard)
         self.screenshotContextEnabled = ContextCapturePreferences.loadScreenshotContext(from: .standard)
         self.preserveClipboard = preserveClipboard
-        self.preserveExactWording = preserveExactWording
+        self.cleanupLevel = CleanupLevel.load(from: .standard)
         self.keepDictationInClipboardHistory = keepDictationInClipboardHistory
         self.realtimeStreamingEnabled = realtimeStreamingEnabled
         self.realtimeStreamingModel = realtimeStreamingModel
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
+        self.dictationStyles = StyleCategory.loadStyles(from: .standard)
         self.isPressEnterVoiceCommandEnabled = isPressEnterVoiceCommandEnabled
         self.alertSoundsEnabled = alertSoundsEnabled
         self.soundVolume = soundVolume
@@ -1328,6 +1331,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         )
         let capturedCustomVocabulary = customVocabulary
         let capturedCustomSystemPrompt = customSystemPrompt
+        // A row keeps only the bundle identifier, so a retry resolves the style the way the
+        // stop path does without text context. A retry always runs cleanup (it never pastes
+        // raw), so an AI chat row takes the Other style whatever the AI-apps setting says.
+        let capturedStyle = StyleCategory.resolvedStyle(
+            for: AIAppRawTranscriptPreference.resolvedCategory(textContext: nil, bundleIdentifier: item.contextBundleIdentifier),
+            styles: dictationStyles,
+            rawTranscriptForAIApp: false
+        )
 
         Task {
             do {
@@ -1355,7 +1366,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     customSystemPrompt: capturedCustomSystemPrompt,
                     outputLanguage: self.outputLanguage,
                     dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
-                    preserveExactWording: self.preserveExactWording
+                    cleanupLevel: self.cleanupLevel,
+                    style: capturedStyle
                 )
                 finalTranscript = result.finalTranscript
                 processingStatus = Self.statusMessage(
@@ -1437,6 +1449,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Run Log "Undo AI edit": puts the dictation on the clipboard as spoken so the
+    /// cleaned text can be replaced by hand. Same pasteboard write as a retry;
+    /// `lastTranscript` is left alone so Paste Again keeps re-pasting the last dictation.
+    func undoAIEdit(item: PipelineHistoryItem) {
+        guard item.canUndoAIEdit else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(item.rawTranscript, forType: .string)
+        let status = CleanupLevel.rawTranscriptCopiedStatusText
+        statusText = status
+        scheduleReadyStatusReset(after: 3, matching: [status])
     }
 
     func startAccessibilityPolling() {
@@ -2670,7 +2694,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         customSystemPrompt: String,
         outputLanguage: String = "",
         dictationLanguage: String = "",
-        preserveExactWording: Bool,
+        cleanupLevel: CleanupLevel,
+        style: DictationStyle? = nil,
         rawTranscriptForAIApp: Bool = false
     ) async -> (
         finalTranscript: String,
@@ -2712,7 +2737,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let snippetPlan = SnippetExpansion.plan(for: correctedTranscript, snippets: precomputedSnippets)
         let expandedSnippetCount = snippetPlan.expansions.count
 
-        // Preserve-exact-wording mode. Two sub-cases so translation
+        let preserveExactWording = cleanupLevel.skipsCleanup
+        // Cleanup level None (the former preserve-exact-wording toggle). Two sub-cases so translation
         // stays honored:
         //
         //   1. No Output Language set — skip the LLM entirely and
@@ -2784,7 +2810,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 customSystemPrompt: customSystemPrompt,
                 outputLanguage: outputLanguage,
                 dictationLanguage: dictationLanguage,
-                preservesSnippetPlaceholders: snippetPlan.hasMatches
+                preservesSnippetPlaceholders: snippetPlan.hasMatches,
+                cleanupLevel: cleanupLevel,
+                style: style
             )
             // The second pass runs before the placeholders resolve so a rule never rewrites snippet text.
             let correctedOutput = DictionaryCorrection.apply(dictionaryCorrections, to: result.transcript)
@@ -2999,13 +3027,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     // Wispr-style: an AI chat gets the transcript as spoken. Text context
                     // classifies the app (and recognizes AI web chats); without it the
                     // recording-start bundle identifier still recognizes desktop AI apps.
+                    let sessionCategory = AIAppRawTranscriptPreference.resolvedCategory(
+                        textContext: appContext.textContext,
+                        bundleIdentifier: sessionBundleIdentifier
+                    )
                     let rawTranscriptForAIApp = AIAppRawTranscriptPreference.shouldPasteRawTranscript(
                         enabled: self.aiAppsRawTranscriptEnabled,
-                        category: AIAppRawTranscriptPreference.resolvedCategory(
-                            textContext: appContext.textContext,
-                            bundleIdentifier: sessionBundleIdentifier
-                        ),
+                        category: sessionCategory,
                         isCommandMode: sessionIntent.isCommandMode
+                    )
+                    // The style follows the same category and the raw-paste decision: an AI
+                    // chat that is cleaned because the AI-apps setting is off takes the Other style.
+                    let dictationStyle = StyleCategory.resolvedStyle(
+                        for: sessionCategory,
+                        styles: self.dictationStyles,
+                        rawTranscriptForAIApp: rawTranscriptForAIApp
                     )
                     await MainActor.run { [weak self] in
                         self?.debugStatusMessage = "Running post-processing"
@@ -3021,7 +3057,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         customSystemPrompt: self.customSystemPrompt,
                         outputLanguage: self.outputLanguage,
                         dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
-                        preserveExactWording: self.preserveExactWording,
+                        cleanupLevel: self.cleanupLevel,
+                        style: dictationStyle,
                         rawTranscriptForAIApp: rawTranscriptForAIApp
                     )
                     stageMarks.cleanupFinished = CFAbsoluteTimeGetCurrent()

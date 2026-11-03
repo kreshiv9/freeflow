@@ -13,6 +13,8 @@ struct FreeFlowTests {
         RecordingTimerPreferenceTests.run()
         SilenceGatePreferenceTests.run()
         AIAppRawTranscriptPreferenceTests.run()
+        CleanupLevelTests.run()
+        DictationStyleTests.run()
         DictionaryCorrectionsTests.run()
         SnippetExpansionTests.run()
         OriginalFieldInsertionPreferenceTests.run()
