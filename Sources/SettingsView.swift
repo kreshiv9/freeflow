@@ -1584,6 +1584,24 @@ struct GeneralSettingsView: View {
             Divider()
                 .padding(.vertical, 2)
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Recording format")
+                    .font(.caption.weight(.semibold))
+                Picker("", selection: $appState.captureFormat) {
+                    ForEach(CaptureFormatPreference.allCases) { format in
+                        Text(format.displayName).tag(format)
+                    }
+                }
+                .accessibilityLabel("Recording format")
+                .labelsHidden()
+                Text(CaptureFormatPreference.caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+                .padding(.vertical, 2)
+
             Toggle("Skip transcription when no speech is detected", isOn: $appState.silenceGateEnabled)
 
             Text("When a recording holds only silence or quiet background noise, \(AppName.displayName) ends the dictation locally instead of requesting a transcript; louder steady noise cannot be told apart from speech and is still transcribed. The silent audio is not uploaded unless Stream audio while speaking is on, which streams audio while you hold the shortcut. Turn this off if quiet dictations are being skipped.")

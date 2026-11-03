@@ -106,9 +106,10 @@ final class RealtimeTranscriptionService: StreamingTranscriptionSession {
 
     // MARK: Producer
 
-    /// Append 16-bit little-endian PCM samples. The caller owns rate matching
-    /// (the service declares 24 kHz mono in `session.update`, matching the
-    /// OpenAI Realtime default).
+    /// Append 16-bit little-endian mono PCM at
+    /// `StreamingTranscriptionProvider.openAIRealtimeSampleRate`, the only PCM
+    /// rate OpenAI accepts and the rate `session.update` declares. AudioRecorder
+    /// converts the capture to that rate for this provider.
     func appendPCM16(_ data: Data) {
         let currentTask: URLSessionWebSocketTask? = stateQueue.sync {
             task
@@ -335,7 +336,7 @@ final class RealtimeTranscriptionService: StreamingTranscriptionSession {
                 "input": [
                     "format": [
                         "type": "audio/pcm",
-                        "rate": 24_000,
+                        "rate": StreamingTranscriptionProvider.openAIRealtimeSampleRate,
                     ],
                     "transcription": transcription,
                     "turn_detection": NSNull(),

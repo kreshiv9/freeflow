@@ -84,7 +84,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private var activeAudioFile: AVAudioFile?
     private var activeAudioFormat: AVAudioFormat?
     private var recordedFrameCount: AVAudioFramePosition = 0
-    private var loggedCaptureFormat = false
     private var fileWriteError: Error?
     private var isSessionInterrupted = false
 
@@ -98,14 +97,17 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     /// Delivered on the main queue only while the capture generation is current.
     var onRecordingReady: ((ContinuousClock.Instant) -> Void)?
     var onRecordingFailure: ((Error) -> Void)?
-    /// Fires on the sample-buffer queue with a 24 kHz mono PCM16 chunk for
-    /// each incoming audio buffer (matching OpenAI Realtime's default PCM
-    /// input rate). Set before ``startRecording`` to stream audio out-of-band
-    /// to a realtime transcription socket. The recorder writes a normalized
-    /// 16 kHz mono PCM16 WAV file independently for upload-based transcription.
-    var onPCM16Samples: ((Data) -> Void)?
-    private let recordingConverterLock = OSAllocatedUnfairLock<AVAudioConverter?>(initialState: nil)
-    private let pcm16ConverterLock = OSAllocatedUnfairLock<AVAudioConverter?>(initialState: nil)
+    /// Fires on the sample-buffer queue with mono little-endian PCM16 at the
+    /// `streamSampleRate` passed to ``startRecording``, one chunk per converted
+    /// buffer, and never when that rate is nil. The tail is flushed through it
+    /// inside ``stopRecording`` before its completion runs. Lock-backed because
+    /// AppState sets and clears it on main while the capture queue reads it
+    /// (B12). The recorder writes a 16 kHz mono PCM16 WAV file independently.
+    var onPCM16Samples: ((Data) -> Void)? {
+        get { pcm16SamplesHandler.withLock { $0 } }
+        set { pcm16SamplesHandler.withLock { $0 = newValue } }
+    }
+    private let pcm16SamplesHandler = OSAllocatedUnfairLock<((Data) -> Void)?>(initialState: nil)
     private let recordingTargetFormat: AVAudioFormat = {
         AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -114,20 +116,26 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             interleaved: true
         )!
     }()
-    private let pcm16TargetFormat: AVAudioFormat = {
-        AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: Double(AudioRecorder.pcm16StreamSampleRate),
-            channels: 1,
-            interleaved: true
-        )!
-    }()
+    /// Capture pipeline state. Set in makeSession before capture starts,
+    /// otherwise touched only on the sample-buffer queue, then flushed and
+    /// cleared in finishAudioFileLocked.
+    private var requestedCaptureFormat: CaptureFormatPreference = .native
+    private var streamSampleRate: Int?
+    private var pipelineSourceFormat: AVAudioFormat?
+    private var wavResampler: PCMStreamResampler?
+    private var streamResampler: PCMStreamResampler?
+    private var pipelineBuildCount = 0
+    private let streamFailed = OSAllocatedUnfairLock(initialState: false)
     private let captureTiming = OSAllocatedUnfairLock(initialState: RecordingCaptureTiming())
     private var failureReported = false
     private static let watchdogTimeout: TimeInterval = 2.0
     private static let sampleRateLogLimit = 40
-    /// Rate of the chunks `onPCM16Samples` delivers; streaming sessions declare it to their provider.
-    static let pcm16StreamSampleRate = 24_000
+
+    /// True once this recording's stream conversion failed, so the caller
+    /// should transcribe the WAV instead. Reset when the next recording starts.
+    var didStreamFail: Bool {
+        streamFailed.withLock { $0 }
+    }
 
     override init() {
         super.init()
@@ -306,6 +314,16 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
 
         // Drain all queued sample-buffer callbacks before releasing the writer.
         sampleBufferQueue.sync {
+            // Write and stream the converters' tails while the writer and the
+            // stream handler are still set; a failed tail write sets
+            // fileWriteError, so the file is not returned, as for a failed
+            // capture write.
+            if !discard {
+                self.flushCapturePipeline()
+            }
+            self.wavResampler = nil
+            self.streamResampler = nil
+            self.pipelineSourceFormat = nil
             finalizedURL = self.tempFileURL
             shouldKeepFile = !discard && self.recordedFrameCount > 0 && self.fileWriteErrorLock.withLock { _ in
                 self.fileWriteError == nil
@@ -347,17 +365,10 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
     }
 
-    private func appendSampleBufferToFile(_ sampleBuffer: CMSampleBuffer) throws {
-        if let fileWriteError = fileWriteErrorLock.withLock({ _ in
-            self.fileWriteError
-        }) {
-            throw fileWriteError
-        }
+    // MARK: Capture pipeline (sample-buffer queue only)
 
-        guard let outputURL = tempFileURL else {
-            throw AudioRecorderError.failedToBeginFileRecording("Missing temporary output URL.")
-        }
-
+    /// Decodes a capture buffer once; nil for an empty buffer.
+    private func decodeCaptureBuffer(_ sampleBuffer: CMSampleBuffer) throws -> AVAudioPCMBuffer? {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
             throw AudioRecorderError.invalidInputFormat("Could not determine audio format from sample buffer.")
         }
@@ -368,28 +379,88 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         )
 
         let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard frameCount > 0 else { return }
-        let inputBuffer = try makePCMBuffer(from: sampleBuffer, format: sourceFormat, frameCount: frameCount)
+        guard frameCount > 0 else { return nil }
+        return try makePCMBuffer(from: sampleBuffer, format: sourceFormat, frameCount: frameCount)
+    }
 
-        let targetFormat = recordingTargetFormat
-        if !loggedCaptureFormat {
-            loggedCaptureFormat = true
-            os_log(
-                .info,
-                log: recordingLog,
-                "capture audio format source=%{public}@ %.0fHz %u ch interleaved=%{public}@ target=%{public}@ %.0fHz %u ch interleaved=%{public}@ conversion=%{public}@",
-                String(describing: sourceFormat.commonFormat),
-                sourceFormat.sampleRate,
-                sourceFormat.channelCount,
-                String(sourceFormat.isInterleaved),
-                String(describing: targetFormat.commonFormat),
-                targetFormat.sampleRate,
-                targetFormat.channelCount,
-                String(targetFormat.isInterleaved),
-                String(sourceFormat != targetFormat)
-            )
+    /// Converts one capture buffer into the 16 kHz WAV (which also feeds the
+    /// speech tracker and a 16 kHz stream) and, for another stream rate, into
+    /// the stream. WAV errors throw; stream errors only stop the stream.
+    private func processCaptureBuffer(_ buffer: AVAudioPCMBuffer) throws {
+        if let fileWriteError = fileWriteErrorLock.withLock({ _ in
+            self.fileWriteError
+        }) {
+            throw fileWriteError
         }
+
+        if pipelineSourceFormat != buffer.format {
+            try rebuildCapturePipeline(for: buffer.format)
+        }
+        try wavResampler?.process(buffer) { try self.writeRecordingChunk($0) }
+        if let streamResampler {
+            do {
+                try streamResampler.process(buffer) { self.emitStreamChunk($0) }
+            } catch {
+                markStreamFailed(error)
+            }
+        }
+    }
+
+    /// Flushes the converters built for the previous source format, then builds
+    /// new ones for `sourceFormat`.
+    private func rebuildCapturePipeline(for sourceFormat: AVAudioFormat) throws {
+        let previousWAVResampler = wavResampler
+        let previousStreamResampler = streamResampler
+        wavResampler = nil
+        streamResampler = nil
+        try previousWAVResampler?.finish { try self.writeRecordingChunk($0) }
+        if let previousStreamResampler {
+            do {
+                try previousStreamResampler.finish { self.emitStreamChunk($0) }
+            } catch {
+                markStreamFailed(error)
+            }
+        }
+
+        wavResampler = try PCMStreamResampler(
+            inputFormat: sourceFormat,
+            outputSampleRate: recordingTargetFormat.sampleRate
+        )
+        if let streamSampleRate,
+           streamSampleRate != Int(recordingTargetFormat.sampleRate),
+           !didStreamFail {
+            do {
+                streamResampler = try PCMStreamResampler(
+                    inputFormat: sourceFormat,
+                    outputSampleRate: Double(streamSampleRate)
+                )
+            } catch {
+                markStreamFailed(error)
+            }
+        }
+        pipelineSourceFormat = sourceFormat
+        pipelineBuildCount += 1
+
+        os_log(
+            .info,
+            log: recordingLog,
+            "capture audio format source=%{public}@ request=%{public}@ wav=%.0fHz stream=%{public}@ converter=minimumPhase/max build=%d",
+            PCMStreamResampler.formatSummary(sourceFormat),
+            requestedCaptureFormat.rawValue,
+            recordingTargetFormat.sampleRate,
+            streamSampleRate.map { "\($0)Hz" } ?? "off",
+            pipelineBuildCount
+        )
+    }
+
+    /// Writes one 16 kHz chunk to the lazily created WAV, tracks its speech
+    /// activity and, when the stream runs at 16 kHz, streams the same samples.
+    private func writeRecordingChunk(_ chunk: AVAudioPCMBuffer) throws {
+        let targetFormat = recordingTargetFormat
         if activeAudioFile == nil {
+            guard let outputURL = tempFileURL else {
+                throw AudioRecorderError.failedToBeginFileRecording("Missing temporary output URL.")
+            }
             let settings = pcmFileSettings(for: targetFormat)
             let audioFile = try AVAudioFile(
                 forWriting: outputURL,
@@ -406,20 +477,54 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             throw AudioRecorderError.failedToBeginFileRecording("Audio file writer was not initialized.")
         }
 
-        if sourceFormat == targetFormat {
-            try activeAudioFile.write(from: inputBuffer)
-            recordedFrameCount += AVAudioFramePosition(inputBuffer.frameLength)
-            return
+        try activeAudioFile.write(from: chunk)
+        recordedFrameCount += AVAudioFramePosition(chunk.frameLength)
+
+        let rms = AudioLevelMeter.rms(chunk)
+        let chunkMilliseconds = Double(chunk.frameLength) / chunk.format.sampleRate * 1000
+        speechActivityLock.withLock {
+            $0.track(rms: rms, durationMilliseconds: chunkMilliseconds)
         }
 
-        let outputBuffer = try convertRecordingBuffer(
-            inputBuffer,
-            from: sourceFormat,
-            to: targetFormat
-        )
-        guard outputBuffer.frameLength > 0 else { return }
-        try activeAudioFile.write(from: outputBuffer)
-        recordedFrameCount += AVAudioFramePosition(outputBuffer.frameLength)
+        if streamSampleRate == Int(targetFormat.sampleRate) {
+            emitStreamChunk(chunk)
+        }
+    }
+
+    private func emitStreamChunk(_ chunk: AVAudioPCMBuffer) {
+        guard !didStreamFail, let handler = onPCM16Samples else { return }
+        let data = PCMStreamResampler.littleEndianData(chunk)
+        guard !data.isEmpty else { return }
+        handler(data)
+    }
+
+    /// Stops the stream for the rest of this recording; the WAV keeps going.
+    private func markStreamFailed(_ error: Error) {
+        streamResampler = nil
+        let isFirstFailure = streamFailed.withLock { failed -> Bool in
+            defer { failed = true }
+            return !failed
+        }
+        if isFirstFailure {
+            os_log(.error, log: recordingLog, "stream conversion failed, stream stopped for this recording: %{public}@", error.localizedDescription)
+        }
+    }
+
+    /// Writes and streams the converters' held-back tails at stop.
+    private func flushCapturePipeline() {
+        do {
+            try wavResampler?.finish { try self.writeRecordingChunk($0) }
+        } catch {
+            fileWriteErrorLock.withLock { _ in
+                fileWriteError = error
+            }
+            os_log(.error, log: recordingLog, "audio file flush failed: %{public}@", error.localizedDescription)
+        }
+        do {
+            try streamResampler?.finish { self.emitStreamChunk($0) }
+        } catch {
+            markStreamFailed(error)
+        }
     }
 
     private func validatedPCMBufferFormat(
@@ -505,88 +610,19 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         return inputBuffer
     }
 
-    private struct ConversionResult {
-        let buffer: AVAudioPCMBuffer
-        let status: String
-    }
-
-    private func convertRecordingBuffer(
-        _ inputBuffer: AVAudioPCMBuffer,
-        from sourceFormat: AVAudioFormat,
-        to targetFormat: AVAudioFormat
-    ) throws -> AVAudioPCMBuffer {
-        let converter = recordingConverterLock.withLock { existing -> AVAudioConverter? in
-            if let existing, existing.inputFormat == sourceFormat {
-                return existing
-            }
-            let new = AVAudioConverter(from: sourceFormat, to: targetFormat)
-            existing = new
-            return new
-        }
-        guard let converter else {
-            throw AudioRecorderError.failedToBeginFileRecording("Could not create recording converter.")
-        }
-
-        return try convertBuffer(
-            inputBuffer,
-            from: sourceFormat,
-            using: converter,
-            to: targetFormat
-        ).buffer
-    }
-
-    private func convertBuffer(
-        _ inputBuffer: AVAudioPCMBuffer,
-        from sourceFormat: AVAudioFormat,
-        using converter: AVAudioConverter,
-        to targetFormat: AVAudioFormat
-    ) throws -> ConversionResult {
-        let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
-        let outputCapacity = AVAudioFrameCount(ceil(Double(inputBuffer.frameLength) * ratio)) + 32
-        guard let outputBuffer = AVAudioPCMBuffer(
-            pcmFormat: targetFormat,
-            frameCapacity: outputCapacity
-        ) else {
-            throw AudioRecorderError.failedToBeginFileRecording("Could not allocate converted audio buffer.")
-        }
-
-        var suppliedInput = false
-        var converterError: NSError?
-        let status = converter.convert(to: outputBuffer, error: &converterError) { _, inputStatus in
-            if suppliedInput {
-                inputStatus.pointee = .noDataNow
-                return nil
-            }
-            suppliedInput = true
-            inputStatus.pointee = .haveData
-            return inputBuffer
-        }
-
-        if let converterError {
-            throw AudioRecorderError.failedToBeginFileRecording("Audio conversion failed: \(converterError.localizedDescription)")
-        }
-        guard status != .error, outputBuffer.frameLength > 0 else {
-            throw AudioRecorderError.failedToBeginFileRecording("Audio conversion produced no data.")
-        }
-        return ConversionResult(buffer: outputBuffer, status: String(describing: status))
-    }
-
-    private func makeSession(deviceUID: String?, outputURL: URL) throws {
+    private func makeSession(
+        deviceUID: String?,
+        outputURL: URL,
+        captureFormat: CaptureFormatPreference,
+        streamSampleRate: Int?
+    ) throws {
         teardownSessionLocked()
 
         let device = try preferredCaptureDevice(for: deviceUID, reason: "initial start")
 
         let session = AVCaptureSession()
         let dataOutput = AVCaptureAudioDataOutput()
-        dataOutput.audioSettings = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: recordingTargetFormat.sampleRate,
-            AVNumberOfChannelsKey: Int(recordingTargetFormat.channelCount),
-            AVLinearPCMBitDepthKey: bitDepth(for: recordingTargetFormat.commonFormat),
-            AVLinearPCMIsFloatKey: isFloatFormat(recordingTargetFormat.commonFormat),
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsNonInterleaved: !recordingTargetFormat.isInterleaved,
-        ]
+        dataOutput.audioSettings = captureFormat.audioSettings()
         dataOutput.setSampleBufferDelegate(self, queue: sampleBufferQueue)
 
         let input: AVCaptureDeviceInput
@@ -623,10 +659,14 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         isSessionInterrupted = false
         activeAudioFile = nil
         activeAudioFormat = nil
-        recordingConverterLock.withLock { $0 = nil }
-        pcm16ConverterLock.withLock { $0 = nil }
+        requestedCaptureFormat = captureFormat
+        self.streamSampleRate = streamSampleRate
+        pipelineSourceFormat = nil
+        wavResampler = nil
+        streamResampler = nil
+        pipelineBuildCount = 0
+        streamFailed.withLock { $0 = false }
         recordedFrameCount = 0
-        loggedCaptureFormat = false
         fileWriteErrorLock.withLock { _ in
             fileWriteError = nil
         }
@@ -648,7 +688,14 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         captureTiming.withLock { $0.prepare() }
     }
 
-    func startRecording(deviceUID: String? = nil, timingGeneration: UInt64? = nil) throws {
+    /// `streamSampleRate` is the rate `onPCM16Samples` delivers; nil skips
+    /// the stream conversion.
+    func startRecording(
+        deviceUID: String? = nil,
+        timingGeneration: UInt64? = nil,
+        captureFormat: CaptureFormatPreference = .load(from: .standard),
+        streamSampleRate: Int? = nil
+    ) throws {
         let timingGeneration = timingGeneration ?? prepareRecordingTiming()
         let t0 = CFAbsoluteTimeGetCurrent()
         recordingStartTime = t0
@@ -664,7 +711,12 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
 
         do {
             try sessionQueue.sync {
-                try self.makeSession(deviceUID: deviceUID, outputURL: outputURL)
+                try self.makeSession(
+                    deviceUID: deviceUID,
+                    outputURL: outputURL,
+                    captureFormat: captureFormat,
+                    streamSampleRate: streamSampleRate
+                )
                 self.captureTiming.withLock { $0.start(at: .now, generation: timingGeneration) }
                 self._recording.withLock { $0 = true }
                 self.startBufferWatchdog()
@@ -707,6 +759,15 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                 tracker.reset()
                 return snapshot
             }
+            os_log(
+                .info,
+                log: recordingLog,
+                "level: peak %.1f dBFS, speech threshold %.1f dBFS, speech %.0f of %.0f ms",
+                Double(AudioLevelMeter.dbfs(speechActivity.peakRMS)),
+                Double(AudioLevelMeter.dbfs(speechActivity.speechThresholdRMS)),
+                speechActivity.speechMilliseconds,
+                speechActivity.totalMilliseconds
+            )
             DispatchQueue.main.async {
                 self.isRecording = false
                 self.audioLevel = 0.0
@@ -756,137 +817,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
     }
 
-    private func updateAudioLevel(from sampleBuffer: CMSampleBuffer) -> Float {
-        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return 0 }
-        guard let sourceFormat = try? validatedPCMBufferFormat(
-            AVAudioFormat(cmAudioFormatDescription: formatDescription),
-            context: "audio level sample buffer"
-        ) else { return 0 }
-
-        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard frameCount > 0 else { return 0 }
-        guard let inputBuffer = try? makePCMBuffer(
-            from: sampleBuffer,
-            format: sourceFormat,
-            frameCount: frameCount
-        ) else { return 0 }
-
-        let rms = rmsLevel(for: inputBuffer)
-        let bufferMilliseconds = Double(frameCount) / sourceFormat.sampleRate * 1000
-        speechActivityLock.withLock {
-            $0.track(rms: rms, durationMilliseconds: bufferMilliseconds)
-        }
-        let normalizedDisplayLevel = liveLevelNormalizerLock.withLock {
-            $0.normalizedLevel(forRMS: rms)
-        }
-
-        DispatchQueue.main.async {
-            self.audioLevel = normalizedDisplayLevel
-        }
-        return rms
-    }
-
-    private func rmsLevel(for buffer: AVAudioPCMBuffer) -> Float {
-        let audioBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-
-        var totalSamples = 0
-        var sumOfSquares: Double = 0
-
-        for audioBuffer in audioBuffers {
-            guard let baseAddress = audioBuffer.mData, audioBuffer.mDataByteSize > 0 else {
-                continue
-            }
-
-            switch buffer.format.commonFormat {
-            case .pcmFormatFloat32:
-                let samples = Int(audioBuffer.mDataByteSize) / MemoryLayout<Float>.size
-                let pointer = baseAddress.assumingMemoryBound(to: Float.self)
-                totalSamples += samples
-                for index in 0..<samples {
-                    let sample = Double(pointer[index])
-                    sumOfSquares += sample * sample
-                }
-            case .pcmFormatFloat64:
-                let samples = Int(audioBuffer.mDataByteSize) / MemoryLayout<Double>.size
-                let pointer = baseAddress.assumingMemoryBound(to: Double.self)
-                totalSamples += samples
-                for index in 0..<samples {
-                    let sample = pointer[index]
-                    sumOfSquares += sample * sample
-                }
-            case .pcmFormatInt16:
-                let samples = Int(audioBuffer.mDataByteSize) / MemoryLayout<Int16>.size
-                let pointer = baseAddress.assumingMemoryBound(to: Int16.self)
-                totalSamples += samples
-                for index in 0..<samples {
-                    let sample = Double(pointer[index]) / 32768.0
-                    sumOfSquares += sample * sample
-                }
-            case .pcmFormatInt32:
-                let samples = Int(audioBuffer.mDataByteSize) / MemoryLayout<Int32>.size
-                let pointer = baseAddress.assumingMemoryBound(to: Int32.self)
-                totalSamples += samples
-                for index in 0..<samples {
-                    let sample = Double(pointer[index]) / 2147483648.0
-                    sumOfSquares += sample * sample
-                }
-            default:
-                continue
-            }
-        }
-
-        guard totalSamples > 0 else { return 0 }
-        return Float(sqrt(sumOfSquares / Double(totalSamples)))
-    }
-
-    private func emitPCM16IfNeeded(from sampleBuffer: CMSampleBuffer) {
-        guard let handler = onPCM16Samples else { return }
-        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
-            return
-        }
-        guard let validatedSourceFormat = try? validatedPCMBufferFormat(
-            AVAudioFormat(cmAudioFormatDescription: formatDescription),
-            context: "realtime transcription sample buffer"
-        ) else {
-            return
-        }
-        let sourceFormat = validatedSourceFormat
-        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard frameCount > 0 else { return }
-
-        guard let inputBuffer = try? makePCMBuffer(
-            from: sampleBuffer,
-            format: sourceFormat,
-            frameCount: frameCount
-        ) else { return }
-
-        let converter = pcm16ConverterLock.withLock { existing -> AVAudioConverter? in
-            if let existing, existing.inputFormat == sourceFormat {
-                return existing
-            }
-            let new = AVAudioConverter(from: sourceFormat, to: pcm16TargetFormat)
-            existing = new
-            return new
-        }
-        guard let converter else { return }
-
-        guard let conversion = try? convertBuffer(
-            inputBuffer,
-            from: sourceFormat,
-            using: converter,
-            to: pcm16TargetFormat
-        ) else { return }
-        let outputBuffer = conversion.buffer
-
-        let outputFrames = Int(outputBuffer.frameLength)
-        guard outputFrames > 0, let int16Ptr = outputBuffer.int16ChannelData?[0] else {
-            return
-        }
-        let byteCount = outputFrames * MemoryLayout<Int16>.size
-        let data = Data(bytes: int16Ptr, count: byteCount)
-        handler(data)
-    }
-
     func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
@@ -894,8 +824,12 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     ) {
         guard _recording.withLock({ $0 }) else { return }
 
+        let buffer: AVAudioPCMBuffer?
         do {
-            try appendSampleBufferToFile(sampleBuffer)
+            buffer = try decodeCaptureBuffer(sampleBuffer)
+            if let buffer {
+                try processCaptureBuffer(buffer)
+            }
         } catch {
             fileWriteErrorLock.withLock { _ in
                 fileWriteError = error
@@ -905,14 +839,22 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             return
         }
 
-        emitPCM16IfNeeded(from: sampleBuffer)
-
         let count = _bufferCount.withLock { value -> Int in
             value += 1
             return value
         }
 
-        let rms = updateAudioLevel(from: sampleBuffer)
+        // The meter and readiness use the raw capture buffer; the speech
+        // tracker is fed the 16 kHz chunks in writeRecordingChunk.
+        let rms = buffer.map { AudioLevelMeter.rms($0) } ?? 0
+        if buffer != nil {
+            let normalizedDisplayLevel = liveLevelNormalizerLock.withLock {
+                $0.normalizedLevel(forRMS: rms)
+            }
+            DispatchQueue.main.async {
+                self.audioLevel = normalizedDisplayLevel
+            }
+        }
         if count <= Self.sampleRateLogLimit {
             let elapsed = (CFAbsoluteTimeGetCurrent() - recordingStartTime) * 1000
             os_log(.info, log: recordingLog, "buffer #%d at %.3fms, rms=%.6f", count, elapsed, rms)

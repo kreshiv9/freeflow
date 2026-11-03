@@ -604,6 +604,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// How the microphone is asked for audio; read when each recording starts.
+    @Published var captureFormat: CaptureFormatPreference {
+        didSet {
+            captureFormat.save(to: .standard)
+        }
+    }
+
     /// Engine opened by an Edit Mode web search.
     @Published var webSearchEngine: WebSearchEngine {
         didSet {
@@ -1004,6 +1011,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.realtimeStreamingModel = realtimeStreamingModel
         self.dictationAudioInterruptionEnabled = dictationAudioInterruptionEnabled
         self.silenceGateEnabled = SilenceGatePreference.load(from: .standard)
+        self.captureFormat = CaptureFormatPreference.load(from: .standard)
         self.webSearchEngine = WebSearchEngine.load(from: .standard)
         self.handsFreeSilenceTimeoutSeconds = HandsFreeAutoStop.loadSilenceTimeoutSeconds(from: .standard)
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
@@ -2978,13 +2986,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
 
         startStreamingIfEnabled()
+        // Only a stream that actually started gets a rate; nil skips the stream conversion.
+        let streamSampleRate = realtimeService == nil ? nil : streamingProvider.streamSampleRate
+        let captureFormat = self.captureFormat
 
         // Start engine on background thread so UI isn't blocked
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let t0 = CFAbsoluteTimeGetCurrent()
             do {
-                try self.audioRecorder.startRecording(deviceUID: deviceUID, timingGeneration: timingGeneration)
+                try self.audioRecorder.startRecording(
+                    deviceUID: deviceUID,
+                    timingGeneration: timingGeneration,
+                    captureFormat: captureFormat,
+                    streamSampleRate: streamSampleRate
+                )
                 os_log(.info, log: recordingLog, "audioRecorder.startRecording() done: %.3fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
                 DispatchQueue.main.async { [self] in
                     guard self.isRecording, self.activeRecordingTriggerMode != nil else { return }
@@ -3514,10 +3530,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         isTranscribing = true
         statusText = "Preparing audio..."
         errorMessage = nil
-        playAlertSound(named: "Pop")
         overlayManager.showTranscribing()
         audioRecorder.stopRecording { [weak self] fileURL, speechActivity in
             guard let self else { return }
+            // Played once capture has stopped so the cue cannot land in the recording's tail;
+            // a stop the user cancelled meanwhile stays silent.
+            if self.isTranscribing {
+                self.playAlertSound(named: "Pop")
+            }
             guard let fileURL else {
                 self.isTranscribing = false
                 self.tearDownRealtimeService()
@@ -3553,9 +3573,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         )
             let transformService = self.makeTransformService()
 
-            let activeRealtime = self.realtimeService
+            let streamingSession = self.realtimeService
             self.realtimeService = nil
             self.audioRecorder.onPCM16Samples = nil
+            // A failed stream conversion left the provider with partial audio; the WAV is complete, so upload it instead.
+            let streamFailed = streamingSession != nil && self.audioRecorder.didStreamFail
+            if streamFailed {
+                os_log(.error, log: recordingLog, "stream conversion failed — using the file upload")
+                streamingSession?.cancel()
+            }
+            let activeRealtime = streamFailed ? nil : streamingSession
             self.transcriptionTask?.cancel()
             guard self.isTranscribing else {
                 if let savedAudioFile {
@@ -4152,7 +4179,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let config = DeepgramStreamingCore.Configuration(
             apiKey: key,
             language: resolvedTranscriptionLanguage,
-            sampleRate: AudioRecorder.pcm16StreamSampleRate,
+            sampleRate: StreamingTranscriptionProvider.deepgramSampleRate,
             keyterms: DeepgramStreamingCore.keyterms(fromVocabularyText: vocabulary)
         )
         return DeepgramStreamingService(config: config)

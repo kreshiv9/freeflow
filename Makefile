@@ -20,6 +20,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AppName.swift \
 	Sources/AppTextInsertionCore.swift \
 	Sources/AppTextInsertionTarget.swift \
+	Sources/AudioLevelMeter.swift \
+	Sources/CaptureFormatPreference.swift \
 	Sources/CleanupLevel.swift \
 	Sources/CommandModeIntent.swift \
 	Sources/ContextInferenceFailure.swift \
@@ -34,6 +36,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/LLMCooldownManager.swift \
 	Sources/ModelConfiguration.swift \
 	Sources/OriginalFieldInsertionPreference.swift \
+	Sources/PCMStreamResampler.swift \
 	Sources/PipelineHistoryItem.swift \
 	Sources/PipelineStageTimings.swift \
 	Sources/PostProcessingService.swift \
