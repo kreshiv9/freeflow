@@ -12,6 +12,7 @@ struct FreeFlowTests {
         AudioLevelMeterTests.run()
         CaptureFormatPreferenceTests.run()
         PCMStreamResamplerTests.run()
+        PCMSampleHandlerSlotTests.run()
         CaptureBackendPreferenceTests.run()
         VoiceProcessingLivenessTests.run()
         VoiceProcessingCaptureTests.run()
