@@ -55,6 +55,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/TransformCore.swift \
 	Sources/TransformService.swift \
 	Sources/UpdateManager.swift \
+	Sources/VoiceIsolationFilter.swift \
+	Sources/VoiceIsolationPreference.swift \
 	Sources/WordBoundedText.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \
 	Sources/ShortcutCore/ShortcutMatcher.swift \
