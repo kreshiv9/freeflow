@@ -34,13 +34,23 @@ enum DeepgramStreamingError: LocalizedError, Equatable {
 }
 
 /// Pure rules for the Deepgram Nova-3 streaming path: URL building, keyterm
-/// normalization, server-message parsing, transcript assembly and the commit,
-/// keep-alive and key-validation decisions. Never logs, and never embeds the
-/// key or transcript text in anything it produces.
+/// normalization, audio framing, server-message parsing, transcript assembly and
+/// the commit, keep-alive and key-validation decisions. Never logs, and never
+/// embeds the key or transcript text in anything it produces.
 enum DeepgramStreamingCore {
     static let listenEndpoint = URL(string: "wss://api.deepgram.com/v1/listen")!
     static let projectsEndpoint = URL(string: "https://api.deepgram.com/v1/projects")!
     static let model = "nova-3"
+    /// Sent for Auto-detect (nil or blank language). Deepgram already uses en when
+    /// the item is omitted, so this only makes the request explicit.
+    static let defaultLanguage = "en"
+    /// Silence before Deepgram finalizes a segment (its default is 10 ms). Inside its
+    /// 300-500 ms range for speakers who pause mid-thought. FreeFlow ignores
+    /// speech_final and always sends Finalize on release, so release latency is unchanged.
+    static let endpointingMilliseconds = 500
+    /// Audio goes out in frames this long; Deepgram recommends 20-100 ms buffers and
+    /// closes the socket on an empty frame.
+    static let frameMilliseconds = 50
     /// Same cap as DictionaryCorrection.maxFieldLength, declared locally.
     static let maxKeytermLength = 60
     static let maxKeyterms = 100
@@ -56,26 +66,26 @@ enum DeepgramStreamingCore {
 
     struct Configuration: Equatable {
         let apiKey: String
-        /// nil or blank = Auto-detect: the query item is omitted.
+        /// nil or blank = Auto-detect, sent as defaultLanguage.
         let language: String?
         /// The recorder's PCM16 stream rate, passed through unchanged.
         let sampleRate: Int
         let keyterms: [String]
     }
 
-    /// wss://api.deepgram.com/v1/listen?model=nova-3[&language=xx]&encoding=linear16&sample_rate=N
-    /// &channels=1&smart_format=true&punctuate=true&interim_results=true[&keyterm=..]*
-    /// Fixed item order. Never contains the key. Keyterms pass through
+    /// wss://api.deepgram.com/v1/listen?model=nova-3&language=xx&encoding=linear16&sample_rate=N
+    /// &channels=1&smart_format=true&punctuate=true&interim_results=true&endpointing=500
+    /// &mip_opt_out=true[&keyterm=..]*
+    /// Fixed item order; language is defaultLanguage when the configured one is nil
+    /// or blank. Never contains the key. Keyterms pass through
     /// normalizedKeyterms (idempotent). Values are percent-encoded against the
     /// RFC 3986 unreserved set and assembled with percentEncodedQuery, so a
     /// space is %20, "+" is %2B, "&" is %26 and "=" is %3D
     /// (URLComponents.queryItems leaves "+" bare, which a server may decode as a space).
     static func listenURL(for configuration: Configuration) -> URL {
         var items: [(name: String, value: String)] = [("model", model)]
-        if let language = configuration.language?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !language.isEmpty {
-            items.append(("language", language))
-        }
+        let language = configuration.language?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        items.append(("language", language.isEmpty ? defaultLanguage : language))
         items += [
             ("encoding", "linear16"),
             ("sample_rate", String(configuration.sampleRate)),
@@ -83,6 +93,9 @@ enum DeepgramStreamingCore {
             ("smart_format", "true"),
             ("punctuate", "true"),
             ("interim_results", "true"),
+            ("endpointing", String(endpointingMilliseconds)),
+            // Deepgram keeps opted-out audio only while it processes the request.
+            ("mip_opt_out", "true"),
         ]
         for keyterm in normalizedKeyterms(configuration.keyterms) {
             items.append(("keyterm", keyterm))
@@ -176,6 +189,45 @@ enum DeepgramStreamingCore {
     /// sampleRate * 2 bytes * maxPendingAudioSeconds.
     static func maxPendingAudioBytes(sampleRate: Int) -> Int {
         sampleRate * MemoryLayout<Int16>.size * maxPendingAudioSeconds
+    }
+
+    /// sampleRate * 2 bytes * frameMilliseconds / 1000, rounded down to whole Int16
+    /// samples and at least one sample: 1600 at 16 kHz, 2400 at 24 kHz.
+    static func frameBytes(sampleRate: Int) -> Int {
+        let sampleBytes = MemoryLayout<Int16>.size
+        let bytes = sampleRate * sampleBytes * frameMilliseconds / 1000
+        return max(sampleBytes, bytes - bytes % sampleBytes)
+    }
+
+    /// Regroups PCM16 chunks of any size into frameBytes-sized frames, in order.
+    /// Never yields an empty frame; the partial frame waits for the next append
+    /// or for flush.
+    struct FrameAggregator: Equatable {
+        let frameBytes: Int
+        private var pending = Data()
+
+        /// At least one Int16 sample, so append always makes progress.
+        init(frameBytes: Int) { self.frameBytes = max(MemoryLayout<Int16>.size, frameBytes) }
+
+        /// Every complete frame now available; an empty append yields none.
+        mutating func append(_ data: Data) -> [Data] {
+            pending.append(data)
+            var frames: [Data] = []
+            var offset = 0
+            while pending.count - offset >= frameBytes {
+                frames.append(pending.subdata(in: offset..<offset + frameBytes))
+                offset += frameBytes
+            }
+            if offset > 0 { pending = pending.subdata(in: offset..<pending.count) }
+            return frames
+        }
+
+        /// The partial frame, once; nil when nothing is pending.
+        mutating func flush() -> Data? {
+            guard !pending.isEmpty else { return nil }
+            defer { pending = Data() }
+            return pending
+        }
     }
 
     enum ServerMessage: Equatable {

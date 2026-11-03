@@ -51,6 +51,8 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     private var isOpen = false
     private var pendingAudio: [Data] = []
     private var pendingAudioBytes = 0
+    /// Regroups appended chunks into frameMilliseconds frames; commitAndAwaitFinal sends the partial frame.
+    private var frameAggregator: DeepgramStreamingCore.FrameAggregator
     private var lastAudioSentAt: TimeInterval?
     private var assembler = DeepgramStreamingCore.TranscriptAssembler()
     private var serverErrorMessage: String?
@@ -68,6 +70,9 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     init(config: Configuration) {
         self.config = config
         maxPendingAudioBytes = DeepgramStreamingCore.maxPendingAudioBytes(sampleRate: config.sampleRate)
+        frameAggregator = DeepgramStreamingCore.FrameAggregator(
+            frameBytes: DeepgramStreamingCore.frameBytes(sampleRate: config.sampleRate)
+        )
     }
 
     /// Monotonic seconds for the keep-alive and commit clocks.
@@ -127,38 +132,43 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     // MARK: Producer
 
     /// Called on the recorder's sample-buffer queue with mono PCM16 at the
-    /// configured sample rate. Chunks are buffered until the socket opens, then
-    /// sent as binary frames; nothing is accepted once the commit has started.
+    /// configured sample rate. Chunks are regrouped into
+    /// DeepgramStreamingCore.frameMilliseconds frames, buffered until the socket
+    /// opens, then sent as binary frames; the partial frame is sent on commit.
+    /// Nothing is accepted once the commit has started.
     func appendPCM16(_ data: Data) {
         guard !data.isEmpty else { return }
         stateQueue.async { [self] in
             guard !closed, terminalError == nil, commitStartedAt == nil else { return }
             lastAudioSentAt = Self.now()
-            if isOpen, let task {
-                sendAudioLocked(data, over: task)
-                return
+            for frame in frameAggregator.append(data) {
+                if isOpen, let task {
+                    sendAudioLocked(frame, over: task)
+                    continue
+                }
+                pendingAudioBytes += frame.count
+                guard pendingAudioBytes <= maxPendingAudioBytes else {
+                    // The WAV is always recorded in parallel, so the fallback loses nothing.
+                    os_log(
+                        .error, log: deepgramLog,
+                        "socket did not open within %d bytes of audio — abandoning the stream",
+                        pendingAudioBytes
+                    )
+                    terminalError = .notConnected
+                    teardownLocked()
+                    return
+                }
+                pendingAudio.append(frame)
             }
-            pendingAudioBytes += data.count
-            guard pendingAudioBytes <= maxPendingAudioBytes else {
-                // The WAV is always recorded in parallel, so the fallback loses nothing.
-                os_log(
-                    .error, log: deepgramLog,
-                    "socket did not open within %d bytes of audio — abandoning the stream",
-                    pendingAudioBytes
-                )
-                terminalError = .notConnected
-                teardownLocked()
-                return
-            }
-            pendingAudio.append(data)
         }
     }
 
-    /// Send Finalize then CloseStream, then wait for Metadata or the close
-    /// within CommitPolicy.timeout. Throws when the server cannot have heard
-    /// anything so the file upload starts at once instead of after the timeout;
-    /// every early throw tears the socket down so a late handshake cannot
-    /// flush the buffered audio to a stream nobody is waiting on.
+    /// Send any partial audio frame, then Finalize and CloseStream, then wait
+    /// for Metadata or the close within CommitPolicy.timeout. Throws when the
+    /// server cannot have heard anything so the file upload starts at once
+    /// instead of after the timeout; every early throw tears the socket down
+    /// so a late handshake cannot flush the buffered audio to a stream nobody
+    /// is waiting on.
     func commitAndAwaitFinal() async throws -> String {
         let commitTask: URLSessionWebSocketTask = try stateQueue.sync {
             if let terminalError {
@@ -174,6 +184,10 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
             guard socketState == .open else {
                 teardownLocked()
                 throw DeepgramStreamingError.socketClosedBeforeCommit
+            }
+            // The partial frame goes out before Finalize and CloseStream, which follow on the same task.
+            if let partialFrame = frameAggregator.flush() {
+                sendAudioLocked(partialFrame, over: task)
             }
             commitStartedAt = Self.now()
             keepAliveTimer?.cancel()
@@ -250,7 +264,11 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
             for chunk in chunks {
                 sendAudioLocked(chunk, over: task)
             }
-            os_log(.info, log: deepgramLog, "socket open; flushed %d buffered chunks", chunks.count)
+            os_log(
+                .info, log: deepgramLog,
+                "socket open; flushed %d buffered chunks (%d-byte frames)",
+                chunks.count, frameAggregator.frameBytes
+            )
         }
     }
 
@@ -405,6 +423,7 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         session = nil
         pendingAudio = []
         pendingAudioBytes = 0
+        _ = frameAggregator.flush()
         pendingKeytermUpdate = nil
     }
 }

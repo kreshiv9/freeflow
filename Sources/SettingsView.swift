@@ -316,7 +316,7 @@ struct ProviderSettingsFields: View {
                 }
                 .accessibilityLabel("Transcription Language")
                 .labelsHidden()
-                Text("Hint to the transcription model. Auto-detect works for most users. Pick a specific language if you see wrong-script characters (for example Chinese) appear in your output.")
+                Text("Hint to the transcription model. Auto-detect works for most users. Pick a specific language if you see wrong-script characters (for example Chinese) appear in your output. With Deepgram streaming, Auto-detect uses English; pick a language to stream in another one.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

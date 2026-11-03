@@ -16,7 +16,7 @@ enum DeepgramStreamingCoreTests {
 
     static func run() async {
         testListenURLIncludesRequiredParameters()
-        testListenURLOmitsLanguageOnAutoDetect()
+        testListenURLSendsEnglishOnAutoDetect()
         testKeytermEncoding()
         testKeytermNormalization()
         testKeytermsFromVocabularyText()
@@ -24,6 +24,11 @@ enum DeepgramStreamingCoreTests {
         testMergedKeyterms()
         testConfigureRepliesAreIgnored()
         testPendingAudioLimit()
+        testFrameBytes()
+        testFrameAggregatorCarriesRemainderAcrossAppends()
+        testFrameAggregatorFlushAndEmptyInput()
+        testFrameAggregatorSplitsLargeAppendInOrder()
+        testFrameAggregatorConservesBytes()
         testParsesFinalAndInterimResults()
         testParsesMetadataUtteranceEndSpeechStartedAndError()
         testParsingToleratesMissingFieldsAndMalformedInput()
@@ -56,17 +61,37 @@ enum DeepgramStreamingCoreTests {
         TestSupport.expectEqual(components?.path, "/v1/listen")
         TestSupport.expectEqual(
             components?.percentEncodedQuery,
-            "model=nova-3&language=en&encoding=linear16&sample_rate=24000&channels=1&smart_format=true&punctuate=true&interim_results=true&keyterm=Claude%20Code&keyterm=FreeFlow"
+            "model=nova-3&language=en&encoding=linear16&sample_rate=24000&channels=1&smart_format=true&punctuate=true&interim_results=true&endpointing=500&mip_opt_out=true&keyterm=Claude%20Code&keyterm=FreeFlow"
         )
         TestSupport.expect(!url.absoluteString.contains(syntheticKey), "The listen URL must never carry the key")
         TestSupport.expectEqual(Core.authorizationHeaderValue(apiKey: " \(syntheticKey) "), "Token \(syntheticKey)")
         TestSupport.expectEqual(Core.model, "nova-3")
+        TestSupport.expectEqual(Core.endpointingMilliseconds, 500)
+        TestSupport.expectEqual(Core.defaultLanguage, "en")
     }
 
-    private static func testListenURLOmitsLanguageOnAutoDetect() {
-        TestSupport.expect(!query(for: configuration(language: nil)).contains("language="), "nil language must be omitted")
-        TestSupport.expect(!query(for: configuration(language: "  ")).contains("language="), "Blank language must be omitted")
-        TestSupport.expect(query(for: configuration(language: "es")).contains("language=es"), "A language code must be sent")
+    private static func languageValues(for configuration: Core.Configuration) -> [String] {
+        let url = Core.listenURL(for: configuration)
+        return URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .filter { $0.name == "language" }
+            .compactMap(\.value) ?? []
+    }
+
+    /// Auto-detect sends Deepgram's own default explicitly, exactly once.
+    private static func testListenURLSendsEnglishOnAutoDetect() {
+        for autoDetect: String? in [nil, "  ", "\n\t"] {
+            TestSupport.expectEqual(languageValues(for: configuration(language: autoDetect)), ["en"])
+        }
+        TestSupport.expectEqual(query(for: configuration(language: nil)), query(for: configuration(language: "en")))
+        TestSupport.expectEqual(languageValues(for: configuration(language: "es")), ["es"])
+        TestSupport.expectEqual(languageValues(for: configuration(language: " es ")), ["es"])
+        for language: String? in [nil, "  ", "es"] {
+            TestSupport.expect(
+                !Core.listenURL(for: configuration(language: language)).absoluteString.contains(syntheticKey),
+                "The listen URL must never carry the key"
+            )
+        }
         TestSupport.expect(
             query(for: configuration(sampleRate: 16000)).contains("sample_rate=16000"),
             "The sample rate is passed through, never resampled"
@@ -207,6 +232,105 @@ enum DeepgramStreamingCoreTests {
             Core.socketIdleTimeoutSeconds > HandsFreeAutoStop.maximumMilliseconds / 1000,
             "The socket idle timeout must outlast the longest possible dictation"
         )
+    }
+
+    /// Synthetic bytes 0, 1, 2, ... wrapping at 256, so a dropped or shifted byte changes the content.
+    private static func ramp(_ count: Int) -> Data {
+        Data((0..<count).map { UInt8(truncatingIfNeeded: $0) })
+    }
+
+    private static func testFrameBytes() {
+        TestSupport.expectEqual(Core.frameMilliseconds, 50)
+        TestSupport.expectEqual(Core.frameBytes(sampleRate: 16_000), 1_600)
+        TestSupport.expectEqual(Core.frameBytes(sampleRate: 24_000), 2_400)
+        TestSupport.expectEqual(Core.frameBytes(sampleRate: 48_000), 4_800)
+        // 2205 bytes rounds down to whole Int16 samples.
+        TestSupport.expectEqual(Core.frameBytes(sampleRate: 22_050), 2_204)
+        TestSupport.expectEqual(Core.frameBytes(sampleRate: 11_025), 1_102)
+        for sampleRate in [0, 1, 8_000, 11_025, 16_000, 22_050, 24_000, 44_100, 48_000] {
+            let bytes = Core.frameBytes(sampleRate: sampleRate)
+            TestSupport.expect(bytes % 2 == 0, "\(sampleRate) Hz frames must hold whole Int16 samples, got \(bytes)")
+            TestSupport.expect(bytes >= 2, "\(sampleRate) Hz frames must hold at least one sample, got \(bytes)")
+        }
+    }
+
+    /// 341-sample capture chunks become 1600-byte frames at 16 kHz.
+    private static func testFrameAggregatorCarriesRemainderAcrossAppends() {
+        let input = ramp(6_820)
+        var aggregator = Core.FrameAggregator(frameBytes: Core.frameBytes(sampleRate: 16_000))
+        var output = Data()
+        var framesPerAppend: [Int] = []
+        for start in stride(from: 0, to: input.count, by: 682) {
+            let frames = aggregator.append(input.subdata(in: start..<start + 682))
+            framesPerAppend.append(frames.count)
+            for frame in frames {
+                TestSupport.expectEqual(frame.count, 1_600)
+                output.append(frame)
+            }
+        }
+        TestSupport.expectEqual(framesPerAppend, [0, 0, 1, 0, 1, 0, 0, 1, 0, 1])
+
+        let remainder = aggregator.flush()
+        TestSupport.expectEqual(remainder?.count, 420)
+        TestSupport.expectEqual(aggregator.flush(), nil)
+        output.append(remainder ?? Data())
+        TestSupport.expectEqual(output, input)
+        TestSupport.expectEqual(aggregator, Core.FrameAggregator(frameBytes: 1_600))
+    }
+
+    private static func testFrameAggregatorFlushAndEmptyInput() {
+        var aggregator = Core.FrameAggregator(frameBytes: 1_600)
+        TestSupport.expectEqual(aggregator.flush(), nil)
+        TestSupport.expectEqual(aggregator.append(Data()), [])
+        TestSupport.expectEqual(aggregator.flush(), nil)
+
+        let exact = ramp(1_600)
+        TestSupport.expectEqual(aggregator.append(exact), [exact])
+        TestSupport.expectEqual(aggregator.flush(), nil)
+
+        let short = ramp(3)
+        TestSupport.expectEqual(aggregator.append(short), [])
+        TestSupport.expectEqual(aggregator.flush(), short)
+        TestSupport.expectEqual(aggregator.flush(), nil)
+
+        // A zero frame size is raised to one Int16 sample, so no frame is ever empty.
+        var minimal = Core.FrameAggregator(frameBytes: 0)
+        TestSupport.expectEqual(minimal.frameBytes, 2)
+        TestSupport.expectEqual(minimal.append(ramp(5)).map(\.count), [2, 2])
+        TestSupport.expectEqual(minimal.flush()?.count, 1)
+        TestSupport.expectEqual(minimal.flush(), nil)
+    }
+
+    private static func testFrameAggregatorSplitsLargeAppendInOrder() {
+        let input = ramp(7_300)
+        var aggregator = Core.FrameAggregator(frameBytes: 2_400)
+        TestSupport.expectEqual(
+            aggregator.append(input),
+            [Data(input[0..<2_400]), Data(input[2_400..<4_800]), Data(input[4_800..<7_200])]
+        )
+        TestSupport.expectEqual(aggregator.flush(), Data(input[7_200..<7_300]))
+        TestSupport.expectEqual(aggregator.flush(), nil)
+    }
+
+    private static func testFrameAggregatorConservesBytes() {
+        let chunkSizes = [0, 1, 682, 1_599, 1_600, 1_601, 3_200, 4_799, 2, 341]
+        let input = ramp(13_825)
+        TestSupport.expectEqual(chunkSizes.reduce(0, +), input.count)
+
+        var aggregator = Core.FrameAggregator(frameBytes: Core.frameBytes(sampleRate: 16_000))
+        var output = Data()
+        var start = 0
+        for size in chunkSizes {
+            for frame in aggregator.append(input.subdata(in: start..<start + size)) {
+                TestSupport.expectEqual(frame.count, 1_600)
+                output.append(frame)
+            }
+            start += size
+        }
+        let remainder = aggregator.flush()
+        TestSupport.expect(remainder.map { !$0.isEmpty } ?? true, "flush must return nil, never an empty frame")
+        output.append(remainder ?? Data())
+        TestSupport.expectEqual(output, input)
     }
 
     private static func message(_ json: String) -> Core.ServerMessage {
