@@ -1,0 +1,66 @@
+# Example variants for build/audio-replay. Use it with --variants <file>, or copy
+# it and keep only the lines you want to compare.
+#
+# Syntax: one variant per line, written as "name key=value key=value ...".
+#   - name: 1-40 characters from A-Z a-z 0-9 . _ - and unique in the file.
+#   - Blank lines and lines starting with # are ignored.
+#   - A key you leave out keeps the default listed below.
+#   - The first variant is the paired baseline: every other variant is
+#     compared with it file by file.
+#
+# Keys, with the default first:
+#   rate=16000            8000, 16000, 22050, 24000, 32000, 44100 or 48000 (Hz sent to Deepgram)
+#   src=minphase          minphase (MinimumPhase at max quality, PR 1's converter),
+#                         mastering-high, mastering-max,
+#                         default (an untouched AVAudioConverter: Normal, medium quality),
+#                         legacy-chain (today's app: an untouched conversion to 16 kHz,
+#                         then an untouched 16 -> 24 kHz step; needs rate=24000)
+#   endpointing=500       1-10000 (ms of silence before Deepgram finalizes), false, or default
+#   language=en           a code such as en, en-US or multi, or omit
+#   mip_opt_out=true      true, false or default
+#   smart_format=true     true, false or default
+#   punctuate=true        true, false or default
+#   interim_results=true  true, false or default
+#   keyterms=none         none, all, or top-N (N 1-100): the first N terms of each
+#                         manifest line's keyterms file
+#   frame_ms=50           10-1000 (audio per WebSocket message)
+#   pacing=realtime       realtime, 1.25x, or burst (everything at once)
+#   isolation=off         off, hqN (High Quality Voice model, macOS 15 or later) or
+#                         voiceN (Voice model), N = wet percent 0-100; the source file
+#                         must be 44.1 or 48 kHz
+#   gain_db=0             -40 to 40; a boost is soft-limited to stay below -1 dBFS:
+#                         before isolation when isolation is on, so the model never
+#                         gets louder input, and always after resampling (with
+#                         src=legacy-chain, its final 16 -> 24 kHz step can overshoot
+#                         that, and a large boost can still clip)
+#
+# For the query keys (endpointing, language, mip_opt_out, smart_format, punctuate,
+# interim_results), "default" and "omit" both leave the item out of the request,
+# so Deepgram applies its own default.
+
+# Closest match to today's full app request: the 24 kHz legacy stream, Deepgram's own
+# endpointing (10 ms), no language, every keyterm, and frames close to the app's
+# capture chunks (about 341 frames at 16 kHz, about 21 ms). Today's app also omits
+# mip_opt_out; it stays true here because it changes how Deepgram may use the audio,
+# not the transcript.
+today rate=24000 src=legacy-chain endpointing=default language=omit keyterms=all frame_ms=21
+
+# PR 1 + PR 2: every default.
+proposed
+
+# Experiment A8: a fixed gain ladder.
+gain-m12 gain_db=-12
+gain-m6 gain_db=-6
+gain-0 gain_db=0
+gain-p6 gain_db=6
+gain-p12 gain_db=12
+
+# The highest-quality Mastering converter.
+src-mastering-max src=mastering-max
+
+# The standard Voice model at 70 percent wet. Needs 44.1 or 48 kHz masters: delete
+# this line when the manifest lists 16 kHz Run Log WAVs.
+iso-voice70 isolation=voice70
+
+# A larger keyterm budget than the keyterms preset's top-20.
+kt-top50 keyterms=top-50
