@@ -353,9 +353,9 @@ class TranscriptionService {
         return normalizedURL
     }
 
-    private func parseTranscript(from data: Data) throws -> String {
+    func parseTranscript(from data: Data) throws -> String {
         do {
-            return try TranscriptionResponseParser.parse(data)
+            return try TranscriptionResponseParser.parse(data, expectedLanguage: language)
         } catch TranscriptionResponseParsingError.invalidResponse {
             throw TranscriptionError.pollFailed("Invalid response")
         }

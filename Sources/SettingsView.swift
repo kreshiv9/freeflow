@@ -1375,6 +1375,15 @@ struct GeneralSettingsView: View {
                     )
                 }
             }
+
+            Divider()
+                .padding(.vertical, 2)
+
+            Toggle("Skip transcription when no speech is detected", isOn: $appState.silenceGateEnabled)
+
+            Text("When a recording holds only silence or quiet background noise, \(AppName.displayName) ends the dictation locally instead of requesting a transcript; louder steady noise cannot be told apart from speech and is still transcribed. The silent audio is not uploaded unless realtime streaming is on, which streams audio while you hold the shortcut. Turn this off if quiet dictations are being skipped.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .onAppear {
             appState.refreshAvailableMicrophones()
@@ -2425,7 +2434,9 @@ struct RunLogEntryView: View {
                             title: "Transcribe Audio",
                             content: {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text("Sent audio to the configured transcription model")
+                                    Text(item.postProcessingStatus == SilenceGatePreference.skippedProcessingStatus
+                                        ? "Transcription skipped: no speech was detected"
+                                        : "Sent audio to the configured transcription model")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         .textSelection(.enabled)

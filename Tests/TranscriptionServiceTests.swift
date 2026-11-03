@@ -68,5 +68,24 @@ enum TranscriptionServiceTests {
             validator: { _, _ in true }
         ) { fallbackApplied = $0 }
         TestSupport.expect(fallbackValid && fallbackApplied?.transcriptionAPIURL.isEmpty == true && fallbackApplied?.transcriptionAPIKey.isEmpty == true, "Empty transcription overrides preserve fallback semantics without a partial override")
+
+        testExpectedLanguageReachesParser()
+    }
+
+    /// The service's configured language must reach the response parser so a
+    /// non-English sign-off returned for an English request is suppressed.
+    private static func testExpectedLanguageReachesParser() {
+        let fixture = Data("{\"text\": \"시청해주셔서 감사합니다.\"}".utf8)
+        let english = try? TranscriptionService(
+            apiKey: "synthetic-key",
+            baseURL: "https://synthetic-provider.invalid/v1",
+            language: "en"
+        )
+        let auto = try? TranscriptionService(
+            apiKey: "synthetic-key",
+            baseURL: "https://synthetic-provider.invalid/v1"
+        )
+        TestSupport.expectEqual(try? english?.parseTranscript(from: fixture), "")
+        TestSupport.expectEqual(try? auto?.parseTranscript(from: fixture), "시청해주셔서 감사합니다.")
     }
 }

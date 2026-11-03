@@ -92,6 +92,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private let _recording = OSAllocatedUnfairLock(initialState: false)
     @Published var audioLevel: Float = 0.0
     private let liveLevelNormalizerLock = OSAllocatedUnfairLock(initialState: LiveAudioLevelNormalizer())
+    /// Fed on the sample-buffer queue, snapshotted on the session queue.
+    private let speechActivityLock = OSAllocatedUnfairLock(initialState: SpeechActivityTracker())
 
     /// Delivered on the main queue only while the capture generation is current.
     var onRecordingReady: ((ContinuousClock.Instant) -> Void)?
@@ -251,6 +253,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             let discardURL = self.finishAudioFileLocked(discard: true)
             self.teardownSessionLocked()
             self.liveLevelNormalizerLock.withLock { $0.reset() }
+            self.speechActivityLock.withLock { $0.reset() }
             if let discardURL {
                 try? FileManager.default.removeItem(at: discardURL)
             }
@@ -650,6 +653,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         _bufferCount.withLock { $0 = 0 }
         failureReported = false
         liveLevelNormalizerLock.withLock { $0.reset() }
+        speechActivityLock.withLock { $0.reset() }
 
         os_log(.info, log: recordingLog, "startRecording() entered")
 
@@ -681,7 +685,10 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         os_log(.info, log: recordingLog, "startRecording() complete: %.3fms total", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
     }
 
-    func stopRecording(completion: @escaping (URL?) -> Void) {
+    /// The speech-activity value is captured on the session queue after
+    /// teardown has drained the sample-buffer queue, so it belongs to the
+    /// recording whose URL it accompanies.
+    func stopRecording(completion: @escaping (URL?, SpeechActivityTracker) -> Void) {
         captureTiming.withLock { $0.invalidate() }
         let count = _bufferCount.withLock { $0 }
         let elapsed = (CFAbsoluteTimeGetCurrent() - recordingStartTime) * 1000
@@ -693,10 +700,15 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             let outputURL = self.finishAudioFileLocked(discard: false)
             self._recording.withLock { $0 = false }
             self.liveLevelNormalizerLock.withLock { $0.reset() }
+            let speechActivity = self.speechActivityLock.withLock { tracker -> SpeechActivityTracker in
+                let snapshot = tracker
+                tracker.reset()
+                return snapshot
+            }
             DispatchQueue.main.async {
                 self.isRecording = false
                 self.audioLevel = 0.0
-                completion(outputURL)
+                completion(outputURL, speechActivity)
             }
         }
     }
@@ -709,6 +721,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             let discardURL = self.finishAudioFileLocked(discard: true)
             self._recording.withLock { $0 = false }
             self.liveLevelNormalizerLock.withLock { $0.reset() }
+            self.speechActivityLock.withLock { $0.reset() }
             if let discardURL {
                 try? FileManager.default.removeItem(at: discardURL)
             }
@@ -750,6 +763,10 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         ) else { return 0 }
 
         let rms = rmsLevel(for: inputBuffer)
+        let bufferMilliseconds = Double(frameCount) / sourceFormat.sampleRate * 1000
+        speechActivityLock.withLock {
+            $0.track(rms: rms, durationMilliseconds: bufferMilliseconds)
+        }
         let normalizedDisplayLevel = liveLevelNormalizerLock.withLock {
             $0.normalizedLevel(forRMS: rms)
         }
