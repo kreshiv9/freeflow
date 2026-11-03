@@ -21,6 +21,89 @@ enum TranscriptTextCoreTests {
         testPostProcessedTranscriptSanitization()
         testModeSpecificSanitization()
         testInstructionExecutionGuard()
+        testEchoedPromptScaffoldingIsStripped()
+        testContentLossGuardCatchesDroppedSentence()
+        testContentLossGuardAllowsNormalCleanup()
+    }
+
+    private static func testEchoedPromptScaffoldingIsStripped() {
+        let cases: [(String, String)] = [
+            // The first test pass: the model echoed the closing delimiter after a one-word dictation.
+            ("store RAW_TRANSCRIPTION", "store"),
+            ("Store.\nRAW_TRANSCRIPTION", "Store."),
+            ("RAW_TRANSCRIPTION: Ship it today.", "Ship it today."),
+            ("<<<RAW_TRANSCRIPTION\nShip it today.\nRAW_TRANSCRIPTION", "Ship it today."),
+            ("Ship it today. RAW_TRANSCRIPTION RAW_TRANSCRIPTION", "Ship it today."),
+            ("<<<CONTEXT\nShip it today.\nCONTEXT", "Ship it today."),
+            (TextContextCore.promptHeader + "\nShip it today.", "Ship it today."),
+            ("EMPTY\nRAW_TRANSCRIPTION", ""),
+            // Ordinary words are left alone, including the phrase spoken in lowercase.
+            ("It also printed out raw transcription.", "It also printed out raw transcription."),
+            ("Check the context menu.", "Check the context menu.")
+        ]
+        for (input, expected) in cases {
+            TestSupport.expectEqual(TranscriptOutputSanitizer.postProcessedTranscript(input), expected)
+        }
+    }
+
+    private static func testContentLossGuardCatchesDroppedSentence() {
+        // Synthetic stand-in for the first test pass: Light cleanup deleted a whole opening sentence.
+        let raw = "The line above this was me testing out number seven. I typed, I went to the, and then I said store. But then it also printed out raw transcription."
+        let cleaned = "I typed \"I went to the store\" but it also printed out raw transcription."
+        TestSupport.expect(
+            TranscriptOutputSanitizer.appearsToHaveDroppedContent(
+                rawTranscript: raw, cleanedTranscript: cleaned, allowsRewording: false, outputLanguage: ""
+            ),
+            "Dropping a whole sentence at Light must trip the guard"
+        )
+        let halved = "The quarterly report covers revenue, hiring, churn and the roadmap for the mobile launch next spring."
+        TestSupport.expect(
+            TranscriptOutputSanitizer.appearsToHaveDroppedContent(
+                rawTranscript: halved, cleanedTranscript: "The quarterly report covers revenue.", allowsRewording: true, outputLanguage: ""
+            ),
+            "Losing most content words trips the guard even at Medium"
+        )
+    }
+
+    private static func testContentLossGuardAllowsNormalCleanup() {
+        let raw = "um so basically I was thinking we could uh move the weekly design review to Thursday because like the client team can't make Wednesday afternoon you know"
+        let cleaned = "I was thinking we could move the weekly design review to Thursday because the client team can't make Wednesday afternoon."
+        TestSupport.expect(
+            !TranscriptOutputSanitizer.appearsToHaveDroppedContent(
+                rawTranscript: raw, cleanedTranscript: cleaned, allowsRewording: false, outputLanguage: ""
+            ),
+            "Removing fillers must not trip the guard"
+        )
+        let backtrack = "Please send the signed contract and the invoice to the finance team on Monday morning, scratch that, send them Tuesday."
+        TestSupport.expect(
+            !TranscriptOutputSanitizer.appearsToHaveDroppedContent(
+                rawTranscript: backtrack, cleanedTranscript: "Please send them Tuesday.", allowsRewording: false, outputLanguage: ""
+            ),
+            "An explicit backtrack marker lets cleanup remove the abandoned wording"
+        )
+        let counted = "things to buy first milk second eggs third bread fourth coffee fifth butter sixth jam"
+        TestSupport.expect(
+            !TranscriptOutputSanitizer.appearsToHaveDroppedContent(
+                rawTranscript: counted,
+                cleanedTranscript: "Things to buy:\n1. Milk\n2. Eggs\n3. Bread\n4. Coffee\n5. Butter\n6. Jam",
+                allowsRewording: false,
+                outputLanguage: ""
+            ),
+            "Turning ordinals into a numbered list is not content loss"
+        )
+        TestSupport.expect(
+            !TranscriptOutputSanitizer.appearsToHaveDroppedContent(
+                rawTranscript: "Ship it.", cleanedTranscript: "", allowsRewording: false, outputLanguage: ""
+            ),
+            "Short dictations are below the guard's minimum"
+        )
+        let translated = "We should move the weekly design review to Thursday because the client team cannot make Wednesday."
+        TestSupport.expect(
+            !TranscriptOutputSanitizer.appearsToHaveDroppedContent(
+                rawTranscript: translated, cleanedTranscript: "Deberíamos mover la revisión al jueves.", allowsRewording: false, outputLanguage: "Spanish"
+            ),
+            "Translation is exempt"
+        )
     }
 
     private static func testJSONTranscriptParsing() {

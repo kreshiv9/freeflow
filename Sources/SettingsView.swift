@@ -2582,13 +2582,19 @@ struct RunLogEntryView: View {
                     }
 
                     if item.canUndoAIEdit {
-                        actionIconButton(
-                            systemName: undidAIEdit ? "checkmark" : "arrow.uturn.backward",
-                            color: undidAIEdit ? .green : .secondary,
-                            help: undidAIEdit ? CleanupLevel.rawTranscriptCopiedStatusText : "Undo AI edit"
-                        ) {
+                        // Labeled, not icon-only, so the action is easy to find in the row.
+                        Button {
                             undoAIEdit()
+                        } label: {
+                            Label(
+                                undidAIEdit ? CleanupLevel.rawTranscriptCopiedStatusText : "Undo AI edit",
+                                systemImage: undidAIEdit ? "checkmark" : "arrow.uturn.backward"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(undidAIEdit ? Color.green : Color.secondary)
                         }
+                        .buttonStyle(.borderless)
+                        .help("Copy what you said, before cleanup, to the clipboard")
                     } else {
                         Color.clear
                             .frame(width: actionIconSize, height: actionIconSize)
