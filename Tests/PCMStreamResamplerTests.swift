@@ -33,6 +33,7 @@ enum PCMStreamResamplerTests {
         testSmallChunksEmitNothingAtFirstThenFlushTheTail()
         testLegacyCaptureFormatPassesThroughBitExact()
         testLittleEndianDataAndFormatSummary()
+        testSliceCopiesTapBuffers()
     }
 
     // MARK: Fixtures
@@ -83,6 +84,31 @@ enum PCMStreamResamplerTests {
 
     private static func samples(_ buffer: AVAudioPCMBuffer) -> [Int16] {
         Array(UnsafeBufferPointer(start: buffer.int16ChannelData![0], count: Int(buffer.frameLength)))
+    }
+
+    /// Per-channel Float32 samples, interleaved or not.
+    private static func floatSamples(_ buffer: AVAudioPCMBuffer) -> [[Float]] {
+        let channels = buffer.floatChannelData!
+        let interleaved = buffer.format.isInterleaved
+        return (0..<Int(buffer.format.channelCount)).map { channel in
+            (0..<Int(buffer.frameLength)).map { frame in
+                interleaved ? channels[0][frame * buffer.stride + channel] : channels[channel][frame]
+            }
+        }
+    }
+
+    private static func setFloatSamples(_ samples: [[Float]], in buffer: AVAudioPCMBuffer) {
+        let channels = buffer.floatChannelData!
+        let interleaved = buffer.format.isInterleaved
+        for (channel, values) in samples.enumerated() {
+            for (frame, value) in values.enumerated() {
+                if interleaved {
+                    channels[0][frame * buffer.stride + channel] = value
+                } else {
+                    channels[channel][frame] = value
+                }
+            }
+        }
     }
 
     private static func makeResampler(
@@ -582,5 +608,40 @@ enum PCMStreamResamplerTests {
         let float48k = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: true)!
         TestSupport.expectEqual(PCMStreamResampler.formatSummary(float48k), "pcmFormatFloat32 48000Hz 1 ch interleaved=true")
         TestSupport.expectEqual(PCMStreamResampler.formatSummary(int16Format(16_000)), "pcmFormatInt16 16000Hz 1 ch interleaved=true")
+    }
+
+    /// The voice-processing tap reuses its buffers, so a full-length slice
+    /// must own every channel's samples, interleaved or not.
+    private static func testSliceCopiesTapBuffers() {
+        let frames = 480
+        let discrete3 = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3)!
+        let formats: [(name: String, format: AVAudioFormat)] = [
+            ("mono non-interleaved", format(48_000)),
+            ("stereo interleaved", AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true)!),
+            ("3-channel non-interleaved", AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, interleaved: false, channelLayout: discrete3)),
+        ]
+        for (name, sourceFormat) in formats {
+            let channelCount = Int(sourceFormat.channelCount)
+            let expected: [[Float]] = (0..<channelCount).map { channel in
+                (0..<frames).map { Float(channel + 1) * Float(sin(Double($0) * 0.1)) }
+            }
+            let source = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(frames))!
+            source.frameLength = AVAudioFrameCount(frames)
+            setFloatSamples(expected, in: source)
+
+            let copy = PCMStreamResampler.slice(source, from: 0, count: source.frameLength)!
+            TestSupport.expect(copy.format == sourceFormat, "\(name): the copy must keep the source format")
+            TestSupport.expectEqual(copy.frameLength, AVAudioFrameCount(frames))
+            TestSupport.expect(floatSamples(copy) == expected, "\(name): the copy must hold every channel's samples")
+
+            let part = PCMStreamResampler.slice(source, from: 100, count: 50)!
+            let expectedPart = expected.map { Array($0[100..<150]) }
+            TestSupport.expectEqual(part.frameLength, 50)
+            TestSupport.expect(floatSamples(part) == expectedPart, "\(name): a slice must hold source frames 100..<150")
+
+            setFloatSamples(Array(repeating: Array(repeating: 9, count: frames), count: channelCount), in: source)
+            TestSupport.expect(floatSamples(copy) == expected, "\(name): writes to the source must not reach the copy")
+            TestSupport.expect(floatSamples(part) == expectedPart, "\(name): writes to the source must not reach the slice")
+        }
     }
 }

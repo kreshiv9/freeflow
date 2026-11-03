@@ -1629,6 +1629,48 @@ struct GeneralSettingsView: View {
             Divider()
                 .padding(.vertical, 2)
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Capture engine")
+                    .font(.caption.weight(.semibold))
+                Picker("", selection: captureBackendSelection) {
+                    ForEach(CaptureBackendPreference.allCases) { backend in
+                        Text(backend.displayName).tag(backend)
+                    }
+                }
+                .accessibilityLabel("Capture engine")
+                .labelsHidden()
+                .disabled(captureBackendUnavailableReason != nil)
+                if let note = captureBackendNote {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text(CaptureBackendPreference.caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if isVoiceProcessingEffective {
+                    HStack(spacing: 8) {
+                        Button("Show Mic Mode menu") {
+                            AVCaptureDevice.showSystemUserInterface(.microphoneModes)
+                        }
+                        .font(.caption)
+                        // Nothing publishes this class property, so the
+                        // line re-reads it every second while it is shown.
+                        TimelineView(.periodic(from: .now, by: 1)) { _ in
+                            Text(activeMicModeStatus)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text("macOS shows the Mic Mode menu only while \(AppName.displayName) is recording: start a hands-free dictation, then press the button.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+                .padding(.vertical, 2)
+
             Toggle("Skip transcription when no speech is detected", isOn: $appState.silenceGateEnabled)
 
             Text("When a recording holds only silence or quiet background noise, \(AppName.displayName) ends the dictation locally instead of requesting a transcript; louder steady noise cannot be told apart from speech and is still transcribed. The silent audio is not uploaded unless Stream audio while speaking is on, which streams audio while you hold the shortcut. Turn this off if quiet dictations are being skipped.")
@@ -1654,6 +1696,50 @@ struct GeneralSettingsView: View {
             get: { appState.effectiveVoiceIsolation },
             set: { appState.voiceIsolation = $0 }
         )
+    }
+
+    private var captureBackendUnavailableReason: String? {
+        CaptureBackendPreference.unavailableReason(
+            osSupportsDucking: CaptureBackendPreference.osSupportsDucking,
+            captureFormat: appState.captureFormat
+        )?.message
+    }
+
+    /// Shows the backend recordings use, so the disabled picker reads
+    /// Standard; the saved choice returns when the picker is enabled again.
+    private var captureBackendSelection: Binding<CaptureBackendPreference> {
+        Binding(
+            get: { captureBackendUnavailableReason == nil ? appState.captureBackend : .standard },
+            set: { appState.captureBackend = $0 }
+        )
+    }
+
+    /// True when recordings start with Apple voice processing: it is chosen
+    /// and no note says they use Standard.
+    private var isVoiceProcessingEffective: Bool {
+        appState.captureBackend == .appleVoiceProcessing && captureBackendNote == nil
+    }
+
+    /// The Mic Mode macOS applies now. The mode picked in Control Center is
+    /// the Voice isolation section's line, so it is not repeated here.
+    private var activeMicModeStatus: String {
+        let active = VoiceIsolationPreference.micModeDisplayName(rawValue: AVCaptureDevice.activeMicrophoneMode.rawValue)
+        return "Active Mic Mode: \(active)"
+    }
+
+    /// Why recordings use Standard, or nil.
+    private var captureBackendNote: String? {
+        if let reason = captureBackendUnavailableReason {
+            return reason
+        }
+        if appState.captureBackend == .appleVoiceProcessing,
+           !CaptureBackendPreference.isDefaultInputSelected(
+               selectedDeviceUID: appState.selectedMicrophoneID,
+               defaultDeviceUID: AVCaptureDevice.default(for: .audio)?.uniqueID
+           ) {
+            return CaptureBackendPreference.FallbackReason.requiresDefaultMicrophone.message + " Recordings use Standard."
+        }
+        return nil
     }
 
     // MARK: Sound Volume

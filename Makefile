@@ -21,6 +21,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AppTextInsertionCore.swift \
 	Sources/AppTextInsertionTarget.swift \
 	Sources/AudioLevelMeter.swift \
+	Sources/CaptureBackendPreference.swift \
 	Sources/CaptureFormatPreference.swift \
 	Sources/CleanupLevel.swift \
 	Sources/CommandModeIntent.swift \
@@ -57,6 +58,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/UpdateManager.swift \
 	Sources/VoiceIsolationFilter.swift \
 	Sources/VoiceIsolationPreference.swift \
+	Sources/VoiceProcessingCapture.swift \
+	Sources/VoiceProcessingLiveness.swift \
 	Sources/WordBoundedText.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \
 	Sources/ShortcutCore/ShortcutMatcher.swift \

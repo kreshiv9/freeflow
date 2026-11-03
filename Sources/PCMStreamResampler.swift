@@ -189,8 +189,9 @@ final class PCMStreamResampler {
     }
 
     /// Copies `count` frames starting at `start` into a new buffer (all
-    /// channels, interleaved or not).
-    private static func slice(_ source: AVAudioPCMBuffer, from start: AVAudioFrameCount, count: AVAudioFrameCount) -> AVAudioPCMBuffer? {
+    /// channels, interleaved or not). Also copies the voice-processing tap's
+    /// reused buffers.
+    static func slice(_ source: AVAudioPCMBuffer, from start: AVAudioFrameCount, count: AVAudioFrameCount) -> AVAudioPCMBuffer? {
         guard let slice = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: count) else { return nil }
         slice.frameLength = count
         let bytesPerFrame = Int(source.format.streamDescription.pointee.mBytesPerFrame)

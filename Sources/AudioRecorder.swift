@@ -86,6 +86,13 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private var recordedFrameCount: AVAudioFramePosition = 0
     private var fileWriteError: Error?
     private var isSessionInterrupted = false
+    /// Session queue only: the running voice-processing capture (nil once it
+    /// is stopped or replaced), the start count that keeps a late fallback
+    /// request from touching a newer recording, and the microphone the
+    /// fallback reopens.
+    private var voiceProcessingCapture: VoiceProcessingCapture?
+    private var captureGeneration: UInt64 = 0
+    private var requestedDeviceUID: String?
 
     @Published var isRecording = false
     private let _recording = OSAllocatedUnfairLock(initialState: false)
@@ -129,6 +136,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private var voiceIsolationMode: VoiceIsolationPreference = .off
     /// This recording's filter; nil sends the raw audio straight to the converters.
     private var voiceIsolationFilter: VoiceIsolationFilter?
+    /// First-second digital-zero check for voice-processing buffers.
+    private var voiceProcessingLiveness = VoiceProcessingLiveness()
     /// The filter built ahead of time by prepareVoiceIsolation for the
     /// selected mode, so no recording waits for the model to load.
     private struct PreparedVoiceIsolation {
@@ -142,6 +151,13 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private var failureReported = false
     private static let watchdogTimeout: TimeInterval = 2.0
     private static let sampleRateLogLimit = 40
+    /// Content-free log labels for leaving voice processing mid-start or mid-recording.
+    private enum VoiceProcessingFallback: String {
+        case setupFailed
+        case silentFirstSecond
+        case noBuffers
+        case configurationChange
+    }
 
     /// True once this recording's stream conversion failed, so the caller
     /// should transcribe the WAV instead. Reset when the next recording starts.
@@ -261,6 +277,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         captureSession = nil
         currentInput = nil
         audioDataOutput = nil
+        stopVoiceProcessingLocked()
     }
 
     private func reportRecordingFailure(_ error: Error, completion: ((URL?) -> Void)? = nil) {
@@ -305,6 +322,10 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
 
             let count = self._bufferCount.withLock { $0 }
             if count == baselineCount {
+                if self.voiceProcessingCapture != nil {
+                    self.fallBackToCaptureSessionLocked(.noBuffers, generation: self.captureGeneration)
+                    return
+                }
                 os_log(.error, log: recordingLog, "watchdog: no new buffers after %.1fs — giving up", Self.watchdogTimeout)
                 self.reportRecordingFailure(AudioRecorderError.noAudioBuffersReceived)
             } else {
@@ -692,12 +713,48 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         outputURL: URL,
         captureFormat: CaptureFormatPreference,
         streamSampleRate: Int?,
-        voiceIsolation: VoiceIsolationPreference
+        voiceIsolation: VoiceIsolationPreference,
+        captureBackend: CaptureBackendPreference
     ) throws {
         teardownSessionLocked()
 
         let device = try preferredCaptureDevice(for: deviceUID, reason: "initial start")
 
+        activeAudioFile = nil
+        activeAudioFormat = nil
+        requestedCaptureFormat = captureFormat
+        self.streamSampleRate = streamSampleRate
+        pipelineSourceFormat = nil
+        wavResampler = nil
+        streamResampler = nil
+        pipelineBuildCount = 0
+        streamFailed.withLock { $0 = false }
+        // Only a filter already built for this mode is used; it is reset
+        // when the first buffer builds the pipeline.
+        let prepared = preparedVoiceIsolation.withLock { ($0.builtMode, $0.filter) }
+        let isIsolationBuilt = voiceIsolation != .off && prepared.0 == voiceIsolation
+        let isolationFilter = isIsolationBuilt ? prepared.1 : nil
+        voiceIsolationMode = voiceIsolation
+        voiceIsolationFilter = isolationFilter
+        recordedFrameCount = 0
+        fileWriteErrorLock.withLock { _ in
+            fileWriteError = nil
+        }
+        voiceProcessingLiveness = VoiceProcessingLiveness()
+        captureGeneration &+= 1
+        requestedDeviceUID = deviceUID
+
+        if !startVoiceProcessingIfChosenLocked(captureBackend, deviceUID: deviceUID, captureFormat: captureFormat) {
+            try startCaptureSessionLocked(device: device, captureFormat: captureFormat)
+        }
+
+        logVoiceIsolationStart(mode: voiceIsolation, filter: isolationFilter, isBuilt: isIsolationBuilt)
+        tempFileURL = outputURL
+    }
+
+    /// Builds and starts the capture session on `device`: the Standard path,
+    /// and the replacement when voice processing fails.
+    private func startCaptureSessionLocked(device: AVCaptureDevice, captureFormat: CaptureFormatPreference) throws {
         let session = AVCaptureSession()
         let dataOutput = AVCaptureAudioDataOutput()
         dataOutput.audioSettings = captureFormat.audioSettings()
@@ -735,26 +792,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         currentInput = input
         audioDataOutput = dataOutput
         isSessionInterrupted = false
-        activeAudioFile = nil
-        activeAudioFormat = nil
-        requestedCaptureFormat = captureFormat
-        self.streamSampleRate = streamSampleRate
-        pipelineSourceFormat = nil
-        wavResampler = nil
-        streamResampler = nil
-        pipelineBuildCount = 0
-        streamFailed.withLock { $0 = false }
-        // Only a filter already built for this mode is used; it is reset
-        // when the first buffer builds the pipeline.
-        let prepared = preparedVoiceIsolation.withLock { ($0.builtMode, $0.filter) }
-        let isIsolationBuilt = voiceIsolation != .off && prepared.0 == voiceIsolation
-        let isolationFilter = isIsolationBuilt ? prepared.1 : nil
-        voiceIsolationMode = voiceIsolation
-        voiceIsolationFilter = isolationFilter
-        recordedFrameCount = 0
-        fileWriteErrorLock.withLock { _ in
-            fileWriteError = nil
-        }
         installSessionObservers(for: session)
 
         os_log(.info, log: recordingLog, "configured capture session with device %{public}@ [uid=%{public}@]", device.localizedName, device.uniqueID)
@@ -765,8 +802,154 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
 
         os_log(.info, log: recordingLog, "capture session running with device %{public}@ [uid=%{public}@]", device.localizedName, device.uniqueID)
-        logVoiceIsolationStart(mode: voiceIsolation, filter: isolationFilter, isBuilt: isIsolationBuilt)
-        tempFileURL = outputURL
+    }
+
+    /// Starts Apple voice processing when it was chosen and its gate passes.
+    /// False means the caller starts the capture session; Standard returns
+    /// before any device lookup or log. A setup failure stops the engine
+    /// itself and is logged here.
+    private func startVoiceProcessingIfChosenLocked(
+        _ captureBackend: CaptureBackendPreference,
+        deviceUID: String?,
+        captureFormat: CaptureFormatPreference
+    ) -> Bool {
+        guard captureBackend == .appleVoiceProcessing else { return false }
+        let resolution = CaptureBackendPreference.resolve(
+            preference: captureBackend,
+            osSupportsDucking: CaptureBackendPreference.osSupportsDucking,
+            isDefaultInputSelected: CaptureBackendPreference.isDefaultInputSelected(
+                selectedDeviceUID: deviceUID,
+                defaultDeviceUID: AVCaptureDevice.default(for: .audio)?.uniqueID
+            ),
+            captureFormat: captureFormat
+        )
+        guard resolution.backend == .appleVoiceProcessing else {
+            os_log(
+                .info,
+                log: recordingLog,
+                "capture backend=captureSession requested=appleVoiceProcessing reason=%{public}@",
+                resolution.reason?.rawValue ?? "none"
+            )
+            return false
+        }
+
+        let generation = captureGeneration
+        let capture = VoiceProcessingCapture()
+        let t0 = CFAbsoluteTimeGetCurrent()
+        do {
+            let report = try capture.start(
+                deliverOn: sampleBufferQueue,
+                onBuffer: { [weak self] buffer in
+                    self?.handleVoiceProcessingBuffer(buffer, generation: generation)
+                },
+                onConfigurationChange: { [weak self] in
+                    self?.sessionQueue.async {
+                        self?.fallBackToCaptureSessionLocked(.configurationChange, generation: generation)
+                    }
+                }
+            )
+            voiceProcessingCapture = capture
+            os_log(
+                .info,
+                log: recordingLog,
+                "capture backend=voiceProcessing setup=%.0fms hw=%{public}@ tap=%{public}@ agc=%{public}@ ducking=%ld micMode preferred=%ld active=%ld",
+                report.setupMilliseconds,
+                PCMStreamResampler.formatSummary(report.hardwareFormat),
+                PCMStreamResampler.formatSummary(report.tapFormat),
+                String(report.isAGCEnabled),
+                report.duckingLevel,
+                AVCaptureDevice.preferredMicrophoneMode.rawValue,
+                AVCaptureDevice.activeMicrophoneMode.rawValue
+            )
+            return true
+        } catch {
+            let captureError = error as? VoiceProcessingCapture.CaptureError
+            os_log(
+                .error,
+                log: recordingLog,
+                "capture backend fallback: voiceProcessing -> captureSession reason=%{public}@ error=%{public}@ status=%d after=%.0fms",
+                VoiceProcessingFallback.setupFailed.rawValue,
+                captureError?.logLabel ?? String(describing: type(of: error)),
+                captureError?.status ?? 0,
+                (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            )
+            return false
+        }
+    }
+
+    /// Voice-processing tap buffers, on the sample-buffer queue. Silent
+    /// buffers are fed too, so the WAV and stream keep their timeline; a
+    /// first second of exact zeros switches to the capture session.
+    private func handleVoiceProcessingBuffer(_ buffer: AVAudioPCMBuffer, generation: UInt64) {
+        guard _recording.withLock({ $0 }) else { return }
+        let change = voiceProcessingLiveness.observe(
+            frameCount: Int(buffer.frameLength),
+            sampleRate: buffer.format.sampleRate,
+            isSilent: VoiceProcessingLiveness.isChannelZeroSilent(buffer)
+        )
+        if change == .live {
+            let elapsed = (CFAbsoluteTimeGetCurrent() - recordingStartTime) * 1000
+            os_log(.info, log: recordingLog, "voice processing first non-silent buffer at %.0fms", elapsed)
+        }
+        consumeCaptureBuffer { buffer }
+        if change == .silent {
+            sessionQueue.async {
+                self.fallBackToCaptureSessionLocked(.silentFirstSecond, generation: generation)
+            }
+        }
+    }
+
+    /// Replaces this recording's voice-processing capture with the capture
+    /// session, on the session queue. One-way: stale and repeated requests
+    /// are ignored. The WAV, converters, isolation filter and stream carry
+    /// on, and the new buffer format rebuilds the converters.
+    private func fallBackToCaptureSessionLocked(_ reason: VoiceProcessingFallback, generation: UInt64) {
+        guard generation == captureGeneration,
+              let capture = voiceProcessingCapture,
+              _recording.withLock({ $0 }),
+              !failureReported else { return }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        os_log(
+            .error,
+            log: recordingLog,
+            "capture backend fallback: voiceProcessing -> captureSession reason=%{public}@ engineRunning=%{public}@ at=%.0fms",
+            reason.rawValue,
+            String(capture.isRunning),
+            (t0 - recordingStartTime) * 1000
+        )
+        stopVoiceProcessingLocked()
+
+        do {
+            let device = try preferredCaptureDevice(for: requestedDeviceUID, reason: "voice processing fallback")
+            try startCaptureSessionLocked(device: device, captureFormat: requestedCaptureFormat)
+        } catch {
+            reportRecordingFailure(error)
+            return
+        }
+        os_log(.info, log: recordingLog, "capture backend fallback: captureSession running after %.0fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        startBufferWatchdog()
+    }
+
+    /// Tears down the voice-processing capture, if any, without waiting for
+    /// the tap's partly filled buffer (see VoiceProcessingCapture.stop). A
+    /// nonzero disable status is logged as an error because other apps may
+    /// stay ducked.
+    private func stopVoiceProcessingLocked() {
+        guard let capture = voiceProcessingCapture else { return }
+        voiceProcessingCapture = nil
+        let preferredMicMode = AVCaptureDevice.preferredMicrophoneMode.rawValue
+        let activeMicMode = AVCaptureDevice.activeMicrophoneMode.rawValue
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let disableStatus = capture.stop()
+        os_log(
+            disableStatus == 0 ? .info : .error,
+            log: recordingLog,
+            "voice processing stopped: teardown=%.0fms disableStatus=%d micMode preferred=%ld active=%ld",
+            (CFAbsoluteTimeGetCurrent() - t0) * 1000,
+            disableStatus,
+            preferredMicMode,
+            activeMicMode
+        )
     }
 
     /// Content-free: the isolation mode, model, wet mix and latency, and the
@@ -857,12 +1040,16 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     /// `streamSampleRate` is the rate `onPCM16Samples` delivers; nil skips
     /// the stream conversion. `voiceIsolation` applies only when
     /// prepareVoiceIsolation has built the filter for that mode.
+    /// `captureBackend` Apple voice processing is tried only when its gate
+    /// passes and falls back to the capture session on its own; the
+    /// `.standard` default keeps SetupView's mic test on the capture session.
     func startRecording(
         deviceUID: String? = nil,
         timingGeneration: UInt64? = nil,
         captureFormat: CaptureFormatPreference = .load(from: .standard),
         streamSampleRate: Int? = nil,
-        voiceIsolation: VoiceIsolationPreference = .off
+        voiceIsolation: VoiceIsolationPreference = .off,
+        captureBackend: CaptureBackendPreference = .standard
     ) throws {
         let timingGeneration = timingGeneration ?? prepareRecordingTiming()
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -884,7 +1071,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                     outputURL: outputURL,
                     captureFormat: captureFormat,
                     streamSampleRate: streamSampleRate,
-                    voiceIsolation: voiceIsolation
+                    voiceIsolation: voiceIsolation,
+                    captureBackend: captureBackend
                 )
                 self.captureTiming.withLock { $0.start(at: .now, generation: timingGeneration) }
                 self._recording.withLock { $0 = true }
@@ -991,11 +1179,18 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        consumeCaptureBuffer { try decodeCaptureBuffer(sampleBuffer) }
+    }
+
+    /// Both capture paths feed their buffers here on the sample-buffer queue:
+    /// the capture session decodes its sample buffers, voice processing hands
+    /// over copied tap buffers. `makeBuffer` returns nil for an empty buffer.
+    private func consumeCaptureBuffer(_ makeBuffer: () throws -> AVAudioPCMBuffer?) {
         guard _recording.withLock({ $0 }) else { return }
 
         let buffer: AVAudioPCMBuffer?
         do {
-            buffer = try decodeCaptureBuffer(sampleBuffer)
+            buffer = try makeBuffer()
             if let buffer {
                 try processCaptureBuffer(buffer)
             }
