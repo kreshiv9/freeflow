@@ -665,6 +665,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Wispr-style Vibe coding: spoken file names become @-mentions in Cursor and Windsurf. On by default.
+    @Published var vibeCodingFileTaggingEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(vibeCodingFileTaggingEnabled, forKey: FileTagMatcher.storageKey)
+        }
+    }
+
     /// Wispr-style tone per kind of app, applied as a prompt line for English dictations.
     @Published var dictationStyles: [StyleCategory: DictationStyle] {
         didSet { StyleCategory.saveStyles(dictationStyles, to: .standard) }
@@ -1001,6 +1008,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.handsFreeSilenceTimeoutSeconds = HandsFreeAutoStop.loadSilenceTimeoutSeconds(from: .standard)
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
         self.cursorFormattingEnabled = CursorFormatting.load(from: .standard)
+        self.vibeCodingFileTaggingEnabled = FileTagMatcher.load(from: .standard)
         self.dictationStyles = StyleCategory.loadStyles(from: .standard)
         self.isPressEnterVoiceCommandEnabled = isPressEnterVoiceCommandEnabled
         self.alertSoundsEnabled = alertSoundsEnabled
@@ -3139,12 +3147,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         parsedTranscript: TranscriptCommandParsingResult,
         isRetry: Bool = false,
         expandedSnippetCount: Int = 0,
+        taggedFileCount: Int = 0,
         fittedToCursor: Bool = false,
         transformStatusSuffix: String = ""
     ) -> String {
         CursorFormatting.processingStatus(
             outcome: outcome.statusMessage(isRetry: isRetry) + transformStatusSuffix,
             expandedSnippetCount: expandedSnippetCount,
+            taggedFileCount: taggedFileCount,
             fittedToCursor: fittedToCursor,
             pressEnterDetected: parsedTranscript.shouldPressEnterAfterPaste
         )
@@ -3246,17 +3256,19 @@ final class AppState: ObservableObject, @unchecked Sendable {
         cleanupLevel: CleanupLevel,
         style: DictationStyle? = nil,
         rawTranscriptForAIApp: Bool = false,
+        fileTaggingEnabled: Bool = false,
         webSearchEngine: WebSearchEngine
     ) async -> (
         finalTranscript: String,
         outcome: TranscriptProcessingOutcome,
         prompt: String,
-        expandedSnippetCount: Int
+        expandedSnippetCount: Int,
+        taggedFileCount: Int
     ) {
         let trimmedRawTranscript = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !trimmedRawTranscript.isEmpty else {
-            return ("", .skippedEmptyRawTranscript, "", 0)
+            return ("", .skippedEmptyRawTranscript, "", 0, 0)
         }
 
         if case .command(let invocation, let selectedText, let scope) = intent {
@@ -3266,10 +3278,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 if let url = webSearchEngine.url(for: query) {
                     await MainActor.run { _ = NSWorkspace.shared.open(url) }
                 }
-                return ("", .commandModeWebSearch, "", 0)
+                return ("", .commandModeWebSearch, "", 0, 0)
             case .noTarget:
                 // The spoken command is the result; the stop path copies it to the clipboard.
-                return (trimmedRawTranscript, .commandModeNoTarget, "", 0)
+                return (trimmedRawTranscript, .commandModeNoTarget, "", 0, 0)
             case .editText:
                 break
             }
@@ -3281,14 +3293,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     customVocabulary: customVocabulary,
                     outputLanguage: outputLanguage
                 )
-                return (result.transcript, .commandModeSucceeded(invocation: invocation), result.prompt, 0)
+                return (result.transcript, .commandModeSucceeded(invocation: invocation), result.prompt, 0, 0)
             } catch {
                 os_log(.error, log: recordingLog, "Edit mode failed: %{public}@", error.localizedDescription)
                 // Field text the user never selected is not a result: nothing to paste or Paste Again.
                 if case .wholeField = scope {
-                    return ("", .commandModeFailedWholeField, "", 0)
+                    return ("", .commandModeFailedWholeField, "", 0, 0)
                 }
-                return (selectedText, .commandModeFailedFallback(invocation: invocation), "", 0)
+                return (selectedText, .commandModeFailedFallback(invocation: invocation), "", 0, 0)
             }
         }
 
@@ -3298,11 +3310,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         if let macro = findMatchingMacro(for: correctedTranscript) {
             os_log(.info, log: recordingLog, "Voice macro triggered: %{public}@", macro.command)
-            return (macro.payload, .voiceMacro(command: macro.command), "", 0)
+            return (macro.payload, .voiceMacro(command: macro.command), "", 0, 0)
         }
 
-        let snippetPlan = SnippetExpansion.plan(for: correctedTranscript, snippets: precomputedSnippets)
-        let expandedSnippetCount = snippetPlan.expansions.count
+        let snippetMatches = SnippetExpansion.plan(for: correctedTranscript, snippets: precomputedSnippets)
+        // @-mentions reuse the snippet placeholders. A tag plan applies only when no correction
+        // or snippet changed this dictation (Wispr's limitation), so the two never share a plan.
+        let fileTagPlan = FileTagMatcher.dictationPlan(
+            correctedTranscript: correctedTranscript,
+            rawTranscript: trimmedRawTranscript,
+            snippetPlan: snippetMatches,
+            enabled: fileTaggingEnabled,
+            bundleIdentifier: context.textContext?.bundleIdentifier,
+            fileNames: context.textContext?.fileNames ?? []
+        )
+        let snippetPlan = fileTagPlan ?? snippetMatches
+        let expandedSnippetCount = snippetMatches.expansions.count
+        let taggedFileCount = fileTagPlan?.expansions.count ?? 0
 
         let preserveExactWording = cleanupLevel.skipsCleanup
         // Cleanup level None (the former preserve-exact-wording toggle). Two sub-cases so translation
@@ -3330,7 +3354,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     snippetPlan.expandedText,
                     preserveExactWording ? .preservedExactWording : .rawTranscriptInAIApp,
                     "",
-                    expandedSnippetCount
+                    expandedSnippetCount,
+                    taggedFileCount
                 )
             }
             do {
@@ -3347,14 +3372,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         snippetPlan.expandedText,
                         .verbatimTranslationDroppedSnippetPlaceholders,
                         result.prompt,
-                        expandedSnippetCount
+                        expandedSnippetCount,
+                        taggedFileCount
                     )
                 }
                 return (
                     resolved,
                     preserveExactWording ? .preservedExactWordingTranslated : .rawTranscriptInAIAppTranslated,
                     result.prompt,
-                    expandedSnippetCount
+                    expandedSnippetCount,
+                    taggedFileCount
                 )
             } catch {
                 os_log(.error, log: recordingLog,
@@ -3364,16 +3391,22 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     snippetPlan.expandedText,
                     .preservedExactWordingTranslationFailedFallback,
                     "",
-                    expandedSnippetCount
+                    expandedSnippetCount,
+                    taggedFileCount
                 )
             }
         }
 
         do {
+            let vocabulary = DictionaryCorrection.vocabularyText(customVocabulary, merging: dictionaryCorrections)
             let result = try await postProcessingService.postProcess(
                 transcript: snippetPlan.placeholderText,
                 context: context,
-                customVocabulary: DictionaryCorrection.vocabularyText(customVocabulary, merging: dictionaryCorrections),
+                customVocabulary: vocabulary,
+                // Screen text, so it goes in its own reference-only section, never the vocabulary.
+                screenIdentifiers: IdentifierExtractor.cleanupTerms(
+                    context.textContext?.codeIdentifiers ?? [], after: vocabulary
+                ),
                 customSystemPrompt: customSystemPrompt,
                 outputLanguage: outputLanguage,
                 dictationLanguage: dictationLanguage,
@@ -3391,13 +3424,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     snippetPlan.expandedText,
                     .postProcessingDroppedSnippetPlaceholders,
                     result.prompt,
-                    expandedSnippetCount
+                    expandedSnippetCount,
+                    taggedFileCount
                 )
             }
-            return (resolved, .postProcessingSucceeded, result.prompt, expandedSnippetCount)
+            return (resolved, .postProcessingSucceeded, result.prompt, expandedSnippetCount, taggedFileCount)
         } catch {
             os_log(.error, log: recordingLog, "Post-processing failed: %{public}@", error.localizedDescription)
-            return (snippetPlan.expandedText, .postProcessingFailedFallback, "", expandedSnippetCount)
+            return (snippetPlan.expandedText, .postProcessingFailedFallback, "", expandedSnippetCount, taggedFileCount)
         }
     }
 
@@ -3629,6 +3663,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         cleanupLevel: self.cleanupLevel,
                         style: dictationStyle,
                         rawTranscriptForAIApp: rawTranscriptForAIApp,
+                        fileTaggingEnabled: self.vibeCodingFileTaggingEnabled,
                         webSearchEngine: self.webSearchEngine
                     )
                     // Auto Apply After Dictation: runs on whatever the final transcript is (cleaned,
@@ -3698,7 +3733,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                     in: $0,
                                     keepCapitalized: CursorFormatting.keepCapitalizedTerms(
                                         from: DictionaryCorrection.vocabularyText(self.customVocabulary, merging: self.dictionaryCorrections)
-                                    )
+                                    ),
+                                    keepLowercase: Set($0.codeIdentifiers)
                                 )
                             }
                             : nil
@@ -3707,6 +3743,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             for: result.outcome,
                             parsedTranscript: parsedTranscript,
                             expandedSnippetCount: result.expandedSnippetCount,
+                            taggedFileCount: result.taggedFileCount,
                             fittedToCursor: cursorFit?.changedAnything == true,
                             transformStatusSuffix: recordedTransformStatusSuffix
                         )
@@ -4151,8 +4188,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
         lastContextScreenshotStatus = usesScreenshotContext
             ? "Collecting screenshot..."
             : AppContextService.textContextScreenshotStatus
+        // This recording's stream (startStreamingIfEnabled ran first); nil for any other provider.
+        let deepgram = realtimeService as? DeepgramStreamingService
 
-        contextCaptureTask = Task { [weak self] in
+        contextCaptureTask = Task { [weak self, weak deepgram] in
             guard let self else { return nil }
             let context = usesScreenshotContext
                 ? await self.contextService.collectContext()
@@ -4160,6 +4199,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
             // A cancelled capture (the session was aborted, or ended without
             // speech) must not publish over the state that replaced it.
             guard !Task.isCancelled else { return nil }
+            // Visible code names also reach the live Deepgram stream as keyterms.
+            if let identifiers = context.textContext?.codeIdentifiers, !identifiers.isEmpty {
+                deepgram?.updateKeyterms(identifiers)
+            }
             await MainActor.run {
                 guard !Task.isCancelled else { return }
                 self.capturedContext = context

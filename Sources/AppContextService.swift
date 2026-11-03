@@ -148,9 +148,15 @@ Return only two sentences, no labels, no markdown, no extra commentary.
     private static let nearbyMaxElements = 150
     private static let nearbyMaxDepth = 6
     private static let maxFullValueLength = 100_000
+    private static let codeContextBudgetSeconds: CFAbsoluteTime = 0.15
+    private static let codeContextMessagingTimeout: Float = 0.1
+    private static let codeContextMaxElements = 600
+    private static let codeContextMaxDepth = 40
 
     /// Reads Wispr-style context through Accessibility: app type, text around the cursor,
     /// and nearby labels. No screenshot and no model call; reads stop at a short budget.
+    /// In Cursor, Windsurf and VS Code it also collects file names and code identifiers
+    /// on a separate short budget.
     func collectTextContext(readFieldText: Bool) -> AppContext {
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
             return Self.textAppContext(snapshot: nil, appName: nil, bundleIdentifier: nil, windowTitle: nil)
@@ -178,6 +184,14 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             appElement: appElement,
             deadline: CFAbsoluteTimeGetCurrent() + Self.textContextBudgetSeconds
         )
+        if snapshot.omission == nil,
+           IdentifierExtractor.collectsCodeContext(bundleIdentifier: bundleIdentifier, category: snapshot.category) {
+            readCodeContext(
+                into: &snapshot,
+                appElement: appElement,
+                deadline: CFAbsoluteTimeGetCurrent() + Self.codeContextBudgetSeconds
+            )
+        }
         return Self.textAppContext(
             snapshot: snapshot, appName: appName, bundleIdentifier: bundleIdentifier, windowTitle: windowTitle
         )
@@ -323,6 +337,140 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         return TextContextCore.nearbyText(from: candidates, excluding: excluding)
     }
 
+    /// Code editors only: walks the focused window breadth-first for file names (window
+    /// title, tab and row titles and descriptions) and for identifiers in the visible text of
+    /// editors other than the focused field, whose text was already read. Skips secure fields
+    /// and reads no editor text while the window title shows a secrets file or folder, with or
+    /// without an extension (id_rsa, credentials, .ssh). Never writes an attribute and never
+    /// logs; the editor text stays local to this function, and the partial results stand when
+    /// the deadline passes.
+    private func readCodeContext(
+        into snapshot: inout TextContextSnapshot,
+        appElement: AXUIElement,
+        deadline: CFAbsoluteTime
+    ) {
+        var labels = [snapshot.windowTitle].compactMap { $0 }
+        let readsEditorText = !IdentifierExtractor.titleShowsSecretsFile(snapshot.windowTitle)
+        // Already read, so no extra calls; first, so they survive the identifier cap.
+        var editorTexts = readsEditorText
+            ? [snapshot.textBeforeCursor, snapshot.selectedText, snapshot.textAfterCursor, snapshot.nearbyText]
+                .compactMap { $0 }
+            : []
+        var remaining = IdentifierExtractor.maxEditorCharacters
+        defer {
+            snapshot.fileNames = IdentifierExtractor.fileNames(fromLabels: labels)
+            snapshot.codeIdentifiers = IdentifierExtractor.identifiers(in: editorTexts)
+        }
+
+        guard let window = accessibilityElement(
+            from: appElement, attribute: kAXFocusedWindowAttribute as CFString
+        ) else { return }
+        let focused = accessibilityElement(from: appElement, attribute: kAXFocusedUIElementAttribute as CFString)
+
+        var queue: [(element: AXUIElement, depth: Int)] = [(window, 0)]
+        var index = 0
+        while index < queue.count, index < Self.codeContextMaxElements, CFAbsoluteTimeGetCurrent() < deadline {
+            let (element, depth) = queue[index]
+            index += 1
+            AXUIElementSetMessagingTimeout(element, Self.codeContextMessagingTimeout)
+
+            let attributes = codeContextAttributes(of: element)
+            if attributes.subrole == kAXSecureTextFieldSubrole as String { continue }
+            labels += [attributes.title, attributes.description].compactMap { $0 }
+
+            if attributes.role == kAXTextAreaRole as String {
+                let isFocused = focused.map { CFEqual($0, element) } ?? false
+                if readsEditorText, remaining > 0, !isFocused,
+                   let text = visibleEditorText(from: element, limit: remaining) {
+                    editorTexts.append(text)
+                    remaining -= text.count
+                }
+                continue
+            }
+
+            guard depth < Self.codeContextMaxDepth, queue.count < Self.codeContextMaxElements * 2 else { continue }
+            for child in attributes.children {
+                queue.append((child, depth + 1))
+            }
+        }
+    }
+
+    private struct CodeContextAttributes {
+        let role: String?
+        let subrole: String?
+        let title: String?
+        let description: String?
+        let children: [AXUIElement]
+    }
+
+    /// One batched read per element. An attribute the element lacks comes back as an
+    /// AXValue error and reads as nil. When the batched call itself is refused, the
+    /// attributes are read one by one, unless the element timed out or is gone.
+    private func codeContextAttributes(of element: AXUIElement) -> CodeContextAttributes {
+        let names = [
+            kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXChildrenAttribute
+        ] as CFArray
+        var values: CFArray?
+        let result = AXUIElementCopyMultipleAttributeValues(
+            element, names, AXCopyMultipleAttributeOptions(rawValue: 0), &values
+        )
+        guard result == .success, let array = values as? [AnyObject], array.count == 5 else {
+            guard result != .cannotComplete, result != .invalidUIElement else {
+                return CodeContextAttributes(role: nil, subrole: nil, title: nil, description: nil, children: [])
+            }
+            return CodeContextAttributes(
+                role: accessibilityRawString(from: element, attribute: kAXRoleAttribute as CFString),
+                subrole: accessibilityRawString(from: element, attribute: kAXSubroleAttribute as CFString),
+                title: accessibilityRawString(from: element, attribute: kAXTitleAttribute as CFString),
+                description: accessibilityRawString(from: element, attribute: kAXDescriptionAttribute as CFString),
+                children: accessibilityChildren(of: element)
+            )
+        }
+
+        func usable(_ value: AnyObject) -> AnyObject? {
+            if CFGetTypeID(value) == AXValueGetTypeID(),
+               AXValueGetType(unsafeBitCast(value, to: AXValue.self)) == .axError {
+                return nil
+            }
+            return value
+        }
+        func string(_ value: AnyObject) -> String? {
+            guard let text = usable(value) as? String, !text.isEmpty else { return nil }
+            return text
+        }
+        let children = (usable(array[4]) as? [AnyObject] ?? []).compactMap { child in
+            CFGetTypeID(child) == AXUIElementGetTypeID() ? unsafeBitCast(child, to: AXUIElement.self) : nil
+        }
+        return CodeContextAttributes(
+            role: string(array[0]),
+            subrole: string(array[1]),
+            title: string(array[2]),
+            description: string(array[3]),
+            children: children
+        )
+    }
+
+    /// The visible part of an editor by range, else a prefix by range, else a value that is
+    /// not too large; never more than `limit` characters.
+    private func visibleEditorText(from element: AXUIElement, limit: Int) -> String? {
+        if let visible = accessibilityRange(from: element, attribute: kAXVisibleCharacterRangeAttribute as CFString),
+           visible.location != NSNotFound, visible.length > 0,
+           let text = accessibilityString(
+               from: element, range: NSRange(location: visible.location, length: min(visible.length, limit * 2))
+           ), !text.isEmpty {
+            return String(text.prefix(limit))
+        }
+        if let count = accessibilityInt(from: element, attribute: kAXNumberOfCharactersAttribute as CFString),
+           count > 0,
+           let text = accessibilityString(from: element, range: NSRange(location: 0, length: min(count, limit * 2))),
+           !text.isEmpty {
+            return String(text.prefix(limit))
+        }
+        guard let value = accessibilityTextValue(from: element), !value.isEmpty,
+              (value as NSString).length <= Self.maxFullValueLength else { return nil }
+        return String(value.prefix(limit))
+    }
+
     private func ancestor(of element: AXUIElement, role targetRole: String, deadline: CFAbsoluteTime) -> AXUIElement? {
         var current: AXUIElement? = element
         for _ in 0..<32 {
@@ -337,8 +485,12 @@ Return only two sentences, no labels, no markdown, no extra commentary.
     }
 
     private func accessibilitySelectedRange(from element: AXUIElement) -> NSRange? {
+        accessibilityRange(from: element, attribute: kAXSelectedTextRangeAttribute as CFString)
+    }
+
+    private func accessibilityRange(from element: AXUIElement, attribute: CFString) -> NSRange? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
               let rawValue = value,
               CFGetTypeID(rawValue) == AXValueGetTypeID() else { return nil }
         var range = CFRange()

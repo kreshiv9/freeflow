@@ -178,10 +178,13 @@ Behavior:
         self.transport = transport
     }
 
+    /// `screenIdentifiers` are code names read from the user's editor: untrusted text, so they
+    /// get their own reference-only section instead of joining the vocabulary.
     func postProcess(
         transcript: String,
         context: AppContext,
         customVocabulary: String,
+        screenIdentifiers: [String] = [],
         customSystemPrompt: String = "",
         outputLanguage: String = "",
         dictationLanguage: String = "",
@@ -206,6 +209,7 @@ Behavior:
                     transcript: transcript,
                     contextSection: context.promptSectionForPostProcessing,
                     customVocabulary: vocabularyTerms,
+                    screenIdentifiers: screenIdentifiers,
                     customSystemPrompt: customSystemPrompt,
                     outputLanguage: outputLanguage,
                     dictationLanguage: dictationLanguage,
@@ -346,6 +350,7 @@ Behavior:
         transcript: String,
         contextSection: String,
         customVocabulary: [String],
+        screenIdentifiers: [String] = [],
         customSystemPrompt: String = "",
         outputLanguage: String = "",
         dictationLanguage: String = "",
@@ -370,6 +375,7 @@ Behavior:
                 contextSection: contextSection,
                 model: primaryModel,
                 customVocabulary: customVocabulary,
+                screenIdentifiers: screenIdentifiers,
                 customSystemPrompt: customSystemPrompt,
                 outputLanguage: outputLanguage,
                 dictationLanguage: dictationLanguage,
@@ -421,6 +427,7 @@ Behavior:
                     contextSection: contextSection,
                     model: retryModel,
                     customVocabulary: customVocabulary,
+                    screenIdentifiers: screenIdentifiers,
                     customSystemPrompt: customSystemPrompt,
                     outputLanguage: outputLanguage,
                     dictationLanguage: dictationLanguage,
@@ -520,6 +527,7 @@ Behavior:
         contextSection: String,
         model: String,
         customVocabulary: [String],
+        screenIdentifiers: [String] = [],
         customSystemPrompt: String = "",
         outputLanguage: String = "",
         dictationLanguage: String = "",
@@ -556,6 +564,10 @@ Use these spellings exactly in the output when relevant:
         }
         if !vocabularyPrompt.isEmpty {
             systemPrompt += "\n\n" + vocabularyPrompt
+        }
+        let screenIdentifierText = normalizedVocabularyText(screenIdentifiers)
+        if !screenIdentifierText.isEmpty {
+            systemPrompt += "\n\n" + IdentifierExtractor.cleanupPromptHeader + "\n" + screenIdentifierText
         }
 
         let userMessage = """

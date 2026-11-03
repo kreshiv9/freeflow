@@ -833,6 +833,9 @@ struct GeneralSettingsView: View {
                 SettingsCard("Transforms", icon: "wand.and.stars") {
                     TransformsSettingsSection()
                 }
+                SettingsCard("Vibe coding", icon: "chevron.left.forwardslash.chevron.right") {
+                    VibeCodingSettingsSection()
+                }
                 SettingsCard("Cleanup", icon: "sparkles") {
                     cleanupSection
                 }
@@ -1498,7 +1501,7 @@ struct GeneralSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Context awareness", isOn: $appState.contextAwarenessEnabled)
 
-            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. Password fields, browser address bars, password managers, and banking sites are skipped. Reading is skipped if it takes too long, so dictation is never slowed down.")
+            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. In Cursor, Windsurf and VS Code it also reads file names and the variable and function names visible in other editor panes; those names are sent with the cleanup request and, with Deepgram streaming, to Deepgram as key terms. Password fields, browser address bars, password managers, and banking sites are skipped. Reading is skipped if it takes too long, so dictation is never slowed down.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

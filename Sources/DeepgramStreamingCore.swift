@@ -143,6 +143,36 @@ enum DeepgramStreamingCore {
         normalizedKeyterms(text.components(separatedBy: CharacterSet(charactersIn: "\n\r,;")))
     }
 
+    /// Code identifiers added to one stream's keyterms, at most.
+    static let maxContextKeyterms = 50
+
+    /// The stream's own keyterms followed by up to maxContextKeyterms identifiers, normalized,
+    /// so the vocabulary terms always survive maxKeyterms and maxKeytermTotalCharacters.
+    /// Dotted member paths are never spoken, so they are left out. nil when nothing new
+    /// would be added: then no update is sent.
+    static func mergedKeyterms(base: [String], adding identifiers: [String]) -> [String]? {
+        let current = normalizedKeyterms(base)
+        let merged = normalizedKeyterms(current + identifiers.filter { !$0.contains(".") }.prefix(maxContextKeyterms))
+        return merged == current ? nil : merged
+    }
+
+    /// `{"keyterms":[...],"type":"Configure"}`, or nil when no keyterm survives
+    /// normalization. Per developers.deepgram.com/docs/configure (Nova-3 only), the list
+    /// replaces the stream's whole keyterm list, URL keyterms included. Deepgram answers
+    /// ConfigureSuccess or ConfigureFailure (CONFIGURE_ALREADY_PENDING,
+    /// CONFIGURE_KEYTERM_LIMIT_EXCEEDED, …) and keeps its previous settings on failure;
+    /// both replies parse as .unknown and are ignored. Only an unknown field produces an
+    /// Error frame, and this message carries only `type` and `keyterms`.
+    static func configureMessage(keyterms: [String]) -> String? {
+        let normalized = normalizedKeyterms(keyterms)
+        guard !normalized.isEmpty,
+              let data = try? JSONSerialization.data(
+                  withJSONObject: ["type": "Configure", "keyterms": normalized],
+                  options: [.sortedKeys, .withoutEscapingSlashes]
+              ) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     /// sampleRate * 2 bytes * maxPendingAudioSeconds.
     static func maxPendingAudioBytes(sampleRate: Int) -> Int {
         sampleRate * MemoryLayout<Int16>.size * maxPendingAudioSeconds

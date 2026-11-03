@@ -39,7 +39,9 @@ enum TextContextOmission: String, Equatable, Sendable {
 }
 
 /// Text read around the cursor for one dictation. It is never written anywhere except the
-/// local run history, and it is sent to the provider only inside the cleanup prompt.
+/// local run history, and it is sent to the provider only inside the cleanup prompt. In
+/// Cursor, Windsurf and VS Code the extracted `codeIdentifiers` also go to cleanup as a
+/// spelling reference and, with Deepgram streaming, to Deepgram as keyterms.
 struct TextContextSnapshot: Equatable, Sendable {
     var appName: String?
     var bundleIdentifier: String?
@@ -54,6 +56,14 @@ struct TextContextSnapshot: Equatable, Sendable {
     /// True once the field's text was read, even when every slice came back empty, so an
     /// empty field is told apart from one that could not be read.
     var fieldTextRead = false
+    /// Cursor, Windsurf and VS Code only: code names from visible editor text, sent only in
+    /// the cleanup prompt's reference-only section and as Deepgram keyterms. The editor text
+    /// itself is never kept. Not rendered by `promptSection(for:)`; the snapshot field is never
+    /// persisted, though the Run Log's stored cleanup prompt shows the names sent.
+    var codeIdentifiers: [String] = []
+    /// Cursor, Windsurf and VS Code only: file names from the window title, tabs and visible
+    /// rows, used only for local @-mention tagging. Not rendered or persisted.
+    var fileNames: [String] = []
 }
 
 struct CursorTextSlices: Equatable {
