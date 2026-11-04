@@ -10,7 +10,6 @@ final class RecordingOverlayState: ObservableObject {
     @Published var audioLevel: Float = 0.0
     @Published var recordingTriggerMode: RecordingTriggerMode = .hold
     @Published var isCommandMode = false
-    @Published var updateVersion: String = ""
     @Published var errorMessage: String?
     @Published var toastID: UUID?
 }
@@ -20,7 +19,6 @@ enum OverlayPhase {
     case recording
     case transcribing
     case feedback
-    case updateAvailable
 }
 
 // MARK: - NSScreen Helpers
@@ -80,7 +78,6 @@ final class RecordingOverlayManager {
     private var lockedOverlayWidth: CGFloat?
 
     var onStopButtonPressed: (() -> Void)?
-    var onUpdateOverlayPressed: (() -> Void)?
 
     /// The screen the overlay should drop down on. The user picks one of
     /// three modes in Settings, stored in UserDefaults under
@@ -126,8 +123,7 @@ final class RecordingOverlayManager {
     }
 
     private var overlayAcceptsMouseEvents: Bool {
-        (overlayState.phase == .recording && overlayState.recordingTriggerMode == .toggle)
-            || overlayState.phase == .updateAvailable
+        overlayState.phase == .recording && overlayState.recordingTriggerMode == .toggle
     }
 
     func showInitializing(mode: RecordingTriggerMode = .hold, isCommandMode: Bool = false) {
@@ -243,16 +239,6 @@ final class RecordingOverlayManager {
         }
     }
 
-    func showUpdateAvailable(version: String) {
-        DispatchQueue.main.async {
-            self.lockedOverlayWidth = nil
-            self.overlayState.isCommandMode = false
-            self.overlayState.updateVersion = version
-            self.overlayState.phase = .updateAvailable
-            self.showOverlayPanel(animatedResize: true)
-        }
-    }
-
     func dismiss() {
         DispatchQueue.main.async {
             self.dismissAll()
@@ -336,9 +322,6 @@ final class RecordingOverlayManager {
                     state: overlayState,
                     onStopButtonPressed: { [weak self] in
                         self?.onStopButtonPressed?()
-                    },
-                    onUpdateOverlayPressed: { [weak self] in
-                        self?.onUpdateOverlayPressed?()
                     }
                 )
                 .padding(.top, screenHasNotch ? notchOverlap : 0)
@@ -360,8 +343,7 @@ final class RecordingOverlayManager {
     }
 
     /// True iff the overlay renders as wings flanking the notch (notched display
-    /// + use_compact_overlay on). updateAvailable and error toasts still use
-    /// the drop-down pill.
+    /// + use_compact_overlay on). Error toasts still use the drop-down pill.
     private var useWingedLayout: Bool {
         guard screenHasNotch else { return false }
         let useCompact = (UserDefaults.standard.object(forKey: "use_compact_overlay") as? Bool) ?? true
@@ -371,8 +353,6 @@ final class RecordingOverlayManager {
             return true
         case .feedback:
             return overlayState.errorMessage?.isEmpty ?? true
-        case .updateAvailable:
-            return false
         }
     }
 
@@ -441,12 +421,6 @@ final class RecordingOverlayManager {
             return max(notchWidth, feedbackWidth)
         }
 
-        if overlayState.phase == .updateAvailable {
-            let updateWidth: CGFloat = 190
-            guard screenHasNotch else { return updateWidth }
-            return max(notchWidth, updateWidth)
-        }
-
         let commandModeWidth: CGFloat = 180
         let toggleWidth: CGFloat = 150
         let defaultWidth: CGFloat = 92
@@ -478,7 +452,6 @@ final class RecordingOverlayManager {
         lockedOverlayWidth = nil
         overlayState.recordingStartedAt = nil
         overlayState.isCommandMode = false
-        overlayState.updateVersion = ""
         if let panel = overlayWindow {
             panel.orderOut(nil)
             // orderOut alone leaves the panel retained in NSApp.windows with its
@@ -959,7 +932,6 @@ struct InitializingDotsView: View {
 struct RecordingOverlayView: View {
     @ObservedObject var state: RecordingOverlayState
     let onStopButtonPressed: () -> Void
-    let onUpdateOverlayPressed: () -> Void
 
     private var leadingAccessoryWidth: CGFloat {
         guard showsLiveRecordingContent && state.showsRecordingTimer else { return 24 }
@@ -981,8 +953,6 @@ struct RecordingOverlayView: View {
                 ErrorOverlayView(message: message)
             } else if state.phase == .feedback {
                 FailureIndicatorView()
-            } else if state.phase == .updateAvailable {
-                UpdateAvailableOverlayView(onPress: onUpdateOverlayPressed)
             } else {
                 ZStack {
                     Group {
@@ -1112,26 +1082,5 @@ struct ErrorOverlayView: View {
                 .truncationMode(.tail)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-    }
-}
-
-struct UpdateAvailableOverlayView: View {
-    let onPress: () -> Void
-
-    var body: some View {
-        Button(action: onPress) {
-            HStack(spacing: 7) {
-                Image(systemName: "arrow.down.circle.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
-
-                Text("Update Available")
-                    .font(.system(size: 11, weight: .semibold))
-                    .lineLimit(1)
-            }
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .buttonStyle(.plain)
     }
 }
