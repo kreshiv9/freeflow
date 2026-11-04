@@ -20,6 +20,9 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AppName.swift \
 	Sources/AppTextInsertionCore.swift \
 	Sources/AppTextInsertionTarget.swift \
+	Sources/AssemblyAIPromptScenario.swift \
+	Sources/AssemblyAIStreamingCore.swift \
+	Sources/AssemblyAIStreamingService.swift \
 	Sources/AudioLevelMeter.swift \
 	Sources/CaptureBackendPreference.swift \
 	Sources/CaptureFormatPreference.swift \

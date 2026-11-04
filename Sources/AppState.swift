@@ -241,6 +241,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let transcriptionAPIURLStorageKey = "transcription_api_url"
     private let transcriptionAPIKeyStorageKey = "transcription_api_key"
     private let deepgramAPIKeyStorageKey = "deepgram_api_key"
+    private let assemblyAIAPIKeyStorageKey = AssemblyAIStreamingCore.apiKeyAccount
     private let postProcessingModelStorageKey = "post_processing_model"
     private let postProcessingFallbackModelStorageKey = "post_processing_fallback_model"
     private let contextModelStorageKey = "context_model"
@@ -361,6 +362,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// Deepgram key for the streaming provider; separate from the OpenAI-compatible key pair.
     @Published var deepgramAPIKey: String {
         didSet { persistOptionalAPIValue(deepgramAPIKey, account: deepgramAPIKeyStorageKey) }
+    }
+
+    /// AssemblyAI key for the streaming provider; a Keychain secret like the Deepgram key.
+    @Published var assemblyAIAPIKey: String {
+        didSet { persistOptionalAPIValue(assemblyAIAPIKey, account: assemblyAIAPIKeyStorageKey) }
     }
 
     // Publish only after the complete configuration transaction has persisted.
@@ -849,7 +855,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var pendingManualCommandInvocation = false
     private var pendingShortcutStartTask: Task<Void, Never>?
     private var pendingShortcutStartMode: RecordingTriggerMode?
-    /// The active streaming session (OpenAI Realtime or Deepgram); nil when streaming is off or failed to start.
+    /// The active streaming session (OpenAI Realtime, Deepgram or AssemblyAI); nil when streaming is off or failed to start.
     private var realtimeService: StreamingTranscriptionSession?
     private var automaticTerminationDisabled = false
     private var activeAudioInterruption: ActiveAudioInterruption?
@@ -880,6 +886,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let transcriptionAPIURL = Self.loadOptionalStoredAPIValue(account: transcriptionAPIURLStorageKey)
         let transcriptionAPIKey = Self.loadStoredAPIKey(account: transcriptionAPIKeyStorageKey)
         let deepgramAPIKey = Self.loadOptionalStoredAPIValue(account: deepgramAPIKeyStorageKey)
+        let assemblyAIAPIKey = Self.loadOptionalStoredAPIValue(account: assemblyAIAPIKeyStorageKey)
         let postProcessingModel = UserDefaults.standard.string(forKey: postProcessingModelStorageKey) ?? Self.defaultPostProcessingModel
         let postProcessingFallbackModel = Self.loadStoredPostProcessingFallbackModel(
             key: postProcessingFallbackModelStorageKey,
@@ -1009,6 +1016,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.transcriptionAPIURL = transcriptionAPIURL
         self.transcriptionAPIKey = transcriptionAPIKey
         self.deepgramAPIKey = deepgramAPIKey
+        self.assemblyAIAPIKey = assemblyAIAPIKey
         self.committedAPIConfiguration = ValidatedAPIConfiguration(
             apiKey: apiKey,
             baseURL: apiBaseURL,
@@ -3611,7 +3619,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
             } catch {
                 try Task.checkCancellation()
                 let text = try await fileService.transcribe(fileURL: fileURL)
-                return (text, PipelineStageTimings.fileFallbackTranscriptionSource)
+                // AssemblyAI's reasons are fixed, text-free strings; other streams keep the plain label.
+                return (text, PipelineStageTimings.fileFallbackSource(
+                    reason: (error as? AssemblyAIStreamingError)?.errorDescription
+                ))
             }
         }
         let text = try await fileService.transcribe(fileURL: fileURL)
@@ -3709,8 +3720,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 streamingSession?.cancel()
             }
             let activeRealtime = streamFailed ? nil : streamingSession
-            // Lets Deepgram fall back to the file when its stream returns no words for counted speech.
-            (activeRealtime as? DeepgramStreamingService)?.setRecorderHeardSpeech(speechActivity.hasSpeech)
+            // Lets Deepgram or AssemblyAI fall back to the file when its stream returns no words for counted speech.
+            (activeRealtime as? KeytermStreamingSession)?.setRecorderHeardSpeech(speechActivity.hasSpeech)
             self.transcriptionTask?.cancel()
             guard self.isTranscribing else {
                 if let savedAudioFile {
@@ -3770,7 +3781,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     let resolved = try await resolvedTranscript
                     stageMarks.transcriptionFinished = CFAbsoluteTimeGetCurrent()
                     stageMarks.transcriptionSource = resolved.source
-                    if let report = (activeRealtime as? DeepgramStreamingService)?.keytermReport {
+                    if let report = (activeRealtime as? KeytermStreamingSession)?.keytermReport {
                         stageMarks.keytermsAtConnect = report.connectCount
                         stageMarks.screenKeyterms = report.screenCount
                         stageMarks.codeKeyterms = report.identifierCount
@@ -4264,6 +4275,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case .deepgram:
             guard let deepgram = makeDeepgramStreamingService() else { return }
             service = deepgram
+        case .assemblyAI:
+            guard let assemblyAI = makeAssemblyAIStreamingService() else { return }
+            service = assemblyAI
         }
         do {
             try service.start()
@@ -4309,16 +4323,56 @@ final class AppState: ObservableObject, @unchecked Sendable {
             apiKey: key,
             language: resolvedTranscriptionLanguage,
             sampleRate: StreamingTranscriptionProvider.deepgramSampleRate,
-            keyterms: DeepgramStreamingCore.KeytermPlan.connectTerms(.init(
-                correctionTargets: dictionaryCorrections.map(\.normalized).filter(\.isUsable).map(\.to),
-                vocabulary: DeepgramStreamingCore.keyterms(fromVocabularyText: customVocabulary),
-                // Context Awareness is the user's switch for every screen and account keyterm.
-                ownName: DeepgramStreamingCore.KeytermPlan.sendsOwnName && contextAwarenessEnabled
-                    ? Self.ownNameKeyterms
-                    : []
-            ))
+            keyterms: streamingConnectKeyterms
         )
         return DeepgramStreamingService(config: config)
+    }
+
+    /// The connect keyterms Deepgram and AssemblyAI share: correction targets, Custom
+    /// Vocabulary, then the own name, ranked by KeytermPlan. AssemblyAI applies its own caps.
+    private var streamingConnectKeyterms: [String] {
+        DeepgramStreamingCore.KeytermPlan.connectTerms(.init(
+            correctionTargets: dictionaryCorrections.map(\.normalized).filter(\.isUsable).map(\.to),
+            vocabulary: DeepgramStreamingCore.keyterms(fromVocabularyText: customVocabulary),
+            // Context Awareness is the user's switch for every screen and account keyterm.
+            ownName: DeepgramStreamingCore.KeytermPlan.sendsOwnName && contextAwarenessEnabled
+                ? Self.ownNameKeyterms
+                : []
+        ))
+    }
+
+    /// Nil without a key, or for a Transcription Language AssemblyAI does not list: the
+    /// dictation then takes the file-upload path. Auto-detect pins English. The hidden
+    /// overrides (AssemblyAIStreamingCore.Overrides) are read at each connect.
+    private func makeAssemblyAIStreamingService() -> AssemblyAIStreamingService? {
+        let key = assemblyAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            os_log(.info, log: recordingLog, "assemblyai streaming selected but no API key is set — using file upload")
+            return nil
+        }
+        guard let languageCode = AssemblyAIStreamingCore.languageCode(for: resolvedTranscriptionLanguage) else {
+            os_log(.info, log: recordingLog, "assemblyai streaming does not list the selected language — using file upload")
+            return nil
+        }
+        let overrides = AssemblyAIStreamingCore.Overrides.load(from: .standard)
+        // From the bundle only at connect; text context refines it once with the page's domain.
+        // Context Awareness off keeps the default template, so nothing derived from the screen is sent.
+        let scenario: AssemblyAIStreamingCore.PromptScenario = contextAwarenessEnabled
+            ? .resolve(bundleIdentifier: activeRecordingBundleIdentifier, websiteDomain: nil)
+            : .dictation
+        let config = AssemblyAIStreamingCore.Configuration(
+            apiKey: key,
+            languageCode: languageCode,
+            sampleRate: StreamingTranscriptionProvider.assemblyAISampleRate,
+            keyterms: overrides.keytermsEnabled ? streamingConnectKeyterms : [],
+            keytermsEnabled: overrides.keytermsEnabled,
+            // The templates are English, so another language gets none.
+            promptScenario: overrides.promptEnabled && languageCode == AssemblyAIStreamingCore.defaultLanguage
+                ? scenario
+                : nil,
+            mode: overrides.mode
+        )
+        return AssemblyAIStreamingService(config: config)
     }
 
     /// The Mac account's first and full name for the Deepgram connect keyterms, computed once
@@ -4328,11 +4382,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
         fullName: NSFullUserName(), everyday: EverydayWords.all
     )
 
-    /// Only Deepgram streaming with Context Awareness uses the word list, the secret and name
+    /// Only Deepgram or AssemblyAI streaming with Context Awareness uses the word list, the secret and name
     /// patterns, the name tagger and the own-name keyterms; this builds them on a utility
     /// queue whenever both become true, so no dictation pays for them on main. Idempotent.
     private func warmUpSpeechTermsIfNeeded() {
-        guard contextAwarenessEnabled, streamingProvider == .deepgram else { return }
+        guard contextAwarenessEnabled, streamingProvider.usesContextKeyterms else { return }
         NameExtractor.prewarm()
         DispatchQueue.global(qos: .utility).async { _ = Self.ownNameKeyterms }
     }
@@ -4380,22 +4434,29 @@ final class AppState: ObservableObject, @unchecked Sendable {
             ? "Collecting screenshot..."
             : AppContextService.textContextScreenshotStatus
         // This recording's stream (startStreamingIfEnabled ran first); nil for any other provider.
-        let deepgram = realtimeService as? DeepgramStreamingService
-        let wantsSpeechTerms = deepgram != nil
+        let keytermStream = realtimeService as? KeytermStreamingSession
+        let wantsSpeechTerms = keytermStream != nil
         let startedAt = CFAbsoluteTimeGetCurrent()
 
-        contextCaptureTask = Task { [weak self, weak deepgram] in
+        contextCaptureTask = Task { [weak self, weak keytermStream] in
             guard let self else { return nil }
-            // On-screen names and visible code names reach the live Deepgram stream as keyterms,
-            // in one Configure sent as soon as they are ready.
+            // On-screen names and visible code names reach the live Deepgram or AssemblyAI stream
+            // as keyterms, in one update sent as soon as they are ready.
             let context = usesScreenshotContext
                 ? await self.contextService.collectContext()
                 : self.contextService.collectTextContext(
                     readFieldText: readsFieldText, wantsSpeechTerms: wantsSpeechTerms
                 ) { screenTerms, identifiers in
                     guard !Task.isCancelled else { return }
-                    deepgram?.updateKeyterms(screenTerms: screenTerms, identifiers: identifiers)
+                    keytermStream?.updateKeyterms(screenTerms: screenTerms, identifiers: identifiers)
                 }
+            // AssemblyAI's scenario prompt, refined from the bundle and page domain only (text
+            // context exists only with Context Awareness on).
+            if !Task.isCancelled, let snapshot = context.textContext {
+                (keytermStream as? AssemblyAIStreamingService)?.updatePromptScenario(.resolve(
+                    bundleIdentifier: snapshot.bundleIdentifier, websiteDomain: snapshot.websiteDomain
+                ))
+            }
             os_log(
                 .info, log: recordingLog, "context ready +%.0f ms after recording start",
                 (CFAbsoluteTimeGetCurrent() - startedAt) * 1000

@@ -23,6 +23,7 @@ enum DeepgramStreamingCoreTests {
         testConfigureMessage()
         testKeytermPlanConnectTerms()
         testKeytermPlanConfigureTerms()
+        testRequestsPinnedForSharedKeytermSeam()
         testAudioMilliseconds()
         testConfigureRepliesAreIgnored()
         testPendingAudioLimit()
@@ -366,6 +367,32 @@ enum DeepgramStreamingCoreTests {
         TestSupport.expectEqual(filled?.screenCount, 10)
         TestSupport.expectEqual(filled?.identifierCount, 5)
         TestSupport.expectEqual(filled.map { Array($0.terms.suffix(15)) }, names + Array(identifiers.prefix(5)))
+    }
+
+    /// Golden bytes for Deepgram's connect URL and its one Configure, so the keyterm seam
+    /// AppState now shares with AssemblyAI provably leaves Deepgram's requests unchanged.
+    private static func testRequestsPinnedForSharedKeytermSeam() {
+        let connect = ["Wispr Flow", "Synthetic Term", "C#"]
+        TestSupport.expectEqual(
+            query(for: configuration(language: nil, sampleRate: 16000, keyterms: connect)),
+            "model=nova-3&language=en&encoding=linear16&sample_rate=16000&channels=1&smart_format=true"
+                + "&punctuate=true&interim_results=true&endpointing=500&mip_opt_out=true"
+                + "&keyterm=Wispr%20Flow&keyterm=Synthetic%20Term&keyterm=C%23"
+        )
+        let plan = Core.KeytermPlan.configureTerms(
+            connect: connect,
+            screenTerms: [
+                "Supabase", "devbox.example.internal", "gh" + "p_" + String(repeating: "FAKEfake", count: 4),
+                "Kai Example",
+            ],
+            identifiers: ["useAuth", "appState.isRecording"]
+        )
+        TestSupport.expectEqual(plan?.screenCount, 2)
+        TestSupport.expectEqual(plan?.identifierCount, 1)
+        TestSupport.expectEqual(
+            plan.flatMap { Core.configureMessage(keyterms: $0.terms) },
+            #"{"keyterms":["Wispr Flow","Synthetic Term","C#","Supabase","Kai Example","useAuth"],"type":"Configure"}"#
+        )
     }
 
     private static func testAudioMilliseconds() {

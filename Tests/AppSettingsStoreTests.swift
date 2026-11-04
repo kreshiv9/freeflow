@@ -48,6 +48,8 @@ enum AppSettingsStoreTests {
     private static let groq = "groq_api_key"
     private static let transcription = "transcription_api_key"
     private static let deepgram = "deepgram_api_key"
+    /// The account AppState uses, so the test covers the app's real key path.
+    private static let assemblyAI = AssemblyAIStreamingCore.apiKeyAccount
     private static let baseURL = "api_base_url"
     private static let transcriptionURL = "transcription_api_url"
 
@@ -70,10 +72,12 @@ enum AppSettingsStoreTests {
         testUnchangedSaveSkipsKeychain()
         testSaveWithFileCopyStillWritesKeychain()
         testFailedReadForgetsKnownKeychainValue()
+        testAssemblyAIKeyGoesToKeychain()
     }
 
     private static func testSecretClassification() {
-        for account in [groq, transcription, deepgram] {
+        TestSupport.expectEqual(assemblyAI, "assemblyai_api_key")
+        for account in [groq, transcription, deepgram, assemblyAI] {
             TestSupport.expect(AppSettingsStore.isSecret(account), "\(account) must be stored as a secret")
         }
         for account in [baseURL, transcriptionURL] {
@@ -406,6 +410,28 @@ enum AppSettingsStoreTests {
     }
 
     // MARK: - Helpers
+
+    /// The AssemblyAI key takes the secret path: the Keychain, never the plain settings file.
+    private static func testAssemblyAIKeyGoesToKeychain() {
+        withStore { store, keychain in
+            store.save("synthetic-assemblyai-key", account: assemblyAI)
+            TestSupport.expectEqual(keychain.items, [assemblyAI: "synthetic-assemblyai-key"])
+            TestSupport.expect(!settingsFileExists(store), "The AssemblyAI key must not be written to the settings file")
+            TestSupport.expectEqual(store.load(account: assemblyAI), "synthetic-assemblyai-key")
+
+            store.delete(account: assemblyAI)
+            TestSupport.expectEqual(keychain.items, [:])
+            TestSupport.expectEqual(store.load(account: assemblyAI), nil)
+        }
+        withStore { store, keychain in
+            writeSettingsFile([assemblyAI: "synthetic-assemblyai-key"], for: store)
+
+            store.migrateFileSecretsToKeychain()
+
+            TestSupport.expectEqual(keychain.items, [assemblyAI: "synthetic-assemblyai-key"])
+            TestSupport.expect(!settingsFileExists(store), "A migrated AssemblyAI key must leave no settings file")
+        }
+    }
 
     private static func withStore(_ body: (AppSettingsStore, FakeKeychain) -> Void) {
         let directory = FileManager.default.temporaryDirectory
