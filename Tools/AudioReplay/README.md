@@ -247,16 +247,20 @@ At the end it prints a table with one row per variant:
 - **KT false**: keyterm occurrences in the transcript beyond those in the
   reference. Over-boosted vocabulary shows up here.
 - **Overlaps**: finalized segments whose first word starts before the previous
-  segment's last word ends. The app joins segments as they come, so overlaps can
-  become duplicated words.
+  segment's last word ends. The app drops a final that only repeats audio it
+  already finalized, and a final that Deepgram re-sends from an earlier start
+  replaces every final from that start on. Only a final that starts partway
+  through an earlier one can still become duplicated words.
 - **from_finalize p50/p95 ms**: milliseconds from the last audio frame to
   Deepgram's first `from_finalize` result, as the median and the 95th
   percentile. Deepgram sometimes sends none when little audio is left; those
   runs are left out.
 - **Metadata p50/p95 ms**: the same, up to Deepgram's closing `Metadata`
   message.
-- **Unfinal**: runs that ended with words Deepgram heard but never finalized.
-  This is what makes the app fall back to the Groq file upload.
+- **Unfinal**: runs whose latest interim result still had words Deepgram never
+  finalized. The app pastes those words after the finals instead of uploading
+  the file, and its Run Log then shows `deepgram-final+interim-tail`. WER scores
+  the finals only, so these tail words count as missing words here.
 - **Failed**: runs that were not `ok`.
 
 Below the table, the "Paired vs <baseline>" section compares each variant with

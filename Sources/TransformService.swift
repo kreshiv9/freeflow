@@ -11,9 +11,10 @@ final class TransformService {
     private let preferredFallbackModel: String
     private let instructionExecutionGuardEnabled: Bool
     private let transport: PostProcessingService.Transport
-    private let defaultModel = "openai/gpt-oss-20b"
-    private let defaultFallbackModel = "qwen/qwen3.8-27b"
-    private let defaultModelReasoningEffort = "low"
+    // The cleanup defaults, so a blank setting picks the same pair in both services.
+    private let defaultModel = ModelConfiguration.defaultCleanupModel
+    private let defaultFallbackModel = ModelConfiguration.defaultCleanupFallbackModel
+    private let defaultModelReasoningEffort = "none"
     private let maxCompletionTokens = 4096
     private var timeoutSeconds: TimeInterval {
         let override = UserDefaults.standard.double(forKey: "post_processing_timeout_seconds")
@@ -105,6 +106,9 @@ final class TransformService {
         preferredModel.isEmpty ? defaultModel : preferredModel
     }
 
+    /// Same rule as `PostProcessingService`: a set fallback is the explicit retry model, and
+    /// one equal to the primary means no retry (Settings moves it on Groq, see
+    /// `ModelConfiguration.cleanupFallback`). Only a blank fallback pairs the built-in models.
     private func resolvedRetryModel(for primaryModel: String) -> String? {
         if !preferredFallbackModel.isEmpty {
             return preferredFallbackModel == primaryModel ? nil : preferredFallbackModel

@@ -23,6 +23,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AudioLevelMeter.swift \
 	Sources/CaptureBackendPreference.swift \
 	Sources/CaptureFormatPreference.swift \
+	Sources/CleanupFastPath.swift \
 	Sources/CleanupLevel.swift \
 	Sources/CommandModeIntent.swift \
 	Sources/ContextInferenceFailure.swift \
@@ -37,6 +38,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/FileTagMatcher.swift \
 	Sources/HandsFreeAutoStop.swift \
 	Sources/IdentifierExtractor.swift \
+	Sources/KeychainStorage.swift \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
 	Sources/LearnedVocabulary.swift \

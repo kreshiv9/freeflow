@@ -37,7 +37,11 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     private typealias CommitPolicy = DeepgramStreamingCore.CommitPolicy
     private typealias KeepAlivePolicy = DeepgramStreamingCore.KeepAlivePolicy
 
-    let transcriptionSource = PipelineStageTimings.deepgramTranscriptionSource
+    /// "deepgram" until the commit resolves, then the path that produced the text.
+    /// Read only off stateQueue (after the commit's await, or on the main thread).
+    var transcriptionSource: String {
+        stateQueue.sync { resolvedPath?.rawValue ?? PipelineStageTimings.deepgramTranscriptionSource }
+    }
 
     private let config: Configuration
     private let maxPendingAudioBytes: Int
@@ -65,6 +69,11 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     private var serverCloseCode: Int?
     private var commitStartedAt: TimeInterval?
     private var finalContinuation: CheckedContinuation<String, Error>?
+    /// Set when the commit resolves; the Run Log source label.
+    private var resolvedPath: CommitPolicy.TranscriptPath?
+    /// The recorder's speech tracker verdict, set on stop. True until then, so an
+    /// empty stream whose verdict never arrived tries the file instead of dropping speech.
+    private var recorderHeardSpeech = true
     private var terminalError: DeepgramStreamingError?
     private var closed = false
     private var keytermUpdateRequested = false
@@ -181,12 +190,21 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         }
     }
 
+    /// Whether the recorder's speech tracker counted speech in this recording.
+    /// Called on stop, before commitAndAwaitFinal; an empty stream transcript
+    /// for counted speech falls back to the file upload.
+    func setRecorderHeardSpeech(_ heardSpeech: Bool) {
+        stateQueue.async { [self] in
+            recorderHeardSpeech = heardSpeech
+        }
+    }
+
     /// Send any partial audio frame, then Finalize and CloseStream, then wait
-    /// for Metadata or the close within CommitPolicy.timeout. Throws when the
-    /// server cannot have heard anything so the file upload starts at once
-    /// instead of after the timeout; every early throw tears the socket down
-    /// so a late handshake cannot flush the buffered audio to a stream nobody
-    /// is waiting on.
+    /// for the from_finalize final, Metadata or the close within
+    /// CommitPolicy.timeout. Throws when the server cannot have heard anything
+    /// so the file upload starts at once instead of after the timeout; every
+    /// early throw tears the socket down so a late handshake cannot flush the
+    /// buffered audio to a stream nobody is waiting on.
     func commitAndAwaitFinal() async throws -> String {
         let commitTask: URLSessionWebSocketTask = try stateQueue.sync {
             if let terminalError {
@@ -450,18 +468,20 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
             assembler: assembler,
             socketState: socketState,
             serverErrorMessage: serverErrorMessage,
-            elapsedSinceCommit: elapsed
+            elapsedSinceCommit: elapsed,
+            recorderHeardSpeech: recorderHeardSpeech
         )
         switch decision {
         case .wait:
             return
-        case .resolve(let text):
+        case .resolve(let text, let path):
             finalContinuation = nil
+            resolvedPath = path
             teardownLocked()
             os_log(
                 .info, log: deepgramLog,
-                "resolved after %d results: %d characters",
-                assembler.resultCount, text.count
+                "resolved via %{public}@ after %d results: %d characters",
+                path.rawValue, assembler.resultCount, text.count
             )
             continuation.resume(returning: text)
         case .fallBack(let error):

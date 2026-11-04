@@ -9,6 +9,16 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
     static let realtimeTranscriptionSource = "realtime"
     static let fileTranscriptionSource = "file"
     static let deepgramTranscriptionSource = "deepgram"
+    /// A streaming session failed, at its commit or earlier when its audio
+    /// conversion failed, and the recording's file upload produced the
+    /// transcript. A stream that never started leaves the label file.
+    static let fileFallbackTranscriptionSource = "file-fallback"
+
+    /// The label for a file upload made without a streaming commit:
+    /// file-fallback when this recording's stream was abandoned, file otherwise.
+    static func fileUploadSource(streamAbandoned: Bool) -> String {
+        streamAbandoned ? fileFallbackTranscriptionSource : fileTranscriptionSource
+    }
 
     /// Shortcut release until the audio file is ready for transcription.
     var audioFinalizeMilliseconds: Int? = nil

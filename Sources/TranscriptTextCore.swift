@@ -373,7 +373,8 @@ enum TranscriptOutputSanitizer {
     ]
 
     /// Explicit self-corrections legitimately delete the abandoned wording, so the guard steps aside.
-    private static let backtrackMarkerPattern =
+    /// The cleanup fast path reuses it to send any self-correction to the model.
+    static let backtrackMarkerPattern =
         #"(?i)\b(actually|scratch that|strike that|delete that|cancel that|never ?mind|i mean|sorry|wait|or rather|rather|instead|correction|let me rephrase|make that|de fapt|perd[oó]n)\b"#
 
     /// True when cleanup dropped meaning the speaker never retracted: content-word recall fell below
