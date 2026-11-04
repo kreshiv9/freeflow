@@ -185,6 +185,12 @@ struct MenuBarView: View {
                 }
             }
 
+            if appState.showsLearnedUndoInMenu, let change = appState.lastLearnedChange {
+                Button("Undo Last Learned (\(change.menuTitle))") {
+                    appState.undoLastLearned()
+                }
+            }
+
             Divider()
 
             Menu("Hold Shortcut") {
