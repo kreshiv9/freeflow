@@ -495,6 +495,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var customVocabulary: String {
         didSet {
             UserDefaults.standard.set(customVocabulary, forKey: customVocabularyStorageKey)
+            refreshLearnedKeytermIndex()
         }
     }
 
@@ -751,8 +752,44 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     /// Dictionary "correct a misspelling" rules; persisted as JSON like voice macros.
     @Published var dictionaryCorrections: [DictionaryCorrection] = [] {
-        didSet { DictionaryCorrection.save(dictionaryCorrections, to: .standard) }
+        didSet {
+            DictionaryCorrection.save(dictionaryCorrections, to: .standard)
+            refreshLearnedKeytermIndex()
+        }
     }
+
+    /// Terms and rules learned from the user's fixes (AppState+Learning.swift); local only.
+    /// Saved LearnedVocabulary.saveDelay after the last change, or when the app quits before
+    /// that.
+    @Published var learnedVocabulary = LearnedVocabulary() {
+        didSet {
+            scheduleLearnedVocabularySave()
+            refreshLearnedKeytermIndex()
+        }
+    }
+
+    /// "Learn automatically". Off stops learning; learned items stay in use until deleted.
+    @Published var learningEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(learningEnabled, forKey: LearningPreference.storageKey)
+            if !learningEnabled { dictationRecords = DictationRecordRing() }
+        }
+    }
+
+    /// The last learned batch, for Undo during this session.
+    @Published var lastLearnedChange: LearnedVocabulary.Change?
+    /// The menu bar offers Undo Last Learned for LearnedVocabulary.undoMenuSeconds.
+    @Published var showsLearnedUndoInMenu = false
+    /// Deepgram words and keyterms of recent dictations, in memory only.
+    var dictationRecords = DictationRecordRing()
+    /// The learned keyterms ranked off main after each change of the learned store, Custom
+    /// Vocabulary or Corrections, so a dictation start only reads them; nil while ranking.
+    var learnedKeytermIndex: EffectiveVocabulary.LearnedKeytermIndex?
+    var learnedKeytermIndexGeneration = 0
+    var learnedToastBatchStartedAt: Date?
+    var learnedUndoMenuWorkItem: DispatchWorkItem?
+    var learnedSaveWorkItem: DispatchWorkItem?
+    var learnedTerminationObserver: NSObjectProtocol?
 
     @Published var isRecording = false {
         didSet {
@@ -1048,12 +1085,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.aiAppsRawTranscriptEnabled = AIAppRawTranscriptPreference.load(from: .standard)
         self.cursorFormattingEnabled = CursorFormatting.load(from: .standard)
         self.vibeCodingFileTaggingEnabled = FileTagMatcher.load(from: .standard)
+        self.learningEnabled = LearningPreference.load(from: .standard)
         self.dictationStyles = StyleCategory.loadStyles(from: .standard)
         self.isPressEnterVoiceCommandEnabled = isPressEnterVoiceCommandEnabled
         self.alertSoundsEnabled = alertSoundsEnabled
         self.soundVolume = soundVolume
         self.voiceMacros = initialMacros
         self.dictionaryCorrections = DictionaryCorrection.load(from: .standard)
+        self.learnedVocabulary = LearnedVocabulary.load(from: .standard)
         self.pipelineHistory = savedHistory
         self.hasAccessibility = initialAccessibility
         self.hasScreenRecordingPermission = initialScreenCapturePermission
@@ -1094,6 +1133,29 @@ final class AppState: ObservableObject, @unchecked Sendable {
             persistOptionalShortcut(savedCopyAgainCustomShortcut.binding, key: savedCopyAgainCustomShortcutStorageKey)
         }
 
+        // didSet does not run in init: age the learned store at launch and save explicitly.
+        // Expired evidence goes even while learning is off; learned items age only while it is on.
+        let launchedAt = Date()
+        if learningEnabled ? learnedVocabulary.prune(now: launchedAt) : learnedVocabulary.expireEvidence(now: launchedAt) {
+            learnedVocabulary.save(to: .standard)
+        }
+        refreshLearnedKeytermIndex()
+        // Quitting writes only a pending change: an unchanged store is never rewritten, so a
+        // store this build cannot read (from a newer build) is not deleted or cut down.
+        learnedTerminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.learnedSaveWorkItem != nil else { return }
+            self.saveLearnedVocabularyNow()
+        }
+        overlayManager.onLearnedUndoPressed = { [weak self] in
+            DispatchQueue.main.async {
+                self?.undoLastLearned()
+            }
+        }
+
         overlayManager.onStopButtonPressed = { [weak self] in
             DispatchQueue.main.async {
                 self?.handleOverlayStopButtonPressed()
@@ -1111,6 +1173,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     deinit {
         removeAudioDeviceObservers()
+        if let learnedTerminationObserver {
+            NotificationCenter.default.removeObserver(learnedTerminationObserver)
+        }
         AppState.writeRecordingStateFlag(false)
     }
 
@@ -1528,7 +1593,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
             preferredFallbackModel: postProcessingFallbackModel,
             instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
         )
-        let capturedCustomVocabulary = customVocabulary
+        let capturedVocabulary = effectiveVocabulary(
+            for: TextContextCore.category(bundleIdentifier: item.contextBundleIdentifier, websiteDomain: nil)
+        )
         let capturedCustomSystemPrompt = customSystemPrompt
         // A row keeps only the bundle identifier, so a retry resolves the style the way the
         // stop path does without text context. A retry always runs cleanup (it never pastes
@@ -1560,8 +1627,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     intent: restoredIntent,
                     context: restoredContext,
                     postProcessingService: postProcessingService,
-                    customVocabulary: capturedCustomVocabulary,
-                    dictionaryCorrections: self.dictionaryCorrections,
+                    customVocabulary: capturedVocabulary.vocabularyText,
+                    dictionaryCorrections: capturedVocabulary.corrections,
                     customSystemPrompt: capturedCustomSystemPrompt,
                     outputLanguage: self.outputLanguage,
                     dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
@@ -3649,6 +3716,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return
             }
             let silenceGateEnabled = self.silenceGateEnabled
+            // Copied here on main: the task below runs off main while Settings, Fix and Undo
+            // may replace these.
+            let manualVocabularySnapshot = self.customVocabulary
+            let manualCorrectionsSnapshot = self.dictionaryCorrections
+            let learnedVocabularySnapshot = self.learnedVocabulary
             self.transcriptionTask = Task {
                 var stageMarks = PipelineStageTimings.Marks(stopRequested: stopRequestedAt, audioReady: audioReadyAt)
                 defer {
@@ -3700,6 +3772,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         stageMarks.codeKeyterms = report.identifierCount
                         stageMarks.screenKeytermsAudioMilliseconds = report.audioMillisecondsBeforeUpdate
                     }
+                    // Words and keyterms only when Deepgram streaming produced this transcript.
+                    let learningEvidence = resolved.source.hasPrefix(PipelineStageTimings.deepgramTranscriptionSource)
+                        ? (activeRealtime as? DeepgramStreamingService)?.learningEvidence
+                        : nil
                     let rawTranscript = resolved.transcript
                     let parsedTranscript = Self.parseTranscriptCommands(
                         from: rawTranscript,
@@ -3731,6 +3807,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         textContext: appContext.textContext,
                         bundleIdentifier: sessionBundleIdentifier
                     )
+                    let effectiveVocabulary = EffectiveVocabulary.merge(
+                        manualVocabulary: manualVocabularySnapshot,
+                        manualCorrections: manualCorrectionsSnapshot,
+                        learned: learnedVocabularySnapshot,
+                        category: LearnedVocabulary.Category(sessionCategory),
+                        now: Date()
+                    )
                     let rawTranscriptForAIApp = AIAppRawTranscriptPreference.shouldPasteRawTranscript(
                         enabled: self.aiAppsRawTranscriptEnabled,
                         category: sessionCategory,
@@ -3752,8 +3835,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         intent: sessionIntent,
                         context: appContext,
                         postProcessingService: postProcessingService,
-                        customVocabulary: self.customVocabulary,
-                        dictionaryCorrections: self.dictionaryCorrections,
+                        customVocabulary: effectiveVocabulary.vocabularyText,
+                        dictionaryCorrections: effectiveVocabulary.corrections,
                         customSystemPrompt: self.customSystemPrompt,
                         outputLanguage: self.outputLanguage,
                         dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
@@ -3829,7 +3912,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                     trimmedFinalTranscript,
                                     in: $0,
                                     keepCapitalized: CursorFormatting.keepCapitalizedTerms(
-                                        from: DictionaryCorrection.vocabularyText(self.customVocabulary, merging: self.dictionaryCorrections)
+                                        from: DictionaryCorrection.vocabularyText(
+                                            effectiveVocabulary.vocabularyText,
+                                            merging: effectiveVocabulary.corrections
+                                        )
                                     ),
                                     keepLowercase: Set($0.codeIdentifiers)
                                 )
@@ -3986,6 +4072,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 appendsSpaceAfterSentenceMark: !(cursorFit?.handledTrailingEdge ?? false)
                             )
                         }
+                        // After the paste is scheduled; the hit scan itself runs off main.
+                        self.recordLearningEvidence(
+                            entryID: entryID,
+                            evidence: learningEvidence,
+                            rawTranscript: trimmedRawTranscript
+                        )
 
                         self.audioRecorder.cleanup()
                         self.refreshAvailableMicrophonesIfNeeded()
@@ -4244,7 +4336,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 // Context Awareness is the user's switch for every screen and account keyterm.
                 ownName: DeepgramStreamingCore.KeytermPlan.sendsOwnName && contextAwarenessEnabled
                     ? Self.ownNameKeyterms
-                    : []
+                    : [],
+                learned: learnedKeyterms(
+                    for: TextContextCore.category(bundleIdentifier: activeRecordingBundleIdentifier, websiteDomain: nil)
+                )
             ))
         )
         return DeepgramStreamingService(config: config)
@@ -4525,6 +4620,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func clearPendingOverlayDismissToken() {
         pendingOverlayDismissToken = nil
+    }
+
+    /// The learned toast is skipped while a dictation, a transform or a shortcut start owns
+    /// the overlay, and while another pill (the update reminder, the failure indicator) waits
+    /// for its timed dismiss; Undo stays in the menu bar.
+    var canShowLearnedToast: Bool {
+        !isRecording && !isTranscribing && !isTransforming && pendingShortcutStartMode == nil
+            && pendingOverlayDismissToken == nil
     }
 
     @MainActor

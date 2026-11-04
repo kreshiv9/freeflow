@@ -41,8 +41,10 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
 
     private let config: Configuration
     private let maxPendingAudioBytes: Int
+    /// The connect URL's keyterms, normalized once.
+    private let connectKeyterms: [String]
     /// The connect URL's keyterm count, for the Run Log.
-    private let connectKeytermCount: Int
+    private var connectKeytermCount: Int { connectKeyterms.count }
 
     // Every property below is guarded by stateQueue.
     private let stateQueue = DispatchQueue(label: "com.zachlatta.freeflow.deepgram.state")
@@ -76,11 +78,16 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     private var identifierKeytermCount: Int?
     /// Audio already sent when the Configure went out; 0 when it was held for the socket.
     private var keytermUpdateAudioMilliseconds: Int?
+    /// Words of the final Results frames, up to maxRecognizedWords, for the learning loop.
+    private var recognizedWords: [DeepgramStreamingCore.RecognizedWord] = []
+    /// The one Configure's keyterms once planned, and once they actually went out.
+    private var plannedConfigureTerms: [String]?
+    private var sentConfigureTerms: [String]?
 
     init(config: Configuration) {
         self.config = config
         maxPendingAudioBytes = DeepgramStreamingCore.maxPendingAudioBytes(sampleRate: config.sampleRate)
-        connectKeytermCount = DeepgramStreamingCore.normalizedKeyterms(config.keyterms).count
+        connectKeyterms = DeepgramStreamingCore.normalizedKeyterms(config.keyterms)
         frameAggregator = DeepgramStreamingCore.FrameAggregator(
             frameBytes: DeepgramStreamingCore.frameBytes(sampleRate: config.sampleRate)
         )
@@ -255,11 +262,13 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
             keytermUpdateRequested = true
             screenKeytermCount = plan.screenCount
             identifierKeytermCount = plan.identifierCount
+            plannedConfigureTerms = DeepgramStreamingCore.normalizedKeyterms(plan.terms)
             if isOpen, let task {
                 keytermUpdateAudioMilliseconds = DeepgramStreamingCore.audioMilliseconds(
                     bytes: audioBytesSent, sampleRate: config.sampleRate
                 )
                 sendKeytermUpdateLocked(message, over: task)
+                sentConfigureTerms = plannedConfigureTerms
             } else {
                 keytermUpdateAudioMilliseconds = 0
                 pendingKeytermUpdate = message
@@ -279,6 +288,15 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         }
     }
 
+    /// The final words heard and the keyterms the stream last used: the Configure's list once
+    /// it went out (it replaces the whole list), otherwise the connect list. In memory, for the
+    /// learning loop only; never stored or logged. Teardown keeps it for the stop path.
+    var learningEvidence: (words: [DeepgramStreamingCore.RecognizedWord], keyterms: [String]) {
+        stateQueue.sync {
+            (recognizedWords, sentConfigureTerms ?? connectKeyterms)
+        }
+    }
+
     // MARK: Socket events
 
     fileprivate func socketDidOpen() {
@@ -289,6 +307,7 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
             if let message = pendingKeytermUpdate {
                 pendingKeytermUpdate = nil
                 sendKeytermUpdateLocked(message, over: task)
+                sentConfigureTerms = plannedConfigureTerms
             }
             let chunks = pendingAudio
             pendingAudio = []
@@ -331,7 +350,10 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
                 @unknown default:
                     continue
                 }
-                handleServerMessage(DeepgramStreamingCore.ServerMessage(data: data))
+                handleServerMessage(
+                    DeepgramStreamingCore.ServerMessage(data: data),
+                    finalWords: DeepgramStreamingCore.finalWords(in: data)
+                )
             } catch {
                 let wasClosed: Bool = stateQueue.sync { closed }
                 if !wasClosed {
@@ -345,9 +367,14 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         }
     }
 
-    private func handleServerMessage(_ message: DeepgramStreamingCore.ServerMessage) {
+    private func handleServerMessage(
+        _ message: DeepgramStreamingCore.ServerMessage,
+        finalWords: [DeepgramStreamingCore.RecognizedWord]
+    ) {
         stateQueue.sync {
             assembler.apply(message)
+            let room = DeepgramStreamingCore.maxRecognizedWords - recognizedWords.count
+            if room > 0 { recognizedWords += finalWords.prefix(room) }
             if case .error(let errorMessage) = message {
                 // Provider responses are untrusted input: the message feeds the
                 // decision and tests, never the log.

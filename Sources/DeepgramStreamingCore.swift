@@ -175,7 +175,7 @@ enum DeepgramStreamingCore {
             /// Custom Vocabulary terms in the user's order.
             var vocabulary: [String] = []
             var ownName: [String] = []
-            /// Ranked learned terms; nothing supplies them yet.
+            /// Ranked learned terms from EffectiveVocabulary.
             var learned: [String] = []
         }
 
@@ -269,6 +269,44 @@ enum DeepgramStreamingCore {
     static func audioMilliseconds(bytes: Int, sampleRate: Int) -> Int {
         guard sampleRate > 0 else { return 0 }
         return bytes * 1000 / (sampleRate * MemoryLayout<Int16>.size)
+    }
+
+    /// One word of a final Results frame. Held in memory for the learning loop only; never
+    /// stored or logged.
+    struct RecognizedWord: Equatable, Sendable {
+        let word: String
+        let punctuatedWord: String
+        /// 0...1.
+        let confidence: Double
+    }
+
+    /// The most words one stream keeps for the learning loop.
+    static let maxRecognizedWords = 2_000
+
+    /// `channel.alternatives[0].words[]` of a Results frame with `is_final` true, in order.
+    /// An entry without a string `word` or a numeric `confidence` is skipped;
+    /// `punctuated_word` falls back to `word` and the confidence is clamped to 0...1. Any
+    /// other frame, and malformed JSON, gives []. Parsed apart from ServerMessage, which
+    /// the transcript path uses.
+    static func finalWords(in data: Data) -> [RecognizedWord] {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["type"] as? String == "Results",
+              object["is_final"] as? Bool ?? false,
+              let channel = object["channel"] as? [String: Any],
+              let alternatives = channel["alternatives"] as? [[String: Any]],
+              let words = alternatives.first?["words"] as? [[String: Any]] else {
+            return []
+        }
+        return words.compactMap { entry in
+            guard let word = entry["word"] as? String,
+                  let number = entry["confidence"] as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            return RecognizedWord(
+                word: word,
+                punctuatedWord: entry["punctuated_word"] as? String ?? word,
+                confidence: min(max(number.doubleValue, 0), 1)
+            )
+        }
     }
 
     /// `{"keyterms":[...],"type":"Configure"}`, or nil when no keyterm survives
