@@ -11,6 +11,56 @@ enum TransformServiceTests {
         testPolishInstructionExecutionGuard()
         testEmptyOutputFallsBackOnce()
         testRateLimitFallsBack()
+        testSwitchedBackPrimaryKeepsRetry()
+        testFallbackEqualToPrimaryMeansNoRetry()
+        testBlankModelsUseCleanupDefaults()
+    }
+
+    /// The same explicit rule as cleanup (PostProcessingServiceTests): a fallback equal to the
+    /// primary means no retry, built-in models included, never a silent swap.
+    private static func testFallbackEqualToPrimaryMeansNoRetry() {
+        for primary in [
+            ModelConfiguration.defaultCleanupFallbackModel,
+            ModelConfiguration.defaultCleanupModel,
+            "synthetic-same-primary"
+        ] {
+            let run = transformRun(text: "synthetic input text", kind: .polish, primaryModel: primary, fallbackModel: primary) { _ in
+                ""
+            }
+            TestSupport.expectEqual(run.requests.map(\.model), [primary])
+            TestSupport.expect(run.result == nil, "An empty reply with no retry must fail")
+        }
+    }
+
+    /// A blank setting resolves to the cleanup defaults, as in PostProcessingService: Qwen with
+    /// reasoning off first, then gpt-oss-20b at low.
+    private static func testBlankModelsUseCleanupDefaults() {
+        let run = transformRun(text: "synthetic input text", kind: .polish, primaryModel: "", fallbackModel: "") { model in
+            model == ModelConfiguration.defaultCleanupModel ? "" : "Synthetic polished text."
+        }
+        TestSupport.expectEqual(
+            run.requests.map(\.model),
+            [ModelConfiguration.defaultCleanupModel, ModelConfiguration.defaultCleanupFallbackModel]
+        )
+        TestSupport.expectEqual(run.requests.map(\.reasoningEffort), ["none", "low"])
+        TestSupport.expectEqual(run.result?.transcript, "Synthetic polished text.")
+    }
+
+    /// Transforms take the cleanup primary and fallback. Switching the primary back to
+    /// gpt-oss-20b on Groq moves a fallback equal to it (ModelConfiguration.cleanupFallback),
+    /// so a transform with an empty first reply still retries on Qwen.
+    private static func testSwitchedBackPrimaryKeepsRetry() {
+        let primary = ModelConfiguration.defaultCleanupFallbackModel
+        let fallback = ModelConfiguration.cleanupFallback(
+            afterSelectingPrimary: primary,
+            fallback: primary,
+            baseURL: "https://api.groq.com/openai/v1"
+        ) ?? primary
+        let run = transformRun(text: "synthetic input text", kind: .polish, primaryModel: primary, fallbackModel: fallback) { model in
+            model == primary ? "" : "Synthetic polished text."
+        }
+        TestSupport.expectEqual(run.requests.map(\.model), [primary, ModelConfiguration.defaultCleanupModel])
+        TestSupport.expectEqual(run.result?.transcript, "Synthetic polished text.")
     }
 
     private static func testPolishRequestShape() {
@@ -157,6 +207,7 @@ enum TransformServiceTests {
         let systemPrompt: String
         let userMessage: String
         let temperature: Double
+        let reasoningEffort: String?
     }
 
     private final class RequestRecorder: @unchecked Sendable {
@@ -181,7 +232,8 @@ enum TransformServiceTests {
                     model: json["model"] as? String ?? "",
                     systemPrompt: system?["content"] as? String ?? "",
                     userMessage: user?["content"] as? String ?? "",
-                    temperature: json["temperature"] as? Double ?? -1
+                    temperature: json["temperature"] as? Double ?? -1,
+                    reasoningEffort: json["reasoning_effort"] as? String
                 )
             }
         }

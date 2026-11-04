@@ -22,6 +22,92 @@ enum LLMAPITransport {
         return requestTimeout
     }
 
+    /// URLSession's own 7-day resource default, set explicitly so the shared session adds no
+    /// ceiling: every caller sets the request's own timeoutInterval, which wins over the
+    /// session's 60 s request timeout, and enforces its own deadline, so a
+    /// post_processing_timeout_seconds above the old 300 s cap still applies.
+    static let keepAliveResourceTimeoutSeconds: TimeInterval = 7 * 24 * 60 * 60
+
+    /// One app-lifetime session so cleanup reuses a warm TCP/TLS connection instead of
+    /// paying a handshake per call.
+    private static let sharedSession = URLSession(configuration: keepAliveConfiguration())
+
+    /// Cookies, cache and credential storage are off, so the pooled connection is the only
+    /// state kept between requests.
+    static func keepAliveConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.urlCredentialStorage = nil
+        configuration.timeoutIntervalForResource = keepAliveResourceTimeoutSeconds
+        return configuration
+    }
+
+    static func keepAliveData(
+        for request: URLRequest
+    ) async throws -> (Data, URLResponse) {
+        try await keepAliveData(for: request, using: sharedSession, cache: TemperatureCapabilityCache.shared)
+    }
+
+    /// An idle pooled connection can die (sleep, network change) and URLSession never
+    /// replays a POST by itself, so a lost connection is retried once on a fresh one.
+    static func keepAliveData(
+        for request: URLRequest,
+        using session: URLSession,
+        cache: TemperatureCapabilityCache
+    ) async throws -> (Data, URLResponse) {
+        do {
+            return try await data(for: request, using: session, cache: cache)
+        } catch let error as URLError where error.code == .networkConnectionLost {
+            try Task.checkCancellation()
+            return try await data(for: request, using: session, cache: cache)
+        }
+    }
+
+    static let preconnectTimeoutSeconds: TimeInterval = 5
+
+    /// A HEAD to the https origin root of `baseURL`: no path, query, user info, Authorization,
+    /// API key, body or header of FreeFlow's own. What reaches the provider is `HEAD /`, Host,
+    /// and the defaults URLSession adds to every request, cleanup POSTs included: `Accept: */*`,
+    /// `Accept-Language` from the macOS preferred languages (such as `en-US,en;q=0.9`),
+    /// `Accept-Encoding` (`gzip, deflate`; CFNetwork may add `br` over https), a `User-Agent`
+    /// of the app's bundle name and build number with the CFNetwork and Darwin versions, and
+    /// `Connection: keep-alive` on HTTP/1.1. Nil for anything but an https URL with a host.
+    static func preconnectRequest(baseURL: String) -> URLRequest? {
+        guard let components = URLComponents(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              components.scheme?.lowercased() == "https",
+              let host = components.percentEncodedHost, !host.isEmpty else { return nil }
+        var origin = URLComponents()
+        origin.scheme = "https"
+        origin.percentEncodedHost = host
+        origin.port = components.port
+        origin.path = "/"
+        guard let url = origin.url else { return nil }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: preconnectTimeoutSeconds)
+        request.httpMethod = "HEAD"
+        return request
+    }
+
+    /// Opens the shared session's connection to the provider while the user is still
+    /// speaking, so the cleanup POST skips the handshake. Sends no content and no key, only
+    /// the request `preconnectRequest` describes; refuses redirects, ignores the response and
+    /// logs nothing.
+    static func preconnect(baseURL: String) {
+        guard preconnectRequest(baseURL: baseURL) != nil else { return }
+        Task.detached(priority: .utility) {
+            await preconnect(baseURL: baseURL, using: sharedSession)
+        }
+    }
+
+    /// The awaitable pre-connect on a given session, so tests can check it with a stub.
+    static func preconnect(baseURL: String, using session: URLSession) async {
+        guard let request = preconnectRequest(baseURL: baseURL) else { return }
+        _ = try? await session.data(for: request, delegate: RedirectRefusingDelegate.shared)
+    }
+
     static func data(
         for request: URLRequest
     ) async throws -> (Data, URLResponse) {
@@ -122,5 +208,19 @@ enum LLMAPITransport {
         let session = makeEphemeralSession(timeout: timeout(for: request))
         defer { session.finishTasksAndInvalidate() }
         return try await session.upload(for: request, from: bodyData)
+    }
+}
+
+/// The pre-connect only warms the configured host; a redirect would contact another one.
+private final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate {
+    static let shared = RedirectRefusingDelegate()
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest
+    ) async -> URLRequest? {
+        nil
     }
 }

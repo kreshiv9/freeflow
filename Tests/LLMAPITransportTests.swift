@@ -18,6 +18,56 @@ private final class StubLLMURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+/// Fails the queued requests with the given URL errors, then answers 200 with a valid completion.
+private final class DroppedConnectionURLProtocol: URLProtocol {
+    static var failures: [URLError.Code] = []
+    static var requestCount = 0
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        Self.requestCount += 1
+        if !Self.failures.isEmpty {
+            client?.urlProtocol(self, didFailWithError: URLError(Self.failures.removeFirst()))
+            return
+        }
+        let data = Data("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"OK\"}}]}".utf8)
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+/// Answers provider.invalid with a 301 to another host and records every request it sees.
+/// The 301 is also delivered as a response: when the task delegate refuses the redirect,
+/// the loading system expects the original response to finish the task.
+private final class RedirectingURLProtocol: URLProtocol {
+    static var requestedURLs: [String] = []
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let url = request.url!
+        Self.requestedURLs.append(url.absoluteString)
+        if url.host == "provider.invalid" {
+            let target = URL(string: "https://elsewhere.invalid/")!
+            let response = HTTPURLResponse(
+                url: url, statusCode: 301, httpVersion: "HTTP/1.1", headerFields: ["Location": target.absoluteString]
+            )!
+            client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: target), redirectResponse: response)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
 private func bodyData(_ request: URLRequest) -> Data? {
     if let body = request.httpBody { return body }
     guard let stream = request.httpBodyStream else { return nil }
@@ -141,6 +191,114 @@ enum LLMAPITransportTests {
             let next = try! await perform([(200, validCompletion)], endpoint: isolatedEndpoint, cache: isolated)
             let nextBody = try! JSONSerialization.jsonObject(with: bodyData(next[0])!) as! [String: Any]
             TestSupport.expect(next.count == 1 && nextBody["temperature"] != nil, "\(label) errors do not poison capability cache")
+        }
+
+        testPreconnectRequest()
+        await testPreconnectRefusesRedirects()
+        await testKeepAliveRetry()
+        testKeepAliveConfiguration()
+    }
+
+    /// The shared session adds no timeout ceiling of its own, so a hidden timeout override
+    /// above the old 300 s cap still governs cleanup, Edit Mode and translation; and it keeps
+    /// no cookies, cache or credentials between requests.
+    private static func testKeepAliveConfiguration() {
+        let configuration = LLMAPITransport.keepAliveConfiguration()
+        TestSupport.expectEqual(configuration.timeoutIntervalForResource, 7 * 24 * 60 * 60)
+        TestSupport.expect(
+            configuration.timeoutIntervalForResource > 3_600,
+            "The resource timeout must stay above any hidden timeout override"
+        )
+        TestSupport.expect(configuration.httpCookieStorage == nil, "No cookie storage")
+        TestSupport.expect(!configuration.httpShouldSetCookies, "No cookies sent")
+        TestSupport.expectEqual(configuration.httpCookieAcceptPolicy, .never)
+        TestSupport.expect(configuration.urlCache == nil, "No response cache")
+        TestSupport.expect(configuration.urlCredentialStorage == nil, "No credential storage")
+        TestSupport.expectEqual(configuration.requestCachePolicy, .reloadIgnoringLocalCacheData)
+    }
+
+    /// The pre-connect only warms the configured host: a redirect to another one is not
+    /// followed. The control request shows the stub's redirect is followed by default.
+    private static func testPreconnectRefusesRedirects() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RedirectingURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        RedirectingURLProtocol.requestedURLs = []
+        _ = try? await session.data(for: URLRequest(url: URL(string: "https://provider.invalid/")!))
+        TestSupport.expectEqual(
+            RedirectingURLProtocol.requestedURLs,
+            ["https://provider.invalid/", "https://elsewhere.invalid/"]
+        )
+
+        RedirectingURLProtocol.requestedURLs = []
+        await LLMAPITransport.preconnect(baseURL: "https://provider.invalid/openai/v1", using: session)
+        TestSupport.expectEqual(RedirectingURLProtocol.requestedURLs, ["https://provider.invalid/"])
+
+        RedirectingURLProtocol.requestedURLs = []
+        await LLMAPITransport.preconnect(baseURL: "http://provider.invalid/v1", using: session)
+        TestSupport.expectEqual(RedirectingURLProtocol.requestedURLs, [])
+    }
+
+    /// The pre-connect carries nothing but the provider's origin: no path, query, user info,
+    /// key, body or header of FreeFlow's own. URLSession adds its defaults (Host, Accept,
+    /// Accept-Language, Accept-Encoding, User-Agent, Connection) only when it sends the
+    /// request, as for every cleanup POST, so they cannot show here; the list is documented
+    /// on `preconnectRequest`.
+    private static func testPreconnectRequest() {
+        let groq = LLMAPITransport.preconnectRequest(baseURL: " https://api.groq.com/openai/v1 ")
+        TestSupport.expectEqual(groq?.url?.absoluteString, "https://api.groq.com/")
+        TestSupport.expectEqual(groq?.httpMethod, "HEAD")
+        TestSupport.expect(groq?.httpBody == nil && groq?.httpBodyStream == nil, "A pre-connect has no body")
+        TestSupport.expect(
+            groq?.allHTTPHeaderFields?.isEmpty ?? true,
+            "FreeFlow sets no header of its own on a pre-connect; only URLSession's defaults are sent"
+        )
+        TestSupport.expect(groq?.value(forHTTPHeaderField: "Authorization") == nil, "A pre-connect never carries the key")
+        TestSupport.expectEqual(groq?.timeoutInterval, LLMAPITransport.preconnectTimeoutSeconds)
+        TestSupport.expectEqual(groq?.cachePolicy, .reloadIgnoringLocalCacheData)
+
+        let stripped = LLMAPITransport.preconnectRequest(baseURL: "https://user:secret@example.invalid:8443/v1?x=1")
+        TestSupport.expectEqual(stripped?.url?.absoluteString, "https://example.invalid:8443/")
+
+        for invalid in ["http://localhost:1234/v1", "", "not a url"] {
+            TestSupport.expect(LLMAPITransport.preconnectRequest(baseURL: invalid) == nil, "No pre-connect for: \(invalid)")
+        }
+    }
+
+    /// A pooled connection that died is retried once; any other failure is not.
+    private static func testKeepAliveRetry() async {
+        let cases: [(failures: [URLError.Code], requests: Int, succeeds: Bool)] = [
+            ([.networkConnectionLost], 2, true),
+            ([.networkConnectionLost, .networkConnectionLost], 2, false),
+            ([.timedOut], 1, false),
+            ([], 1, true)
+        ]
+        for testCase in cases {
+            DroppedConnectionURLProtocol.failures = testCase.failures
+            DroppedConnectionURLProtocol.requestCount = 0
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [DroppedConnectionURLProtocol.self]
+            let session = URLSession(configuration: configuration)
+            let suite = "transport-keepalive-\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            let cache = TemperatureCapabilityCache(defaults: defaults)
+            var request = URLRequest(url: URL(string: "https://provider.invalid/\(UUID().uuidString)/chat")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try! JSONSerialization.data(withJSONObject: ["model": "fixture", "temperature": 0, "messages": []])
+            let succeeded: Bool
+            do {
+                _ = try await LLMAPITransport.keepAliveData(for: request, using: session, cache: cache)
+                succeeded = true
+            } catch {
+                succeeded = false
+            }
+            session.invalidateAndCancel()
+            defaults.removePersistentDomain(forName: suite)
+            TestSupport.expectEqual(succeeded, testCase.succeeds)
+            TestSupport.expectEqual(DroppedConnectionURLProtocol.requestCount, testCase.requests)
         }
     }
 }

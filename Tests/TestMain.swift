@@ -24,6 +24,7 @@ struct FreeFlowTests {
         VoiceIsolationFilterTests.run()
         AIAppRawTranscriptPreferenceTests.run()
         CleanupLevelTests.run()
+        CleanupFastPathTests.run()
         CommandModeIntentTests.run()
         DictationStyleTests.run()
         DictionaryCorrectionsTests.run()

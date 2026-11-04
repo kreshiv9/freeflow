@@ -313,8 +313,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         ("hu", "Hungarian"),
         ("ca", "Catalan")
     ]
-    static let defaultPostProcessingModel = "openai/gpt-oss-20b"
-    static let defaultPostProcessingFallbackModel = "qwen/qwen3.8-27b"
+    static let defaultPostProcessingModel = ModelConfiguration.defaultCleanupModel
+    static let defaultPostProcessingFallbackModel = ModelConfiguration.defaultCleanupFallbackModel
     static let defaultContextModel = "qwen/qwen3.8-27b"
     private static let deprecatedDefaultPostProcessingFallbackModel = "meta-llama/llama-4-scout-17b-16e-instruct"
     private static let deprecatedDefaultContextModel = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -375,6 +375,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var postProcessingModel: String {
         didSet {
             UserDefaults.standard.set(postProcessingModel, forKey: postProcessingModelStorageKey)
+            // Keeps a distinct retry model when the primary lands on the fallback.
+            if let fallback = ModelConfiguration.cleanupFallback(
+                afterSelectingPrimary: postProcessingModel,
+                fallback: postProcessingFallbackModel,
+                baseURL: apiBaseURL
+            ) {
+                postProcessingFallbackModel = fallback
+            }
         }
     }
 
@@ -862,13 +870,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
         for key in [contextModelStorageKey, postProcessingModelStorageKey, postProcessingFallbackModelStorageKey] {
             ModelConfiguration.migrateGroqSelection(key: key, baseURL: apiBaseURL, defaults: .standard)
         }
+        ModelConfiguration.migrateCleanupDefault(
+            modelKey: postProcessingModelStorageKey,
+            fallbackKey: postProcessingFallbackModelStorageKey,
+            baseURL: apiBaseURL,
+            defaults: .standard
+        )
         let transcriptionModel = UserDefaults.standard.string(forKey: transcriptionModelStorageKey) ?? Self.defaultTranscriptionModel
         let transcriptionAPIURL = Self.loadOptionalStoredAPIValue(account: transcriptionAPIURLStorageKey)
         let transcriptionAPIKey = Self.loadStoredAPIKey(account: transcriptionAPIKeyStorageKey)
         let deepgramAPIKey = Self.loadOptionalStoredAPIValue(account: deepgramAPIKeyStorageKey)
         let postProcessingModel = UserDefaults.standard.string(forKey: postProcessingModelStorageKey) ?? Self.defaultPostProcessingModel
         let postProcessingFallbackModel = Self.loadStoredPostProcessingFallbackModel(
-            key: postProcessingFallbackModelStorageKey
+            key: postProcessingFallbackModelStorageKey,
+            primary: postProcessingModel,
+            baseURL: apiBaseURL
         )
         let contextModel = Self.loadStoredContextModel(key: contextModelStorageKey)
         let shortcuts = Self.loadShortcutConfiguration(
@@ -1174,15 +1190,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         return trimmed.isEmpty ? defaultContextModel : trimmed
     }
 
-    private static func loadStoredPostProcessingFallbackModel(key: String) -> String {
+    private static func loadStoredPostProcessingFallbackModel(key: String, primary: String, baseURL: String) -> String {
         guard let stored = UserDefaults.standard.string(forKey: key) else {
             return defaultPostProcessingFallbackModel
         }
 
         let trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed == deprecatedDefaultPostProcessingFallbackModel {
-            UserDefaults.standard.set(defaultPostProcessingFallbackModel, forKey: key)
-            return defaultPostProcessingFallbackModel
+            let replacement = ModelConfiguration.replacementForRetiredCleanupFallback(primary: primary, baseURL: baseURL)
+            UserDefaults.standard.set(replacement, forKey: key)
+            return replacement
         }
 
         return trimmed.isEmpty ? defaultPostProcessingFallbackModel : trimmed
@@ -2946,6 +2963,30 @@ final class AppState: ObservableObject, @unchecked Sendable {
         automaticTerminationDisabled = false
     }
 
+    /// Warms the cleanup provider's connection while the user speaks. Content-free: a HEAD
+    /// to the configured https origin with no key, body or header of FreeFlow's own, only
+    /// URLSession's defaults (LLMAPITransport.preconnectRequest lists them). A desktop AI
+    /// chat app that will be pasted raw is known from the bundle identifier alone, with no
+    /// Accessibility call, so it is skipped here.
+    private func preconnectCleanupIfNeeded() {
+        let isCommandMode = currentSessionIntent.isCommandMode
+        guard PostProcessingService.shouldPreconnect(
+            apiKey: apiKey,
+            cleanupLevel: cleanupLevel,
+            outputLanguage: outputLanguage,
+            isCommandMode: isCommandMode,
+            pastesRawTranscript: AIAppRawTranscriptPreference.shouldPasteRawTranscript(
+                enabled: aiAppsRawTranscriptEnabled,
+                category: AIAppRawTranscriptPreference.resolvedCategory(
+                    textContext: nil,
+                    bundleIdentifier: activeRecordingBundleIdentifier
+                ),
+                isCommandMode: isCommandMode
+            )
+        ) else { return }
+        LLMAPITransport.preconnect(baseURL: apiBaseURL)
+    }
+
     private func beginRecording(triggerMode: RecordingTriggerMode) {
         os_log(.info, log: recordingLog, "beginRecording() entered")
         beginCriticalDictationActivity()
@@ -3026,6 +3067,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         if !startsContextAfterEngine {
             startContextCapture()
         }
+        preconnectCleanupIfNeeded()
         // Only a stream that actually started gets a rate; nil skips the stream conversion.
         let streamSampleRate = realtimeService == nil ? nil : streamingProvider.streamSampleRate
         let captureFormat = self.captureFormat
@@ -3246,6 +3288,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case postProcessingFailedFallback
         case postProcessingDroppedSnippetPlaceholders
         case postProcessingDroppedContentFallback
+        case postProcessingTimedOutFallback
+        case cleanupFastPath(CleanupFastPath.Reason)
         case preservedExactWording
         case preservedExactWordingTranslated
         case preservedExactWordingTranslationFailedFallback
@@ -3284,6 +3328,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return isRetry
                     ? "Cleanup dropped part of the transcript on retry, using raw transcript"
                     : "Cleanup dropped part of the transcript, using raw transcript"
+            case .postProcessingTimedOutFallback:
+                return isRetry ? CleanupFastPath.timedOutRetryProcessingStatus : CleanupFastPath.timedOutProcessingStatus
+            case .cleanupFastPath(let reason):
+                return CleanupFastPath.processingStatus(for: reason)
             case .preservedExactWording:
                 return "Preserved exact wording, skipped post-processing"
             case .preservedExactWordingTranslated:
@@ -3324,6 +3372,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         style: DictationStyle? = nil,
         rawTranscriptForAIApp: Bool = false,
         fileTaggingEnabled: Bool = false,
+        allowsFastPath: Bool = false,
+        appCategory: DictationAppCategory? = nil,
         webSearchEngine: WebSearchEngine
     ) async -> (
         finalTranscript: String,
@@ -3464,6 +3514,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
         }
 
+        // Stop path only: a short already-clean dictation, or a short query in the google.com
+        // search box, is pasted without the model. A Run Log retry always runs cleanup.
+        if allowsFastPath, let reason = CleanupFastPath.reason(
+            transcript: correctedTranscript,
+            websiteDomain: context.textContext?.websiteDomain,
+            category: appCategory ?? context.textContext?.category,
+            cleanupLevel: cleanupLevel,
+            style: style,
+            outputLanguage: outputLanguage,
+            dictationLanguage: dictationLanguage,
+            hasSnippetMatches: snippetPlan.hasMatches,
+            hasCustomSystemPrompt: CleanupFastPath.isCustomSystemPrompt(customSystemPrompt)
+        ) {
+            let pasted = CleanupFastPath.pastedText(for: snippetPlan, style: style, dictationLanguage: dictationLanguage)
+            return (pasted, .cleanupFastPath(reason), "", expandedSnippetCount, taggedFileCount)
+        }
+
         do {
             let vocabulary = DictionaryCorrection.vocabularyText(customVocabulary, merging: dictionaryCorrections)
             let result = try await postProcessingService.postProcess(
@@ -3502,6 +3569,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
             // Like Wispr Flow, a failed format falls back to the raw transcript.
             os_log(.error, log: recordingLog, "Post-processing dropped part of the transcript, using raw transcript")
             return (snippetPlan.expandedText, .postProcessingDroppedContentFallback, "", expandedSnippetCount, taggedFileCount)
+        } catch PostProcessingError.requestTimedOut(_) {
+            os_log(.error, log: recordingLog, "Cleanup missed its deadline, using raw transcript")
+            return (
+                CleanupFastPath.timedOutText(for: snippetPlan),
+                .postProcessingTimedOutFallback,
+                "",
+                expandedSnippetCount,
+                taggedFileCount
+            )
         } catch {
             os_log(.error, log: recordingLog, "Post-processing failed: %{public}@", error.localizedDescription)
             return (snippetPlan.expandedText, .postProcessingFailedFallback, "", expandedSnippetCount, taggedFileCount)
@@ -3618,7 +3694,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             baseURL: apiBaseURL,
             preferredModel: postProcessingModel,
             preferredFallbackModel: postProcessingFallbackModel,
-            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
+            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled,
+            cleanupDeadlineSeconds: PostProcessingService.dictationCleanupDeadline(baseURL: apiBaseURL)
         )
             let transformService = self.makeTransformService()
 
@@ -3760,6 +3837,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         style: dictationStyle,
                         rawTranscriptForAIApp: rawTranscriptForAIApp,
                         fileTaggingEnabled: self.vibeCodingFileTaggingEnabled,
+                        allowsFastPath: true,
+                        appCategory: sessionCategory,
                         webSearchEngine: self.webSearchEngine
                     )
                     // Auto Apply After Dictation: runs on whatever the final transcript is (cleaned,
@@ -3889,6 +3968,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         case .postProcessingFailedFallback,
                              .postProcessingDroppedSnippetPlaceholders,
                              .postProcessingDroppedContentFallback,
+                             .postProcessingTimedOutFallback,
                              .preservedExactWordingTranslationFailedFallback,
                              .verbatimTranslationDroppedSnippetPlaceholders:
                             shouldPersistRawDictationFallback = !trimmedFinalTranscript.isEmpty

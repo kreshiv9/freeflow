@@ -21,6 +21,18 @@ enum PostProcessingServiceTests {
         testDefaultPromptHasSmartFormattingRules()
         testEchoedDelimiterIsStrippedFromCleanup()
         testDroppedSentenceFallsBackWithoutRetry()
+        testCleanupDeadlineThrowsTimedOut()
+        testDeadlineLeavesEditModeAndTranslationAlone()
+        testURLTimeoutMapsToDeadline()
+        testTimeoutResolution()
+        testDefaultModelsAndRequestOptions()
+        testDefaultPromptStaysShort()
+        testShouldPreconnect()
+        testDefaultDeadlineIsTheLongBudget()
+        testDictationDeadlineIsGroqOnly()
+        testOutputLanguageKeepsLongBudget()
+        testHiddenTimeoutOverridesCleanupDeadline()
+        testFallbackEqualToPrimaryMeansNoRetry()
     }
 
     private static func testEchoedDelimiterIsStrippedFromCleanup() {
@@ -420,11 +432,14 @@ Synthetic term
             "Use context only as a formatting hint",
             "Do not draft, compose, expand, summarize",
             "rename user id to user underscore id",
-            "Do not invent a closing when none was spoken"
+            "Do not invent a closing when none was spoken",
+            // ed3764b: naming all four replies kept Qwen from returning EMPTY for them.
+            "\"yeah\", \"ja\" or \"да\" is content, not filler",
+            "in any language"
         ] {
             TestSupport.expect(prompt.contains(rule), "The default prompt must keep: \(rule)")
         }
-        TestSupport.expectEqual(PostProcessingService.defaultSystemPromptDate, "2026-11-02")
+        TestSupport.expectEqual(PostProcessingService.defaultSystemPromptDate, "2026-11-03")
         TestSupport.expect(
             PostProcessingService.defaultSystemPromptDate > "2026-10-10",
             "The bumped date must show the newer-default banner to custom-prompt users"
@@ -463,22 +478,318 @@ Synthetic term
         }
     }
 
+    // MARK: - Speed: deadline, defaults, prompt size, pre-connect
+
+    /// The stop path's short budget ends a slow cleanup with requestTimedOut, which AppState
+    /// turns into the locally formatted raw transcript. The stub sleeps cooperatively, as
+    /// URLSession's async request does, so cancellation ends it at the deadline.
+    private static func testCleanupDeadlineThrowsTimedOut() {
+        let service = makeService(
+            recorder: RequestRecorder(),
+            cleanupDeadlineSeconds: 0.05,
+            delayNanoseconds: 2_000_000_000
+        ) { _ in "Synthetic cleaned text." }
+        let started = Date()
+        let outcome = cleanupOutcome(service: service)
+        TestSupport.expect(outcome.result == nil, "A late cleanup must not return a result")
+        TestSupport.expect(isTimedOut(outcome.error), "A late cleanup must throw requestTimedOut")
+        TestSupport.expect(Date().timeIntervalSince(started) < 1, "The deadline must not wait for the slow request")
+    }
+
+    /// Edit Mode and verbatim translation keep the 20 s budget even on a service built with
+    /// the short cleanup deadline.
+    private static func testDeadlineLeavesEditModeAndTranslationAlone() {
+        let service = makeService(
+            recorder: RequestRecorder(),
+            cleanupDeadlineSeconds: 0.05,
+            delayNanoseconds: 200_000_000
+        ) { _ in "Synthetic transformed text." }
+        TestSupport.expect(isTimedOut(cleanupOutcome(service: service).error), "Cleanup itself must hit the deadline")
+
+        let box = ResultBox()
+        let done = DispatchSemaphore(value: 0)
+        Task {
+            box.result = try? await service.commandTransform(
+                selectedText: "Synthetic selected text.",
+                voiceCommand: "make it shorter",
+                context: syntheticContext,
+                customVocabulary: ""
+            )
+            done.signal()
+        }
+        done.wait()
+        TestSupport.expectEqual(box.result?.transcript, "Synthetic transformed text.")
+
+        let translationBox = ResultBox()
+        let translated = DispatchSemaphore(value: 0)
+        Task {
+            translationBox.result = try? await service.translateVerbatim(
+                transcript: "synthetic transcript",
+                targetLanguage: "Spanish"
+            )
+            translated.signal()
+        }
+        translated.wait()
+        TestSupport.expectEqual(translationBox.result?.transcript, "Synthetic transformed text.")
+    }
+
+    private static func testURLTimeoutMapsToDeadline() {
+        let service = makeService(recorder: RequestRecorder(), failure: .timedOut) { _ in "Synthetic cleaned text." }
+        let outcome = cleanupOutcome(service: service)
+        TestSupport.expect(isTimedOut(outcome.error), "A URL timeout must report the deadline outcome")
+    }
+
+    private static func testTimeoutResolution() {
+        TestSupport.expectEqual(PostProcessingService.resolvedTimeout(override: 0, otherwise: 2.5), 2.5)
+        TestSupport.expectEqual(PostProcessingService.resolvedTimeout(override: -3, otherwise: 2.5), 2.5)
+        TestSupport.expectEqual(PostProcessingService.resolvedTimeout(override: 7, otherwise: 2.5), 7)
+        TestSupport.expectEqual(PostProcessingService.resolvedTimeout(override: 0, otherwise: 20), 20)
+        TestSupport.expectEqual(PostProcessingService.dictationCleanupDeadlineSeconds, 2.5)
+        TestSupport.expectEqual(PostProcessingService.defaultTimeoutSeconds, 20)
+    }
+
+    /// No stored model: Qwen 3.8 with reasoning off first, then gpt-oss-20b, with the same prompt.
+    private static func testDefaultModelsAndRequestOptions() {
+        let recorder = RequestRecorder()
+        let service = makeService(recorder: recorder, preferredModel: "", preferredFallbackModel: "") { model in
+            model == ModelConfiguration.defaultCleanupModel ? "" : "Synthetic cleaned text."
+        }
+        let outcome = cleanupOutcome(service: service)
+        TestSupport.expectEqual(outcome.result?.transcript, "Synthetic cleaned text.")
+        let requests = recorder.captured
+        TestSupport.expectEqual(requests.map(\.model), ["qwen/qwen3.8-27b", "openai/gpt-oss-20b"])
+        guard requests.count == 2 else { return }
+        TestSupport.expectEqual(requests[0].reasoningEffort, "none")
+        TestSupport.expectEqual(requests[0].includeReasoning, false)
+        TestSupport.expectEqual(requests[0].maxCompletionTokens, 4096)
+        TestSupport.expectEqual(requests[0].temperature, 0)
+        TestSupport.expectEqual(requests[1].reasoningEffort, "low")
+        TestSupport.expectEqual(requests[1].maxCompletionTokens, 4096)
+        TestSupport.expectEqual(requests[0].systemPrompt, requests[1].systemPrompt)
+    }
+
+    /// About 1,000 tokens (1,026 with o200k_base when trimmed); the character count is the
+    /// dependency-free proxy.
+    private static func testDefaultPromptStaysShort() {
+        TestSupport.expect(
+            PostProcessingService.defaultSystemPrompt.count <= 4_500,
+            "The default prompt must stay under about 1,000 tokens"
+        )
+    }
+
+    private static func testShouldPreconnect() {
+        for key in ["", "   "] {
+            TestSupport.expect(
+                !PostProcessingService.shouldPreconnect(
+                    apiKey: key, cleanupLevel: .light, outputLanguage: "", isCommandMode: true, pastesRawTranscript: false
+                ),
+                "No key, no pre-connect"
+            )
+        }
+        let cases: [(level: CleanupLevel, outputLanguage: String, isCommandMode: Bool, rawAIApp: Bool, expected: Bool)] = [
+            (.light, "", false, false, true),
+            (.medium, "", false, false, true),
+            (CleanupLevel.none, "", false, false, false),
+            (CleanupLevel.none, "  ", false, false, false),
+            (CleanupLevel.none, "German", false, false, true),
+            (CleanupLevel.none, "", true, false, true),
+            // A desktop AI chat app pasted raw never calls the model, unless it translates.
+            (.light, "", false, true, false),
+            (.medium, " ", false, true, false),
+            (.light, "German", false, true, true)
+        ]
+        for testCase in cases {
+            TestSupport.expectEqual(
+                PostProcessingService.shouldPreconnect(
+                    apiKey: "synthetic-key",
+                    cleanupLevel: testCase.level,
+                    outputLanguage: testCase.outputLanguage,
+                    isCommandMode: testCase.isCommandMode,
+                    pastesRawTranscript: testCase.rawAIApp
+                ),
+                testCase.expected
+            )
+        }
+        // The value AppState computes at recording start for the ChatGPT app, before any text context.
+        let chatGPTApp = AIAppRawTranscriptPreference.shouldPasteRawTranscript(
+            enabled: true,
+            category: AIAppRawTranscriptPreference.resolvedCategory(textContext: nil, bundleIdentifier: "com.openai.codex"),
+            isCommandMode: false
+        )
+        TestSupport.expect(
+            !PostProcessingService.shouldPreconnect(
+                apiKey: "synthetic-key", cleanupLevel: .light, outputLanguage: "", isCommandMode: false,
+                pastesRawTranscript: chatGPTApp
+            ),
+            "No pre-connect for a raw-pasted AI chat app"
+        )
+    }
+
+    /// Only the stop path opts into the short deadline; the Run Log retry and the Settings
+    /// System Prompt Test build the service without it and keep the 20 s budget.
+    private static func testDefaultDeadlineIsTheLongBudget() {
+        let service = PostProcessingService(apiKey: "synthetic-key", baseURL: "https://example.invalid/v1")
+        TestSupport.expectEqual(service.cleanupDeadlineSeconds, PostProcessingService.defaultTimeoutSeconds)
+        TestSupport.expect(
+            PostProcessingService.dictationCleanupDeadlineSeconds < service.cleanupDeadlineSeconds,
+            "The stop-path deadline must be the shorter one"
+        )
+    }
+
+    /// The short deadline is sized for Groq; a local or other provider keeps the 20 s budget.
+    private static func testDictationDeadlineIsGroqOnly() {
+        for groq in ["https://api.groq.com/openai/v1", " https://api.groq.com/openai/v1/ "] {
+            TestSupport.expectEqual(
+                PostProcessingService.dictationCleanupDeadline(baseURL: groq),
+                PostProcessingService.dictationCleanupDeadlineSeconds
+            )
+        }
+        for other in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:1234/v1",
+            "https://openrouter.ai/api/v1",
+            "https://api.groq.com.example.invalid/openai/v1",
+            ""
+        ] {
+            TestSupport.expectEqual(
+                PostProcessingService.dictationCleanupDeadline(baseURL: other),
+                PostProcessingService.defaultTimeoutSeconds
+            )
+        }
+    }
+
+    /// Cleanup that also translates keeps the long budget: a miss would paste the source
+    /// language. Without an Output Language the same service hits the short deadline.
+    private static func testOutputLanguageKeepsLongBudget() {
+        let service = makeService(
+            recorder: RequestRecorder(),
+            cleanupDeadlineSeconds: 0.05,
+            delayNanoseconds: 200_000_000
+        ) { _ in "Synthetischer Text." }
+        TestSupport.expectEqual(
+            cleanupOutcome(service: service, outputLanguage: "German").result?.transcript,
+            "Synthetischer Text."
+        )
+        TestSupport.expect(isTimedOut(cleanupOutcome(service: service).error), "Plain cleanup keeps the short deadline")
+        TestSupport.expect(
+            isTimedOut(cleanupOutcome(service: service, outputLanguage: "  ").error),
+            "A blank Output Language is no translation"
+        )
+    }
+
+    /// A positive hidden `post_processing_timeout_seconds` replaces the short deadline, and the
+    /// 20 s budget too, on the request itself as well as the task deadline. Each case reads an
+    /// isolated defaults suite, never the app's or the test process's standard defaults.
+    private static func testHiddenTimeoutOverridesCleanupDeadline() {
+        TestSupport.expectEqual(PostProcessingService.timeoutOverrideKey, "post_processing_timeout_seconds")
+
+        func outcome(
+            override: Double?,
+            outputLanguage: String = ""
+        ) -> (result: PostProcessingResult?, error: Error?, timeouts: [TimeInterval]) {
+            withIsolatedDefaults { defaults in
+                if let override {
+                    defaults.set(override, forKey: PostProcessingService.timeoutOverrideKey)
+                }
+                let recorder = RequestRecorder()
+                let service = makeService(
+                    recorder: recorder,
+                    cleanupDeadlineSeconds: 0.1,
+                    delayNanoseconds: 500_000_000,
+                    defaults: defaults
+                ) { _ in "Synthetic cleaned text." }
+                let outcome = cleanupOutcome(service: service, outputLanguage: outputLanguage)
+                return (outcome.result, outcome.error, recorder.timeoutIntervals)
+            }
+        }
+
+        let overridden = outcome(override: 2.0)
+        TestSupport.expectEqual(overridden.result?.transcript, "Synthetic cleaned text.")
+        TestSupport.expectEqual(overridden.timeouts, [2.0])
+        TestSupport.expect(isTimedOut(outcome(override: 0).error), "Only a positive override applies")
+        TestSupport.expect(isTimedOut(outcome(override: -1).error), "A negative override is ignored")
+        let unset = outcome(override: nil)
+        TestSupport.expect(isTimedOut(unset.error), "No override keeps the deadline")
+        TestSupport.expectEqual(unset.timeouts, [PostProcessingService.defaultTimeoutSeconds])
+        // Cleanup with an Output Language keeps the long budget, which the override also replaces.
+        let translated = outcome(override: 0.1, outputLanguage: "German")
+        TestSupport.expect(isTimedOut(translated.error), "The override also sets the translation budget")
+        TestSupport.expectEqual(translated.timeouts, [0.1])
+    }
+
+    private static func withIsolatedDefaults<T>(_ body: (UserDefaults) -> T) -> T {
+        let suite = "FreeFlowTests.PostProcessingTimeout.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        return body(defaults)
+    }
+
+    /// Never written, so every other test runs without a hidden timeout override.
+    private static let unsetDefaults = UserDefaults(suiteName: "FreeFlowTests.PostProcessingUnset.\(UUID().uuidString)")!
+
+    /// A fallback equal to the primary means no retry, built-in models included: Settings
+    /// moves the fallback (ModelConfiguration.cleanupFallback) so a retry stays visible there,
+    /// and that moved pair retries on the other built-in model.
+    private static func testFallbackEqualToPrimaryMeansNoRetry() {
+        for primary in [
+            ModelConfiguration.defaultCleanupFallbackModel,
+            ModelConfiguration.defaultCleanupModel,
+            "synthetic-primary"
+        ] {
+            let recorder = RequestRecorder()
+            let service = makeService(recorder: recorder, preferredModel: primary, preferredFallbackModel: primary) { _ in "" }
+            TestSupport.expect(cleanupOutcome(service: service).result == nil, "An empty reply with no retry must fail")
+            TestSupport.expectEqual(recorder.captured.map(\.model), [primary])
+        }
+
+        let groq = "https://api.groq.com/openai/v1"
+        for primary in [ModelConfiguration.defaultCleanupFallbackModel, ModelConfiguration.defaultCleanupModel] {
+            let fallback = ModelConfiguration.cleanupFallback(afterSelectingPrimary: primary, fallback: primary, baseURL: groq)
+            let recorder = RequestRecorder()
+            let service = makeService(
+                recorder: recorder, preferredModel: primary, preferredFallbackModel: fallback ?? primary
+            ) { model in
+                model == primary ? "" : "Synthetic cleaned text."
+            }
+            TestSupport.expectEqual(cleanupOutcome(service: service).result?.transcript, "Synthetic cleaned text.")
+            TestSupport.expectEqual(recorder.captured.count, 2)
+            TestSupport.expect(recorder.captured.last?.model != primary, "The retry goes to the other built-in model")
+        }
+    }
+
+    private static func isTimedOut(_ error: Error?) -> Bool {
+        guard let error = error as? PostProcessingError, case .requestTimedOut(_) = error else { return false }
+        return true
+    }
+
     // MARK: - Request capture
 
     private struct CapturedRequest {
         let model: String
         let systemPrompt: String
         let userMessage: String
+        let reasoningEffort: String?
+        let includeReasoning: Bool?
+        let maxCompletionTokens: Int?
+        let temperature: Double?
     }
 
     private final class RequestRecorder: @unchecked Sendable {
         private let lock = NSLock()
         private var bodies: [Data] = []
+        private var timeouts: [TimeInterval] = []
 
-        func record(_ body: Data?) {
+        func record(_ body: Data?, timeoutInterval: TimeInterval = 0) {
             lock.lock()
             defer { lock.unlock() }
             bodies.append(body ?? Data())
+            timeouts.append(timeoutInterval)
+        }
+
+        var timeoutIntervals: [TimeInterval] {
+            lock.lock()
+            defer { lock.unlock() }
+            return timeouts
         }
 
         var captured: [CapturedRequest] {
@@ -492,23 +803,44 @@ Synthetic term
                 return CapturedRequest(
                     model: json["model"] as? String ?? "",
                     systemPrompt: system?["content"] as? String ?? "",
-                    userMessage: user?["content"] as? String ?? ""
+                    userMessage: user?["content"] as? String ?? "",
+                    reasoningEffort: json["reasoning_effort"] as? String,
+                    includeReasoning: json["include_reasoning"] as? Bool,
+                    maxCompletionTokens: json["max_completion_tokens"] as? Int,
+                    temperature: json["temperature"] as? Double
                 )
             }
         }
     }
 
+    /// `delayNanoseconds` sleeps cooperatively before replying; `failure` throws that URL error
+    /// instead of replying. `defaults` holds the hidden timeout override; nil reads a suite
+    /// that is never written, so no override applies.
     private static func makeService(
         recorder: RequestRecorder,
+        preferredModel: String = "synthetic-primary",
+        preferredFallbackModel: String = "synthetic-fallback",
+        cleanupDeadlineSeconds: TimeInterval = PostProcessingService.defaultTimeoutSeconds,
+        delayNanoseconds: UInt64 = 0,
+        failure: URLError.Code? = nil,
+        defaults: UserDefaults? = nil,
         reply: @escaping @Sendable (String) -> String
     ) -> PostProcessingService {
         PostProcessingService(
             apiKey: "synthetic-key",
             baseURL: "https://example.invalid/v1",
-            preferredModel: "synthetic-primary",
-            preferredFallbackModel: "synthetic-fallback",
+            preferredModel: preferredModel,
+            preferredFallbackModel: preferredFallbackModel,
+            cleanupDeadlineSeconds: cleanupDeadlineSeconds,
+            defaults: defaults ?? unsetDefaults,
             transport: { request in
-                recorder.record(request.httpBody)
+                recorder.record(request.httpBody, timeoutInterval: request.timeoutInterval)
+                if delayNanoseconds > 0 {
+                    try await Task.sleep(nanoseconds: delayNanoseconds)
+                }
+                if let failure {
+                    throw URLError(failure)
+                }
                 let json = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any]
                 let model = json?["model"] as? String ?? ""
                 let body = try JSONSerialization.data(withJSONObject: [
@@ -579,18 +911,7 @@ Synthetic term
     ) -> (result: PostProcessingResult?, requests: [CapturedRequest]) {
         let recorder = RequestRecorder()
         let service = makeService(recorder: recorder, reply: reply)
-        let context = AppContext(
-            appName: nil,
-            bundleIdentifier: nil,
-            windowTitle: nil,
-            selectedText: nil,
-            currentActivity: "",
-            contextSystemPrompt: nil,
-            contextPrompt: nil,
-            screenshotDataURL: nil,
-            screenshotMimeType: nil,
-            screenshotError: nil
-        )
+        let context = syntheticContext
 
         let resultBox = ResultBox()
         let done = DispatchSemaphore(value: 0)
@@ -612,7 +933,45 @@ Synthetic term
         return (resultBox.result, recorder.captured)
     }
 
+    private static let syntheticContext = AppContext(
+        appName: nil,
+        bundleIdentifier: nil,
+        windowTitle: nil,
+        selectedText: nil,
+        currentActivity: "",
+        contextSystemPrompt: nil,
+        contextPrompt: nil,
+        screenshotDataURL: nil,
+        screenshotMimeType: nil,
+        screenshotError: nil
+    )
+
+    /// One default cleanup through `service`: the result, or the error it threw.
+    private static func cleanupOutcome(
+        service: PostProcessingService,
+        outputLanguage: String = ""
+    ) -> (result: PostProcessingResult?, error: Error?) {
+        let box = ResultBox()
+        let done = DispatchSemaphore(value: 0)
+        Task {
+            do {
+                box.result = try await service.postProcess(
+                    transcript: "synthetic transcript",
+                    context: syntheticContext,
+                    customVocabulary: "",
+                    outputLanguage: outputLanguage
+                )
+            } catch {
+                box.error = error
+            }
+            done.signal()
+        }
+        done.wait()
+        return (box.result, box.error)
+    }
+
     private final class ResultBox: @unchecked Sendable {
         var result: PostProcessingResult?
+        var error: Error?
     }
 }

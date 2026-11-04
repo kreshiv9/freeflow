@@ -255,7 +255,7 @@ struct ProviderSettingsFields: View {
 
             ModelDropdownView(
                 title: "Post-Processing Fallback Model",
-                subtitle: "Used as the explicit retry model for transcript cleanup and Edit Mode transforms.",
+                subtitle: "Used as the explicit retry model for transcript cleanup and Edit Mode transforms. The same model as the Post-Processing Model means no retry. On Groq, choosing this fallback's built-in model as the Post-Processing Model moves the fallback to the other built-in model.",
                 predefinedModels: ModelConfiguration.llmModels,
                 defaultModel: AppState.defaultPostProcessingFallbackModel,
                 textDraft: $postProcessingFallbackModelDraft,
