@@ -7,6 +7,7 @@ let pressEnterAfterPasteDelay: TimeInterval = 0.08
 enum AppTextInsertionDispatchTests {
     static func run() {
         testAccessibilityPreparationRequiresEnabledMonitoringAndPermission()
+        testContextAwarenessPrimesTargetAppsOnly()
         testFocusedEditsRejectWithoutClipboardOrInput()
         testEditsAfterFocusReturnsReject()
         testFocusedSelectionChangeRejectsBeforeClipboard()
@@ -173,6 +174,38 @@ enum AppTextInsertionDispatchTests {
         TestDispatchQueue.runAll()
         TestSupport.expect(TestInsertionTarget.preparedProcessIdentifiers.isEmpty,
                            "Preparation requires a current foreground application")
+    }
+
+    /// With Original Field Insertion off, Context Awareness primes only Chrome, VS Code and
+    /// ChatGPT.app, with the same role read: no attribute write and no input.
+    private static func testContextAwarenessPrimesTargetAppsOnly() {
+        let rows: [(bundle: String, contextAwareness: Bool, primed: Bool)] = [
+            ("com.microsoft.VSCode", true, true),
+            ("com.google.Chrome", true, true),
+            ("com.openai.codex", true, true),
+            ("com.apple.TextEdit", true, false),
+            ("com.microsoft.VSCode", false, false),
+        ]
+        for row in rows {
+            for trusted in [true, false] {
+                let fixture = makeFixture(focused: true)
+                fixture.state.originalFieldInsertionEnabled = false
+                fixture.state.shouldMonitorHotkeys = true
+                fixture.state.contextAwarenessEnabled = row.contextAwareness
+                TestAX.frontmostApplication?.bundleIdentifier = row.bundle
+                TestAX.isProcessTrusted = trusted
+
+                fixture.state.testPrepareForegroundApplicationForInsertion()
+                TestDispatchQueue.runAll()
+
+                let expected = row.primed && trusted ? [fixture.target.processIdentifier] : []
+                TestSupport.expectEqual(TestInsertionTarget.preparedProcessIdentifiers, expected)
+                TestSupport.expectEqual(TestAX.attributeWriteCount, 0)
+                TestSupport.expectEqual(fixture.state.clipboardWriteCount, 0)
+                TestSupport.expect(fixture.state.pasteCalls.isEmpty && fixture.state.enterCalls.isEmpty,
+                                   "Priming Accessibility must not send any input")
+            }
+        }
     }
 
     private static func testFocusedEditsRejectWithoutClipboardOrInput() {
@@ -807,6 +840,7 @@ final class TestInsertionState {
     static let pasteFiredMark: CFAbsoluteTime = 700_000_000
 
     var originalFieldInsertionEnabled = false
+    var contextAwarenessEnabled = false
     var shouldMonitorHotkeys = false
     let insertionAccessibilityQueue = TestDispatchQueue.main
     let pasteGate = PipelineStageTimings.PasteGate(now: { TestInsertionState.pasteFiredMark })
@@ -982,6 +1016,7 @@ final class TestAXElement {
 
 final class TestApplication {
     let processIdentifier: pid_t
+    var bundleIdentifier: String?
     var isTerminated = false
 
     init(processIdentifier: pid_t) { self.processIdentifier = processIdentifier }
@@ -1046,6 +1081,7 @@ enum TestAX {
     static var afterActivation: ((pid_t) -> Void)?
     static var activationCount = 0
     static var restoreActionCount = 0
+    static var attributeWriteCount = 0
     private static var applications: [pid_t: TestApplication] = [:]
     private static var windows: [pid_t: TestAXElement] = [:]
     private static var elements: [pid_t: TestAXElement] = [:]
@@ -1059,6 +1095,7 @@ enum TestAX {
         afterActivation = nil
         activationCount = 0
         restoreActionCount = 0
+        attributeWriteCount = 0
         applications.removeAll()
         windows.removeAll()
         elements.removeAll()
@@ -1099,6 +1136,7 @@ enum TestAX {
     }
 
     static func setAttributeValue(_ element: TestAXElement, _ attribute: String, _ value: Any) {
+        attributeWriteCount += 1
         guard attribute == focusedAttribute,
               let processIdentifier = elementOwners[ObjectIdentifier(element)] else { return }
         elements[processIdentifier] = element

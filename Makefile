@@ -26,16 +26,19 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/CleanupLevel.swift \
 	Sources/CommandModeIntent.swift \
 	Sources/ContextInferenceFailure.swift \
+	Sources/ContextTermSources.swift \
 	Sources/CursorFormatting.swift \
 	Sources/DeepgramStreamingCore.swift \
 	Sources/DictationStyle.swift \
 	Sources/DictionaryCorrections.swift \
+	Sources/EverydayWords.swift \
 	Sources/FileTagMatcher.swift \
 	Sources/HandsFreeAutoStop.swift \
 	Sources/IdentifierExtractor.swift \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
 	Sources/ModelConfiguration.swift \
+	Sources/NameExtractor.swift \
 	Sources/OriginalFieldInsertionPreference.swift \
 	Sources/PCMSampleHandlerSlot.swift \
 	Sources/PCMStreamResampler.swift \
@@ -44,6 +47,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/PostProcessingService.swift \
 	Sources/RecordingCaptureTiming.swift \
 	Sources/RecordingTimerPreference.swift \
+	Sources/SecretFilter.swift \
 	Sources/SilenceGatePreference.swift \
 	Sources/SnippetExpansion.swift \
 	Sources/SpokenListFormatter.swift \
@@ -222,6 +226,7 @@ AUDIO_REPLAY_SOURCES = $(shell find Tools/AudioReplay -name '*.swift' -type f | 
 AUDIO_REPLAY_PRODUCTION_SOURCES = \
 	Sources/DeepgramStreamingCore.swift \
 	Sources/LLMAPITransport.swift \
+	Sources/SecretFilter.swift \
 	Sources/TemperatureCapabilityCache.swift
 
 # Developer tool (Tools/AudioReplay/README.md). make check only type-checks it.

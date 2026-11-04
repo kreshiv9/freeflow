@@ -38,7 +38,7 @@ enum StreamingTranscriptionProviderTests {
         )
         TestSupport.expectEqual(
             StreamingTranscriptionProvider.deepgram.caption,
-            "Deepgram Nova-3 transcribes while you talk, so the text is ready when you release the key. Your custom vocabulary, corrections and, in Cursor, Windsurf and VS Code, visible code names are sent as key terms."
+            "Deepgram Nova-3 transcribes while you talk, so the text is ready when you release the key. Your custom vocabulary and corrections are sent as key terms. With Context Awareness on, so are your Mac account name, visible code names in Cursor, Windsurf and VS Code, and names on screen in the Claude Code panel, ChatGPT in Chrome or the ChatGPT app, and Google search in Chrome."
         )
         TestSupport.expectEqual(
             StreamingTranscriptionProvider.allCases.map(\.usesRealtimeStreamingModel),

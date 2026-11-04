@@ -21,7 +21,9 @@ enum DeepgramStreamingCoreTests {
         testKeytermNormalization()
         testKeytermsFromVocabularyText()
         testConfigureMessage()
-        testMergedKeyterms()
+        testKeytermPlanConnectTerms()
+        testKeytermPlanConfigureTerms()
+        testAudioMilliseconds()
         testConfigureRepliesAreIgnored()
         testPendingAudioLimit()
         testFrameBytes()
@@ -153,6 +155,16 @@ enum DeepgramStreamingCoreTests {
         TestSupport.expectEqual(cappedByCharacters.count, 20)
         TestSupport.expectEqual(cappedByCharacters, Array(manyLong.prefix(20)))
 
+        // A term that would pass the character cap is skipped; later, shorter terms still fit.
+        let fiftyNines = (0..<20).map { index in
+            String(repeating: Character(UnicodeScalar(97 + index)!), count: 59)
+        }
+        let thirty = String(repeating: "z", count: 30)
+        let skipped = Core.normalizedKeyterms(fiftyNines + [thirty, "Abc"])
+        TestSupport.expectEqual(skipped.count, 21)
+        TestSupport.expectEqual(skipped.last, "Abc")
+        TestSupport.expect(!skipped.contains(thirty), "The term that would pass 1,200 characters is skipped")
+
         let mixed = ["  Claude\tCode  ", "freeflow", "FreeFlow", sixtyOne, "", "Deepgram"]
         TestSupport.expectEqual(Core.normalizedKeyterms(Core.normalizedKeyterms(mixed)), Core.normalizedKeyterms(mixed))
 
@@ -189,21 +201,174 @@ enum DeepgramStreamingCoreTests {
         TestSupport.expect(configure?.contains(syntheticKey) == false, "The Configure message must never carry the key")
     }
 
-    /// The stream's vocabulary keyterms always come first; dotted paths and terms already
-    /// present add nothing, and nil means no update is sent.
-    private static func testMergedKeyterms() {
+    /// The connect URL: correction targets, then vocabulary, then at most two own-name terms,
+    /// then the learned slice clamped to 10...25 by the manual terms kept.
+    private static func testKeytermPlanConnectTerms() {
+        typealias Plan = Core.KeytermPlan
+        TestSupport.expectEqual(Plan.targetTotal, 50)
+        TestSupport.expectEqual(Plan.minimumScreenSlots, 15)
+        TestSupport.expectEqual(Plan.maxOwnNameTerms, 2)
+        TestSupport.expectEqual(Plan.learnedSlots, 10...25)
+
         TestSupport.expectEqual(
-            Core.mergedKeyterms(base: ["Synthetic Term"], adding: ["fooBar", "appState.isRecording", "synthetic term"]),
-            ["Synthetic Term", "fooBar"]
+            Plan.connectTerms(.init(
+                correctionTargets: ["Claude Code"],
+                vocabulary: ["Wispr Flow", "claude code", "Deepgram"],
+                ownName: ["Kai", "Kai Example", "Extra"]
+            )),
+            ["Claude Code", "Wispr Flow", "Deepgram", "Kai", "Kai Example"]
         )
-        TestSupport.expectEqual(Core.mergedKeyterms(base: ["Synthetic Term"], adding: ["synthetic term", "a.b"]), nil)
-        TestSupport.expectEqual(Core.mergedKeyterms(base: (0..<100).map { "term\($0)" }, adding: ["fooBar"]), nil)
-        TestSupport.expectEqual(Core.mergedKeyterms(base: [], adding: ["fooBar"]), ["fooBar"])
+
+        let vocabulary100 = (0..<100).map { "Term\($0)x" }
+        let full = Plan.connectTerms(.init(correctionTargets: ["Claude Code"], vocabulary: vocabulary100))
+        TestSupport.expectEqual(full.count, 100)
+        TestSupport.expectEqual(full.first, "Claude Code")
+
+        let learned = (0..<40).map { "Learned\($0)y" }
+        let small = Plan.connectTerms(.init(vocabulary: ["Alpha1x", "Beta2x"], learned: learned))
+        TestSupport.expectEqual(small.count, 27)
+        TestSupport.expectEqual(Array(small.dropFirst(2)), Array(learned.prefix(25)))
+        let thirty = (0..<30).map { "Vocab\($0)x" }
+        TestSupport.expectEqual(Plan.connectTerms(.init(vocabulary: thirty, learned: learned)).count, 50)
+        let fortyFive = (0..<45).map { "Vocab\($0)x" }
+        TestSupport.expectEqual(Plan.connectTerms(.init(vocabulary: fortyFive, learned: learned)).count, 55)
+        TestSupport.expectEqual(Plan.connectTerms(.init()), [])
+
+        // A term that would pass 1,200 characters is skipped; later, shorter terms of the same
+        // tier and of the next tiers still fit.
+        let thirtyCharacters = String(repeating: "z", count: 30)
+        let nearCap = Plan.connectTerms(.init(
+            correctionTargets: fiftyNineCharacterTerms, vocabulary: [thirtyCharacters, "Abc"], ownName: ["Kai"]
+        ))
+        TestSupport.expectEqual(nearCap.count, 22)
+        TestSupport.expectEqual(Array(nearCap.suffix(2)), ["Abc", "Kai"])
+        TestSupport.expect(!nearCap.contains(thirtyCharacters), "The term that would pass 1,200 characters is skipped")
+    }
+
+    /// Twenty distinct terms of 59 characters: 1,180 of the 1,200-character cap.
+    private static let fiftyNineCharacterTerms = (0..<20).map { index in
+        String(repeating: Character(UnicodeScalar(97 + index)!), count: 59)
+    }
+
+    /// The one Configure: the connect list unchanged, then screen names, then identifiers,
+    /// about targetTotal in all with at least minimumScreenSlots for the screen; nil when
+    /// nothing new fits.
+    private static func testKeytermPlanConfigureTerms() {
+        typealias Plan = Core.KeytermPlan
+        let full = (0..<100).map { "term\($0)" }
+        TestSupport.expect(
+            Plan.configureTerms(connect: full, screenTerms: ["Supabase"], identifiers: ["useAuth"]) == nil,
+            "No Configure when the connect list is at the hard cap"
+        )
+        TestSupport.expect(
+            Plan.configureTerms(connect: ["Synthetic Term"], screenTerms: ["synthetic term"], identifiers: ["a.b"]) == nil,
+            "No Configure when nothing new fits"
+        )
+
+        let connect = ["Claude Code", "Wispr Flow", "Deepgram", "Kai", "Kai Example"]
+        let screen = (0..<60).map { "Screen\($0)y" }
+        let planned = Plan.configureTerms(connect: connect, screenTerms: screen, identifiers: ["fooBar"])
+        TestSupport.expectEqual(planned?.terms.count, 50)
+        TestSupport.expectEqual(planned.map { Array($0.terms.prefix(5)) }, connect)
+        TestSupport.expectEqual(planned?.screenCount, 45)
+        TestSupport.expectEqual(planned?.identifierCount, 0)
+
+        let vocabulary80 = (0..<80).map { "V\($0)" }
         TestSupport.expectEqual(
-            Core.mergedKeyterms(base: [], adding: (0..<80).map { "syntheticName\($0)Value" })?.count,
-            Core.maxContextKeyterms
+            Plan.configureTerms(connect: vocabulary80, screenTerms: screen, identifiers: [])?.screenCount, 15
         )
-        TestSupport.expectEqual(Core.maxContextKeyterms, 50)
+
+        let ordered = Plan.configureTerms(connect: [], screenTerms: ["Vercel"], identifiers: ["useAuth"])
+        TestSupport.expectEqual(ordered?.terms, ["Vercel", "useAuth"])
+        TestSupport.expectEqual(ordered?.screenCount, 1)
+        TestSupport.expectEqual(ordered?.identifierCount, 1)
+
+        // Identifiers alone send a Configure, counted apart from on-screen names.
+        let codeOnly = Plan.configureTerms(connect: ["Synthetic Term"], screenTerms: [], identifiers: ["useAuth"])
+        TestSupport.expectEqual(codeOnly?.screenCount, 0)
+        TestSupport.expectEqual(codeOnly?.identifierCount, 1)
+
+        let filtered = Plan.configureTerms(
+            connect: ["Synthetic Term"],
+            screenTerms: ["1234567890", "gh" + "p_" + String(repeating: "FAKEfake", count: 4), "Supabase"],
+            identifiers: [
+                "appState.isRecording", "1234567890", "gh" + "p_" + String(repeating: "FAKEfake", count: 4), "fooBar"
+            ]
+        )
+        TestSupport.expectEqual(filtered?.terms, ["Synthetic Term", "Supabase", "fooBar"])
+
+        // Near the character cap a long screen term is skipped, and shorter terms still fit.
+        let nearCap = Plan.configureTerms(
+            connect: fiftyNineCharacterTerms,
+            screenTerms: [String(repeating: "z", count: 30), "Vercel"],
+            identifiers: ["fooBar"]
+        )
+        TestSupport.expectEqual(nearCap?.terms, fiftyNineCharacterTerms + ["Vercel", "fooBar"])
+        // The identifier tier skips the same way: a long identifier is passed over, not the end.
+        let nearCapIdentifiers = Plan.configureTerms(
+            connect: fiftyNineCharacterTerms,
+            screenTerms: [],
+            identifiers: ["syntheticLongIdentifier" + String(repeating: "x", count: 20), "useAuth"]
+        )
+        TestSupport.expectEqual(nearCapIdentifiers?.terms, fiftyNineCharacterTerms + ["useAuth"])
+        TestSupport.expectEqual(nearCapIdentifiers?.identifierCount, 1)
+
+        // Secret-like identifiers never reach the Configure, whatever their shape.
+        let secretIdentifiers = Plan.configureTerms(
+            connect: [],
+            screenTerms: [],
+            identifiers: [
+                "AbCdEf" + "123456" + "GhIjKlMn", "sk-" + "proj-" + "FAKEfake0000FAKEfake0000",
+                String(repeating: "3f9a1c0b7e", count: 4), "acct12345678", "useAuth",
+            ]
+        )
+        TestSupport.expectEqual(secretIdentifiers?.terms, ["useAuth"])
+        TestSupport.expectEqual(secretIdentifiers?.identifierCount, 1)
+        TestSupport.expect(
+            Plan.configureTerms(connect: ["Synthetic Term"], screenTerms: [], identifiers: ["AbCdEf" + "123456" + "GhIjKlMn"]) == nil,
+            "Only secret-like identifiers send no Configure"
+        )
+
+        // The Run Log's screen count is on-screen names only; IDE identifiers show as "code".
+        let editorPlan = Plan.configureTerms(
+            connect: ["Synthetic Term"], screenTerms: ["Supabase"], identifiers: ["useAuth", "fooBar"]
+        )
+        TestSupport.expectEqual(
+            PipelineStageTimings(
+                keytermsAtConnect: 1, screenKeyterms: editorPlan?.screenCount, codeKeyterms: editorPlan?.identifierCount,
+                screenKeytermsAudioMilliseconds: 0
+            ).keytermLine,
+            "keyterms 1 · screen 1 · code 2 (from start)"
+        )
+        let identifiersOnly = Plan.configureTerms(connect: ["Synthetic Term"], screenTerms: [], identifiers: ["useAuth", "fooBar"])
+        TestSupport.expectEqual(
+            PipelineStageTimings(
+                keytermsAtConnect: 1, screenKeyterms: identifiersOnly?.screenCount,
+                codeKeyterms: identifiersOnly?.identifierCount, screenKeytermsAudioMilliseconds: 0
+            ).keytermLine,
+            "keyterms 1 · code 2 (from start)"
+        )
+
+        // A dot outside a version number marks a host or domain, which is never sent.
+        let dotted = Plan.configureTerms(
+            connect: [],
+            screenTerms: ["zorblax-lab [SSH: devbox-07.corp.example.internal", "Next.js", "GPT-4.5", "Llama-3.1-8B"],
+            identifiers: []
+        )
+        TestSupport.expectEqual(dotted?.terms, ["GPT-4.5", "Llama-3.1-8B"])
+
+        let names = (0..<10).map { "Name\($0)z" }
+        let identifiers = (0..<20).map { "identifier\($0)Value" }
+        let filled = Plan.configureTerms(connect: vocabulary80, screenTerms: names, identifiers: identifiers)
+        TestSupport.expectEqual(filled?.screenCount, 10)
+        TestSupport.expectEqual(filled?.identifierCount, 5)
+        TestSupport.expectEqual(filled.map { Array($0.terms.suffix(15)) }, names + Array(identifiers.prefix(5)))
+    }
+
+    private static func testAudioMilliseconds() {
+        TestSupport.expectEqual(Core.audioMilliseconds(bytes: 32_000, sampleRate: 16_000), 1000)
+        TestSupport.expectEqual(Core.audioMilliseconds(bytes: 0, sampleRate: 16_000), 0)
+        TestSupport.expectEqual(Core.audioMilliseconds(bytes: 32_000, sampleRate: 0), 0)
     }
 
     /// Deepgram answers a Configure with ConfigureSuccess or ConfigureFailure; neither may

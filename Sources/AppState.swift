@@ -577,7 +577,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// cut the wall-clock time between "stop" and text-ready because most transcription
     /// work happens while the user is still speaking; `.off` uploads the file after release.
     @Published var streamingProvider: StreamingTranscriptionProvider {
-        didSet { streamingProvider.save(to: .standard) }
+        didSet {
+            streamingProvider.save(to: .standard)
+            warmUpSpeechTermsIfNeeded()
+        }
     }
 
     /// Model ID the realtime WebSocket should transcribe with. Empty means
@@ -660,6 +663,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var contextAwarenessEnabled: Bool {
         didSet {
             UserDefaults.standard.set(contextAwarenessEnabled, forKey: ContextCapturePreferences.contextAwarenessStorageKey)
+            updateInsertionAccessibilityPreparation()
+            warmUpSpeechTermsIfNeeded()
         }
     }
 
@@ -1060,6 +1065,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         installAudioDeviceObservers()
         // didSet does not run in init, so build the selected filter at launch.
         audioRecorder.prepareVoiceIsolation(effectiveVoiceIsolation)
+        // didSet does not run in init, so warm up the on-screen name extraction at launch.
+        warmUpSpeechTermsIfNeeded()
 
         if shortcuts.didUpdateHoldStoredValue {
             persistShortcut(shortcuts.hold, key: holdShortcutStorageKey)
@@ -2123,7 +2130,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func updateInsertionAccessibilityPreparation() {
         insertionAccessibilityCancellable = nil
-        guard shouldMonitorHotkeys, originalFieldInsertionEnabled else { return }
+        guard shouldMonitorHotkeys, originalFieldInsertionEnabled || contextAwarenessEnabled else { return }
         insertionAccessibilityCancellable = NSWorkspace.shared.notificationCenter
             .publisher(for: NSWorkspace.didActivateApplicationNotification)
             .receive(on: DispatchQueue.main)
@@ -2132,9 +2139,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     /// A role query lets Electron expose its editor before the start-time snapshot, without reading text.
+    /// It runs for any app with Original Field Insertion, and with Context Awareness for Chrome, VS Code
+    /// and ChatGPT.app, whose web content then answers the text context reads. Never writes an attribute.
     private func prepareForegroundApplicationForInsertion() {
-        guard shouldMonitorHotkeys, originalFieldInsertionEnabled, AXIsProcessTrusted(),
-              let app = NSWorkspace.shared.frontmostApplication else { return }
+        guard shouldMonitorHotkeys, AXIsProcessTrusted(),
+              let app = NSWorkspace.shared.frontmostApplication,
+              originalFieldInsertionEnabled
+                || (contextAwarenessEnabled && ContextTarget.primesAccessibility(bundleIdentifier: app.bundleIdentifier))
+        else { return }
         let processIdentifier = app.processIdentifier
         insertionAccessibilityQueue.async {
             AppTextInsertionTarget.prepareAccessibility(processIdentifier: processIdentifier)
@@ -3014,6 +3026,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
 
         startStreamingIfEnabled()
+        // Text context starts with the stream, so its one Deepgram Configure can be held and
+        // sent before the first audio. The legacy screenshot path still waits for the engine,
+        // because its permission error stops the recording.
+        let startsContextAfterEngine = screenshotContextEnabled
+        if !startsContextAfterEngine {
+            startContextCapture()
+        }
         // Only a stream that actually started gets a rate; nil skips the stream conversion.
         let streamSampleRate = realtimeService == nil ? nil : streamingProvider.streamSampleRate
         let captureFormat = self.captureFormat
@@ -3036,7 +3055,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 os_log(.info, log: recordingLog, "audioRecorder.startRecording() done: %.3fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
                 DispatchQueue.main.async { [self] in
                     guard self.isRecording, self.activeRecordingTriggerMode != nil else { return }
-                    self.startContextCapture()
+                    if startsContextAfterEngine {
+                        self.startContextCapture()
+                    }
                     self.audioLevelCancellable = self.audioRecorder.$audioLevel
                         .receive(on: DispatchQueue.main)
                         .sink { [weak self] level in
@@ -3673,6 +3694,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     let resolved = try await resolvedTranscript
                     stageMarks.transcriptionFinished = CFAbsoluteTimeGetCurrent()
                     stageMarks.transcriptionSource = resolved.source
+                    if let report = (activeRealtime as? DeepgramStreamingService)?.keytermReport {
+                        stageMarks.keytermsAtConnect = report.connectCount
+                        stageMarks.screenKeyterms = report.screenCount
+                        stageMarks.codeKeyterms = report.identifierCount
+                        stageMarks.screenKeytermsAudioMilliseconds = report.audioMillisecondsBeforeUpdate
+                    }
                     let rawTranscript = resolved.transcript
                     let parsedTranscript = Self.parseTranscriptCommands(
                         from: rawTranscript,
@@ -4207,14 +4234,36 @@ final class AppState: ObservableObject, @unchecked Sendable {
             os_log(.info, log: recordingLog, "deepgram streaming selected but no API key is set — using file upload")
             return nil
         }
-        let vocabulary = DictionaryCorrection.vocabularyText(customVocabulary, merging: dictionaryCorrections)
         let config = DeepgramStreamingCore.Configuration(
             apiKey: key,
             language: resolvedTranscriptionLanguage,
             sampleRate: StreamingTranscriptionProvider.deepgramSampleRate,
-            keyterms: DeepgramStreamingCore.keyterms(fromVocabularyText: vocabulary)
+            keyterms: DeepgramStreamingCore.KeytermPlan.connectTerms(.init(
+                correctionTargets: dictionaryCorrections.map(\.normalized).filter(\.isUsable).map(\.to),
+                vocabulary: DeepgramStreamingCore.keyterms(fromVocabularyText: customVocabulary),
+                // Context Awareness is the user's switch for every screen and account keyterm.
+                ownName: DeepgramStreamingCore.KeytermPlan.sendsOwnName && contextAwarenessEnabled
+                    ? Self.ownNameKeyterms
+                    : []
+            ))
         )
         return DeepgramStreamingService(config: config)
+    }
+
+    /// The Mac account's first and full name for the Deepgram connect keyterms, computed once
+    /// per launch. A static let initializes once and thread-safely, so the warm-up builds it
+    /// off main and a dictation only reads it. Never stored or logged.
+    private static let ownNameKeyterms: [String] = NameExtractor.ownNameTerms(
+        fullName: NSFullUserName(), everyday: EverydayWords.all
+    )
+
+    /// Only Deepgram streaming with Context Awareness uses the word list, the secret and name
+    /// patterns, the name tagger and the own-name keyterms; this builds them on a utility
+    /// queue whenever both become true, so no dictation pays for them on main. Idempotent.
+    private func warmUpSpeechTermsIfNeeded() {
+        guard contextAwarenessEnabled, streamingProvider == .deepgram else { return }
+        NameExtractor.prewarm()
+        DispatchQueue.global(qos: .utility).async { _ = Self.ownNameKeyterms }
     }
 
     private func tearDownRealtimeService() {
@@ -4261,19 +4310,28 @@ final class AppState: ObservableObject, @unchecked Sendable {
             : AppContextService.textContextScreenshotStatus
         // This recording's stream (startStreamingIfEnabled ran first); nil for any other provider.
         let deepgram = realtimeService as? DeepgramStreamingService
+        let wantsSpeechTerms = deepgram != nil
+        let startedAt = CFAbsoluteTimeGetCurrent()
 
         contextCaptureTask = Task { [weak self, weak deepgram] in
             guard let self else { return nil }
+            // On-screen names and visible code names reach the live Deepgram stream as keyterms,
+            // in one Configure sent as soon as they are ready.
             let context = usesScreenshotContext
                 ? await self.contextService.collectContext()
-                : self.contextService.collectTextContext(readFieldText: readsFieldText)
+                : self.contextService.collectTextContext(
+                    readFieldText: readsFieldText, wantsSpeechTerms: wantsSpeechTerms
+                ) { screenTerms, identifiers in
+                    guard !Task.isCancelled else { return }
+                    deepgram?.updateKeyterms(screenTerms: screenTerms, identifiers: identifiers)
+                }
+            os_log(
+                .info, log: recordingLog, "context ready +%.0f ms after recording start",
+                (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            )
             // A cancelled capture (the session was aborted, or ended without
             // speech) must not publish over the state that replaced it.
             guard !Task.isCancelled else { return nil }
-            // Visible code names also reach the live Deepgram stream as keyterms.
-            if let identifiers = context.textContext?.codeIdentifiers, !identifiers.isEmpty {
-                deepgram?.updateKeyterms(identifiers)
-            }
             await MainActor.run {
                 guard !Task.isCancelled else { return }
                 self.capturedContext = context
@@ -4297,7 +4355,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func fallbackContextAtStop(currentActivity: String) -> AppContext {
         let frontmostApp = NSWorkspace.shared.frontmostApplication
-        let windowTitle = focusedWindowTitle(for: frontmostApp)
+        let windowTitle = focusedWindowTitle(for: frontmostApp).map(SecretFilter.redact)
         return AppContext(
             appName: frontmostApp?.localizedName,
             bundleIdentifier: frontmostApp?.bundleIdentifier,
