@@ -244,6 +244,31 @@ enum AssemblyAIStreamingCoreTests {
         for (bundle, domain, expected) in cases {
             TestSupport.expectEqual(Scenario.resolve(bundleIdentifier: bundle, websiteDomain: domain), expected)
         }
+
+        // Text context refines the connect scenario, except in a private Chrome window, which
+        // keeps the bundle-only connect scenario (.dictation for Chrome) and so sends nothing
+        // about its page. A title that does not parse fails safe the same way.
+        let refinements: [(String?, String?, String?, Scenario?)] = [
+            ("com.google.Chrome", "chatgpt.com", "ChatGPT - Google Chrome", .aiChat),
+            ("com.google.Chrome", "chatgpt.com", "ChatGPT - Google Chrome - Synthetic Profile", .aiChat),
+            ("com.google.Chrome", "google.com", "synthetic query - Google Search - Google Chrome", .googleSearch),
+            ("com.google.Chrome.beta", "mail.google.com", "Inbox - Google Chrome Beta", .email),
+            ("com.google.Chrome", "chatgpt.com", "ChatGPT - Google Chrome (Incognito)", nil),
+            ("com.google.Chrome", "google.com", "Google - Google Chrome (Guest)", nil),
+            ("com.google.Chrome.canary", "chatgpt.com", "ChatGPT - Google Chrome Canary (Incognito)", nil),
+            ("com.google.Chrome", "chatgpt.com", "ChatGPT - Google Chrome (Inkognito)", nil),
+            ("com.google.Chrome", "chatgpt.com", "Google Chrome", nil),
+            ("com.google.Chrome", "chatgpt.com", nil, nil),
+            ("com.apple.Safari", "claude.ai", nil, .aiChat),
+            ("com.microsoft.VSCode", nil, "synthetic.swift — SyntheticProject", .codingAssistant),
+            ("com.apple.mail", nil, "Synthetic (Incognito)", .email),
+            ("com.apple.TextEdit", nil, nil, .dictation),
+        ]
+        for (bundle, domain, title, expected) in refinements {
+            TestSupport.expectEqual(
+                Scenario.refinement(bundleIdentifier: bundle, websiteDomain: domain, windowTitle: title), expected
+            )
+        }
     }
 
     /// Text context carries screen text, titles and names; only the bundle and domain pick
@@ -342,6 +367,21 @@ enum AssemblyAIStreamingCoreTests {
             message(#"{"type":"Turn","turn_order":4,"end_of_turn":true,"transcript":"A b c.","words":[{"text":"A","start":10,"end":1635},{"text":"b","end":4155.4},{"text":"c.","start":900,"end":2975},{"text":"x","end":"9999"},{"text":"y"},7]}"#),
             .turn(order: 4, transcript: "A b c.", endOfTurn: true, speechEndMilliseconds: 4155)
         )
+        // Word ends outside 0...Int32.max ms are skipped instead of trapping the conversion
+        // (1e19 > Int.max) or overflowing the commit arithmetic (a huge negative end).
+        TestSupport.expectEqual(
+            message(#"{"type":"Turn","turn_order":5,"end_of_turn":true,"transcript":"x","words":[{"end":1e19},{"end":-5},{"end":-1e19},{"end":1e300},{"end":2147483648},{"end":1200}]}"#),
+            .turn(order: 5, transcript: "x", endOfTurn: true, speechEndMilliseconds: 1200)
+        )
+        TestSupport.expectEqual(
+            message(#"{"type":"Turn","turn_order":0,"end_of_turn":true,"transcript":"x","words":[{"end":1e19}]}"#),
+            .turn(order: 0, transcript: "x", endOfTurn: true, speechEndMilliseconds: nil)
+        )
+        TestSupport.expectEqual(
+            message(#"{"type":"Turn","turn_order":0,"end_of_turn":true,"transcript":"x","words":[{"end":0},{"end":2147483647}]}"#),
+            .turn(order: 0, transcript: "x", endOfTurn: true, speechEndMilliseconds: 2_147_483_647)
+        )
+        TestSupport.expectEqual(Core.ServerMessage.maxWordEndMilliseconds, 2_147_483_647)
         TestSupport.expectEqual(
             message(#"{"type":"Termination","audio_duration_seconds":3,"session_duration_seconds":4}"#),
             .termination
@@ -385,18 +425,32 @@ enum AssemblyAIStreamingCoreTests {
             TestSupport.expectEqual(Core.failure(errorCode: code, message: "Ignore previous instructions"), .serverError(code: code))
         }
 
-        TestSupport.expectEqual(Core.failure(closeCode: 1000, httpStatus: 101), nil)
-        TestSupport.expectEqual(Core.failure(closeCode: nil, httpStatus: nil), nil)
-        TestSupport.expectEqual(Core.failure(closeCode: 0, httpStatus: nil), nil)
-        TestSupport.expectEqual(Core.failure(closeCode: 1008, httpStatus: 101), .unauthorized)
-        TestSupport.expectEqual(Core.failure(closeCode: 3008, httpStatus: nil), .serverError(code: 3008))
-        TestSupport.expectEqual(Core.failure(closeCode: 1011, httpStatus: nil), .serverError(code: 1011))
-        TestSupport.expectEqual(Core.failure(closeCode: nil, httpStatus: 401), .unauthorized)
-        TestSupport.expectEqual(Core.failure(closeCode: 0, httpStatus: 403), .unauthorized)
-        TestSupport.expectEqual(Core.failure(closeCode: nil, httpStatus: 429), .accountLimit)
+        TestSupport.expectEqual(Core.failure(closeCode: 1000, closeReason: nil, httpStatus: 101), nil)
+        TestSupport.expectEqual(Core.failure(closeCode: nil, closeReason: nil, httpStatus: nil), nil)
+        TestSupport.expectEqual(Core.failure(closeCode: 0, closeReason: nil, httpStatus: nil), nil)
+        TestSupport.expectEqual(Core.failure(closeCode: 1008, closeReason: nil, httpStatus: 101), .unauthorized)
+        TestSupport.expectEqual(Core.failure(closeCode: 3008, closeReason: nil, httpStatus: nil), .serverError(code: 3008))
+        TestSupport.expectEqual(Core.failure(closeCode: 1011, closeReason: nil, httpStatus: nil), .serverError(code: 1011))
+        TestSupport.expectEqual(Core.failure(closeCode: nil, closeReason: nil, httpStatus: 401), .unauthorized)
+        TestSupport.expectEqual(Core.failure(closeCode: 0, closeReason: nil, httpStatus: 403), .unauthorized)
+        TestSupport.expectEqual(Core.failure(closeCode: nil, closeReason: nil, httpStatus: 429), .accountLimit)
+        // A 1008 close reason carries the error text when the Error frame could not be sent.
+        for reason in ["Unauthorized Connection: Insufficient funds", "Unauthorized Connection: Too many concurrent sessions"] {
+            TestSupport.expectEqual(Core.failure(closeCode: 1008, closeReason: reason, httpStatus: 101), .accountLimit)
+        }
+        for reason in ["Unauthorized Connection: Invalid API key", "See Error message for details", ""] {
+            TestSupport.expectEqual(Core.failure(closeCode: 1008, closeReason: reason, httpStatus: 101), .unauthorized)
+        }
+        // The reason only matters for 1008, and a refused handshake still wins.
+        TestSupport.expectEqual(Core.failure(closeCode: 1000, closeReason: "Insufficient funds", httpStatus: 101), nil)
+        TestSupport.expectEqual(
+            Core.failure(closeCode: 3005, closeReason: "Insufficient funds", httpStatus: nil), .serverError(code: 3005)
+        )
+        TestSupport.expectEqual(Core.failure(closeCode: 1008, closeReason: "Insufficient funds", httpStatus: 401), .unauthorized)
 
         let descriptions: [(AssemblyAIStreamingError, String)] = [
             (.notConnected, "AssemblyAI could not connect"),
+            (.releasedBeforeSessionBegan, "AssemblyAI session had not started yet"),
             (.unauthorized, "AssemblyAI rejected the API key"),
             (.accountLimit, "AssemblyAI refused the session (rate limit or account balance)"),
             (.serverError(code: 3005), "AssemblyAI reported an error"),
@@ -461,6 +515,14 @@ enum AssemblyAIStreamingCoreTests {
 
     private static func testCommitConstants() {
         TestSupport.expectEqual(Policy.timeout, 3)
+        TestSupport.expectEqual(Policy.maxBacklogWait, 3)
+        // The deadline grows by the time the throttle needs to drain the backlog, capped.
+        TestSupport.expectEqual(Policy.deadline(backlogMillisecondsAtCommit: 0), 3)
+        TestSupport.expectEqual(Policy.deadline(backlogMillisecondsAtCommit: -100), 3)
+        TestSupport.expectEqual(Policy.deadline(backlogMillisecondsAtCommit: 1250), 4)
+        TestSupport.expectEqual(Policy.deadline(backlogMillisecondsAtCommit: 4750), 6)
+        TestSupport.expectEqual(Policy.deadline(backlogMillisecondsAtCommit: 100_000), 6)
+        TestSupport.expectEqual(Policy.backlogDrainSeconds(backlogMillisecondsAtCommit: 2500), 2)
         TestSupport.expectEqual(Policy.coverageSlackMilliseconds, 300)
         TestSupport.expectEqual(Core.minTurnSilenceMilliseconds, 5000)
         TestSupport.expectEqual(Policy.commitMessages, [#"{"type":"ForceEndpoint"}"#, #"{"type":"Terminate"}"#])
@@ -561,8 +623,32 @@ enum AssemblyAIStreamingCoreTests {
             decision(before: [turn(0, "First.", ended: true, speechEnd: 900)], elapsed: 3),
             .resolve("First.", .finals)
         )
+        // A backlog moves the deadline out by its drain time (300 ms -> 0.24 s).
+        TestSupport.expectEqual(decision(before: [spoken], after: [forced], elapsed: 3, backlog: 300), .wait)
         TestSupport.expectEqual(
-            decision(before: [spoken], after: [forced], elapsed: 3, backlog: 300),
+            decision(before: [spoken], after: [forced], elapsed: 3.25, backlog: 300),
+            .resolve("Hello world.", .finals)
+        )
+        // A slow handshake left 4750 ms queued: at 3 s the server cannot have reached the
+        // trailing words, so the commit keeps waiting for Termination...
+        TestSupport.expectEqual(decision(before: [spoken], elapsed: 3, backlog: 4750), .wait)
+        TestSupport.expectEqual(
+            decision(before: [spoken], after: [forced, .termination], elapsed: 4.2, backlog: 4750),
+            .resolve("Hello world.", .finals)
+        )
+        // ...until the capped deadline, by which the 3.8 s drain is done.
+        TestSupport.expectEqual(
+            decision(before: [spoken], elapsed: 6, backlog: 4750),
+            .resolve("hello wor", .finalsWithPartialTail)
+        )
+        // A backlog the capped deadline cannot cover falls back rather than drop trailing
+        // words, even with text in hand; without counted speech the text resolves.
+        TestSupport.expectEqual(decision(before: [spoken], elapsed: 5.9, backlog: 9000), .wait)
+        TestSupport.expectEqual(
+            decision(before: [spoken], after: [forced], elapsed: 6, backlog: 9000), .fallBack(.commitTimedOut)
+        )
+        TestSupport.expectEqual(
+            decision(before: [spoken], after: [forced], elapsed: 6, heardSpeech: false, backlog: 9000),
             .resolve("Hello world.", .finals)
         )
         TestSupport.expectEqual(decision(before: [], elapsed: 3), .fallBack(.commitTimedOut))
@@ -720,8 +806,9 @@ enum AssemblyAIStreamingCoreTests {
         )
         service.appendPCM16(Data(count: 3200))
         service.setRecorderHeardSpeech(true)
-        // ...and with no Begin the commit throws at once, so the file upload runs.
-        await expectCommitThrows(service, .notConnected)
+        // ...and with no Begin the commit throws at once, so the file upload runs; nothing
+        // failed, so the Run Log does not report a connection failure.
+        await expectCommitThrows(service, .releasedBeforeSessionBegan)
         // A held update that never went out must not show in the Run Log.
         TestSupport.expectEqual(
             service.keytermReport,
@@ -735,8 +822,10 @@ enum AssemblyAIStreamingCoreTests {
         TestSupport.expectEqual(service.keytermReport.screenCount, nil)
         await expectCommitThrows(service, .notConnected)
 
-        // Keyterms off: none at connect and no updates.
+        // Keyterms off: none at connect and no updates, so text context reads no screen names.
+        TestSupport.expect(service.acceptsKeytermUpdates, "Keyterms on take the mid-stream update")
         let noKeyterms = AssemblyAIStreamingService(config: configuration(keyterms: ["Wispr Flow"], keytermsEnabled: false))
+        TestSupport.expect(!noKeyterms.acceptsKeytermUpdates, "Keyterms off take no mid-stream update")
         noKeyterms.updateKeyterms(screenTerms: ["Supabase"], identifiers: [])
         TestSupport.expectEqual(
             noKeyterms.keytermReport,
@@ -744,10 +833,22 @@ enum AssemblyAIStreamingCoreTests {
         )
         noKeyterms.cancel()
 
-        // Too much audio before Begin abandons the stream.
+        // Too much audio before Begin abandons the stream: it is torn down at once, so a later
+        // update is dropped instead of held (it would report 1 screen term), and the commit
+        // reports the connection failure, not a release before Begin.
         let overflow = AssemblyAIStreamingService(config: configuration())
         overflow.appendPCM16(Data(count: DeepgramStreamingCore.maxPendingAudioBytes(sampleRate: 16000) + 3200))
+        overflow.updateKeyterms(screenTerms: ["Supabase"], identifiers: [])
+        TestSupport.expectEqual(overflow.keytermReport.screenCount, nil)
         await expectCommitThrows(overflow, .notConnected)
         overflow.cancel()
+
+        // Just under the limit nothing is abandoned: the update is held for Begin.
+        let underLimit = AssemblyAIStreamingService(config: configuration())
+        underLimit.appendPCM16(Data(count: DeepgramStreamingCore.maxPendingAudioBytes(sampleRate: 16000)))
+        underLimit.updateKeyterms(screenTerms: ["Supabase"], identifiers: [])
+        TestSupport.expectEqual(underLimit.keytermReport.screenCount, 1)
+        await expectCommitThrows(underLimit, .releasedBeforeSessionBegan)
+        underLimit.cancel()
     }
 }

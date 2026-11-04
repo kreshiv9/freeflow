@@ -23,7 +23,7 @@ private final class AssemblyAISocketDelegate: NSObject, URLSessionWebSocketDeleg
         didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
         reason: Data?
     ) {
-        service?.socketDidClose(code: closeCode.rawValue)
+        service?.socketDidClose(code: closeCode.rawValue, reason: reason)
     }
 }
 
@@ -74,6 +74,9 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
     private var socketState = CommitPolicy.SocketState.open
     /// The server's close code from the delegate, when it arrives before the receive loop ends.
     private var serverCloseCode: Int?
+    /// The failure that close's code and reason report, classified in socketDidClose; the
+    /// reason text itself is never kept.
+    private var serverCloseFailure: AssemblyAIStreamingError?
     private var commitStartedAt: TimeInterval?
     /// Audio the server cannot have processed when the commit started (throttle estimate).
     private var backlogMillisecondsAtCommit = 0
@@ -222,20 +225,25 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
     }
 
     /// Send the padded partial frame, then ForceEndpoint and Terminate, then wait for
-    /// ForceEndpoint's end_of_turn, Termination or the close within CommitPolicy.timeout.
+    /// ForceEndpoint's end_of_turn, Termination or the close by CommitPolicy.deadline.
     /// Throws at once when the server cannot have heard anything, so the file upload starts
     /// without waiting; every early throw tears the socket down.
     func commitAndAwaitFinal() async throws -> String {
-        let commitTask: URLSessionWebSocketTask = try stateQueue.sync {
+        let (commitTask, deadline): (URLSessionWebSocketTask, TimeInterval) = try stateQueue.sync {
             if let error = terminalError ?? failure {
                 teardownLocked()
                 throw error
             }
             // A second commit must not tear down the one in flight.
             guard commitStartedAt == nil else { throw AssemblyAIStreamingError.notConnected }
-            guard !closed, let task, isReady else {
+            guard !closed else {
                 teardownLocked()
                 throw AssemblyAIStreamingError.notConnected
+            }
+            // A short dictation released while the handshake still runs: nothing failed.
+            guard isReady, let task else {
+                teardownLocked()
+                throw AssemblyAIStreamingError.releasedBeforeSessionBegan
             }
             guard socketState == .open else {
                 teardownLocked()
@@ -256,7 +264,7 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
             )
             assembler.markCommitted()
             terminateSent = true
-            return task
+            return (task, CommitPolicy.deadline(backlogMillisecondsAtCommit: backlogMillisecondsAtCommit))
         }
 
         for message in CommitPolicy.commitMessages {
@@ -266,7 +274,7 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
                 }
             }
         }
-        scheduleCommitTimeout()
+        scheduleCommitTimeout(after: deadline)
 
         return try await withCheckedThrowingContinuation { continuation in
             stateQueue.sync {
@@ -283,9 +291,9 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
         }
     }
 
-    /// Re-evaluates once the commit timeout elapses; a no-op after resolution.
-    private func scheduleCommitTimeout() {
-        stateQueue.asyncAfter(deadline: .now() + CommitPolicy.timeout) { [weak self] in
+    /// Re-evaluates once the commit deadline elapses; a no-op after resolution.
+    private func scheduleCommitTimeout(after deadline: TimeInterval) {
+        stateQueue.asyncAfter(deadline: .now() + deadline) { [weak self] in
             self?.evaluateLocked()
         }
     }
@@ -346,6 +354,9 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
         }
     }
 
+    /// updateKeyterms ignores every call with keyterms off.
+    var acceptsKeytermUpdates: Bool { config.keytermsEnabled }
+
     /// Numbers only, for the Run Log.
     var keytermReport: DeepgramStreamingCore.KeytermReport {
         stateQueue.sync {
@@ -367,13 +378,19 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
         }
     }
 
-    /// Only records the code: the delegate can run before the receive loop has applied
-    /// the last queued frames, so the close itself is reported by the receive loop once
-    /// every delivered frame has been handled.
-    fileprivate func socketDidClose(code: Int) {
+    /// Only records the code and what it reports: the delegate can run before the receive
+    /// loop has applied the last queued frames, so the close itself is reported by the
+    /// receive loop once every delivered frame has been handled. The reason carries the
+    /// error text when the server could not send its Error frame; it is matched against
+    /// fixed markers here and dropped, never stored or logged.
+    fileprivate func socketDidClose(code: Int, reason: Data?) {
         os_log(.info, log: assemblyAILog, "socket closed with code %d", code)
+        let closeFailure = AssemblyAIStreamingCore.failure(
+            closeCode: code, closeReason: reason.flatMap { String(data: $0, encoding: .utf8) }, httpStatus: nil
+        )
         stateQueue.async { [self] in
             serverCloseCode = code
+            serverCloseFailure = closeFailure
         }
     }
 
@@ -509,7 +526,14 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
         pendingAudio = []
         pendingAudioBytes = 0
         if failure == nil {
-            failure = AssemblyAIStreamingCore.failure(closeCode: closeCode, httpStatus: httpStatus)
+            // The delegate's close (code and reason) only arrives after a completed handshake,
+            // so it never hides a refused one. Without it, the task's own close frame decides;
+            // its reason is matched and dropped here too.
+            failure = serverCloseFailure ?? AssemblyAIStreamingCore.failure(
+                closeCode: closeCode,
+                closeReason: task?.closeReason.flatMap { String(data: $0, encoding: .utf8) },
+                httpStatus: httpStatus
+            )
         }
         if commitStartedAt == nil {
             if !closed, terminalError == nil {

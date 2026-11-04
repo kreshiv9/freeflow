@@ -5,10 +5,14 @@ import Foundation
 /// text-free reason the Run Log shows after "file-fallback: "; the server's error text
 /// is only matched to pick a case, never stored, logged or shown.
 enum AssemblyAIStreamingError: LocalizedError, Equatable {
-    /// start() never ran, Begin never arrived, the handshake stalled or cancel() ran.
+    /// The handshake failed, Begin never arrived within the pending-audio limit, the
+    /// commit came twice or cancel() ran.
     case notConnected
-    /// Close or error code 1008 for a missing, invalid, expired or disabled key, or an
-    /// HTTP 401/403 on the handshake.
+    /// The shortcut was released before Begin (a short dictation while the handshake ran,
+    /// or a stream never started); nothing failed.
+    case releasedBeforeSessionBegan
+    /// Close or error code 1008 for a missing, invalid, expired or disabled key (or with no
+    /// text naming an account refusal), or an HTTP 401/403 on the handshake.
     case unauthorized
     /// Code 1008 for the session-start rate limit or a low account balance, or HTTP 429.
     case accountLimit
@@ -18,7 +22,8 @@ enum AssemblyAIStreamingError: LocalizedError, Equatable {
     case socketClosedBeforeCommit
     /// The socket closed abnormally after the commit, before the transcript arrived.
     case socketClosedBeforeFinal
-    /// CommitPolicy.timeout elapsed with no text although the recorder counted speech.
+    /// The commit deadline passed with no text although the recorder counted speech, or
+    /// before the server could have reached the end of the audio.
     case commitTimedOut
     /// AssemblyAI returned no words although the recorder counted speech.
     case emptyTranscriptForSpeech
@@ -26,6 +31,7 @@ enum AssemblyAIStreamingError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .notConnected: "AssemblyAI could not connect"
+        case .releasedBeforeSessionBegan: "AssemblyAI session had not started yet"
         case .unauthorized: "AssemblyAI rejected the API key"
         case .accountLimit: "AssemblyAI refused the session (rate limit or account balance)"
         case .serverError: "AssemblyAI reported an error"
@@ -325,22 +331,27 @@ enum AssemblyAIStreamingCore {
     }
 
     /// The failure a close reports when no Error frame did: a refused handshake (HTTP
-    /// 401/403 or 429) or a documented error close code. A normal close (1000), no code
-    /// and transport-level codes are nil; the socket state then decides.
-    static func failure(closeCode: Int?, httpStatus: Int?) -> AssemblyAIStreamingError? {
+    /// 401/403 or 429) or a documented error close code. A 1008 close reason carries the
+    /// Error frame's text when the frame could not be sent (common-session-errors), so it
+    /// is matched like that text and dropped. A normal close (1000), no code and
+    /// transport-level codes are nil; the socket state then decides.
+    static func failure(closeCode: Int?, closeReason: String?, httpStatus: Int?) -> AssemblyAIStreamingError? {
         switch httpStatus {
         case 401, 403: return .unauthorized
         case 429: return .accountLimit
         default: break
         }
         switch closeCode {
-        case 1008: return .unauthorized
+        case 1008: return failure(errorCode: 1008, message: closeReason)
         case 1011, 3005, 3006, 3007, 3008: return .serverError(code: closeCode)
         default: return nil
         }
     }
 
     enum ServerMessage: Equatable {
+        /// About 24.8 days of stream audio; sessions end after 3 hours.
+        static let maxWordEndMilliseconds = Int(Int32.max)
+
         case begin
         /// One Turn: its text replaces the previous text of the same turn_order.
         /// speechEndMilliseconds is the latest words[].end (ms of stream audio), nil
@@ -355,7 +366,8 @@ enum AssemblyAIStreamingCore {
         /// without an integral turn_order -> .unknown (SpeechStarted, Heartbeat and
         /// SpeakerRevision included). Turn text is `transcript`, or `utterance` when the
         /// transcript is empty; end_of_turn defaults false and tolerates wrong types, and
-        /// words without a numeric `end` are skipped.
+        /// words without a numeric `end` in 0...maxWordEndMilliseconds are skipped, so no
+        /// provider value can trap the conversion or overflow the commit arithmetic.
         init(data: Data) {
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let type = object["type"] as? String else {
@@ -374,7 +386,8 @@ enum AssemblyAIStreamingCore {
                 let utterance = object["utterance"] as? String ?? ""
                 let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? utterance : transcript
                 let wordEnds = (object["words"] as? [Any] ?? []).compactMap { word -> Int? in
-                    guard let end = (word as? [String: Any])?["end"] as? Double, end.isFinite else { return nil }
+                    guard let end = (word as? [String: Any])?["end"] as? Double,
+                          (0...Double(Self.maxWordEndMilliseconds)).contains(end) else { return nil }
                     return Int(end.rounded())
                 }
                 self = .turn(
@@ -455,6 +468,9 @@ enum AssemblyAIStreamingCore {
     enum CommitPolicy {
         /// Same budget as Deepgram's (#21); ForceEndpoint answers in about 0.1-0.3 s.
         static let timeout: TimeInterval = 3
+        /// The most the deadline grows for audio still queued behind the throttle at the
+        /// commit, so a commit never waits longer than timeout + this.
+        static let maxBacklogWait: TimeInterval = 3
         /// Margin under min_turn_silence for the fast path's coverage check.
         static let coverageSlackMilliseconds = 300
         static let forceEndpointMessage = #"{"type":"ForceEndpoint"}"#
@@ -474,6 +490,18 @@ enum AssemblyAIStreamingCore {
 
         typealias SocketState = DeepgramStreamingCore.CommitPolicy.SocketState
 
+        /// Seconds the server needs, at the throttle rate, to reach the end of the audio
+        /// still queued when the commit started.
+        static func backlogDrainSeconds(backlogMillisecondsAtCommit: Int) -> TimeInterval {
+            Double(max(0, backlogMillisecondsAtCommit)) / (1000 * AssemblyAIStreamingCore.throttleRealTimeFactor)
+        }
+
+        /// timeout after the server can have reached the end of the audio, so ForceEndpoint
+        /// gets the same budget with or without a backlog; at most timeout + maxBacklogWait.
+        static func deadline(backlogMillisecondsAtCommit: Int) -> TimeInterval {
+            timeout + min(maxBacklogWait, backlogDrainSeconds(backlogMillisecondsAtCommit: backlogMillisecondsAtCommit))
+        }
+
         enum Decision: Equatable {
             case wait
             case resolve(String, TranscriptPath)
@@ -491,7 +519,10 @@ enum AssemblyAIStreamingCore {
         ///    not after queued audio), and the last final word ends closer to the end of the
         ///    audio than a natural end of turn allows (min_turn_silence minus a slack).
         ///    Anything else waits for Termination.
-        /// 4. At the timeout the ended turns plus the latest unfinished turn resolve.
+        /// 4. At the deadline the ended turns plus the latest unfinished turn resolve, unless
+        ///    the recorder counted speech and the throttle estimate says the server has not
+        ///    reached the end of the audio yet: its text would miss the trailing words, so
+        ///    the file upload runs instead.
         /// Empty text falls back when the recorder counted speech; otherwise "" resolves.
         static func decision(
             assembler: TurnAssembler,
@@ -523,7 +554,11 @@ enum AssemblyAIStreamingCore {
                     assembler, emptyFailure: .emptyTranscriptForSpeech, recorderHeardSpeech: recorderHeardSpeech
                 )
             }
-            if elapsedSinceCommit >= timeout {
+            if elapsedSinceCommit >= deadline(backlogMillisecondsAtCommit: backlogMillisecondsAtCommit) {
+                if recorderHeardSpeech,
+                   backlogDrainSeconds(backlogMillisecondsAtCommit: backlogMillisecondsAtCommit) > elapsedSinceCommit {
+                    return .fallBack(.commitTimedOut)
+                }
                 return streamText(assembler, emptyFailure: .commitTimedOut, recorderHeardSpeech: recorderHeardSpeech)
             }
             return .wait

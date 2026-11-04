@@ -179,6 +179,12 @@ enum ContextTermSourcesTests {
         }
         TestSupport.expect(ContextTarget.readsFocusedLabel(bundleIdentifier: "com.microsoft.VSCode"), "VS Code reads the label")
         TestSupport.expect(!ContextTarget.readsFocusedLabel(bundleIdentifier: "com.openai.codex"), "Only VS Code reads the label")
+        for bundle in ["com.google.Chrome", "com.google.Chrome.beta", " COM.GOOGLE.CHROME.CANARY "] {
+            TestSupport.expect(ContextTarget.isChrome(bundleIdentifier: bundle), "\(bundle) is Chrome")
+        }
+        for bundle in ["com.apple.Safari", "com.microsoft.VSCode", "com.google.Chrome.app.synthetic", "", nil] as [String?] {
+            TestSupport.expect(!ContextTarget.isChrome(bundleIdentifier: bundle), "Only Chrome is Chrome")
+        }
     }
 
     private static func testTurnLabels() {

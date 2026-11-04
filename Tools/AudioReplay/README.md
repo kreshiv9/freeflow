@@ -1,19 +1,20 @@
 # Audio replay tool
 
-`build/audio-replay` replays your own recordings through Deepgram under named
-settings ("variants") and scores each transcript against a reference you typed.
-Use it to decide whether a change, such as a different sample rate, resampler,
-`endpointing` value, keyterm budget, isolation strength or gain, makes
-transcripts better or worse.
+`build/audio-replay` replays your own recordings through Deepgram or AssemblyAI
+under named settings ("variants") and scores each transcript against a reference
+you typed. Use it to decide whether a change, such as a different sample rate,
+resampler, `endpointing` value, keyterm budget, isolation strength, gain or
+speech provider, makes transcripts better or worse.
 
 Some things to know first:
 
 - It is a developer tool and is never part of the app. `make` builds the app
   from `Sources/` only. This folder is compiled only by `make audio-replay`.
-- Only you run it, with your own Deepgram key and your own recordings. It never
-  opens the microphone.
+- Only you run it, with your own Deepgram or AssemblyAI key and your own
+  recordings. It never opens the microphone.
 - Audio leaves your Mac only after the tool has shown the estimated cost and you
-  have confirmed. It goes only to Deepgram.
+  have confirmed. It goes only to the providers your variants name: Deepgram,
+  unless a variant sets `provider=assemblyai` (section 4).
 
 ## 1. Build
 
@@ -136,7 +137,13 @@ printf '%s\t%s\t%s\n' clip03.wav clip03.txt vocabulary.txt >> manifest.tsv
 Relative paths are resolved from the manifest's folder, and `~/` works.
 Lines starting with `#` are ignored. Ten to twenty clips is a good start.
 
-## 4. Provide your Deepgram key
+## 4. Provide your keys
+
+The tool asks only for the keys of the providers your variants use: Deepgram
+for every variant without `provider=assemblyai`, AssemblyAI for the others (the
+`providers` preset needs both).
+
+### Deepgram
 
 The tool reads the key from the `DEEPGRAM_API_KEY` environment variable. `read
 -s` keeps the key off the screen and out of your shell history:
@@ -155,6 +162,32 @@ one key (a second line, a comment, a space or a `NAME=value` entry) without
 showing its contents, so no other credential reaches Deepgram. The key is never
 printed or written anywhere; it goes only into the `Authorization` header.
 
+### AssemblyAI
+
+1. Sign up at [assemblyai.com](https://www.assemblyai.com) and open the
+   dashboard. New accounts get free credits that cover streaming.
+2. For zero data retention, turn off model training before you send any
+   audio: on the dashboard's
+   [Data Controls](https://www.assemblyai.com/dashboard/settings/data-controls)
+   page, turn on **Opt Out of Data Sharing for Model Improvement Program**.
+   AssemblyAI keeps no streaming audio or transcripts once you are opted out, but the page needs a paid plan (add a card first)
+   and the Owner or Admin role, and the opt-out applies only to later
+   sessions. On a free account your audio may be used for model training.
+3. Copy a key from the **API Keys** page and export it the same way:
+
+```bash
+read -s ASSEMBLYAI_API_KEY; export ASSEMBLYAI_API_KEY
+# ... runs ...
+unset ASSEMBLYAI_API_KEY
+```
+
+The tool takes the AssemblyAI key from `ASSEMBLYAI_API_KEY` only (`--key-file`
+is the Deepgram key), refuses a value that holds anything besides one key, never
+prints it and sends it only in the `Authorization` header. A free account can
+open 5 new streaming sessions per minute and a paid one 200; a refused session
+shows as `account_limit`, so on a free account use `--concurrency 1` and
+expect some of them on short clips.
+
 ## 5. Run experiments
 
 ```bash
@@ -168,15 +201,17 @@ Before anything is sent, the tool:
    costs nothing.
 2. Prints a plan: audio seconds × variants × repeats, the estimated cost, the
    estimated wall time, the variants and the output folder.
-3. Asks `Send this audio to Deepgram?`. Type `y` to continue. In a script, pass
+3. Asks `Send this audio to Deepgram?` (or names AssemblyAI, or both). Type
+   `y` to continue. In a script, pass
    `--yes` instead; without a terminal and without `--yes`, it refuses. When
    you redirect the output to a file, the plan and the question still appear
    in the terminal.
 
 Useful options: `--repeat N` (1 to 10 runs per file and variant), `--concurrency
-N` (1 to 4 streams at once, default 2), `--save-transcripts`, and
-`--price-per-minute USD`. Use a new `--out` folder for each experiment: the
-tool refuses a folder that already holds a `results.csv`.
+N` (1 to 4 streams at once, default 2), `--save-transcripts`,
+`--price-per-minute USD` and `--assemblyai-price-per-minute USD`. Use a new
+`--out` folder for each experiment: the tool refuses a folder that already
+holds a `results.csv`.
 
 A suggested order:
 
@@ -214,10 +249,11 @@ thing.
 | `src` | `src-default`, `src-minphase`, `src-mastering-high` | On 44.1/48 kHz masters, does the converter quality matter? `src-default` stands in for an untouched converter. |
 | `endpointing` | `ep10`, `ep300`, `ep500`, `ep1000`, `ep-false` | Which value should PR 2 use? `ep10` matches today's app, which sends no `endpointing` and so gets Deepgram's 10 ms default. Watch WER, first-word deletions and overlaps. |
 | `keyterms` | `kt-all`, `kt-top20`, `kt-none` | Does a long keyterm list add false insertions? Needs the keyterms column in the manifest. |
-| `language` | `lang-omit`, `lang-en`, `lang-en-US`, `lang-multi` | Is omitting the language the same as `en`, and is `multi` worse for English? |
+| `language` | `lang-omit`, `lang-en`, `lang-en-US`, `lang-multi`, `lang-en-GB`, `lang-en-IN`, `lang-en-AU`, `lang-en-NZ` | Is omitting the language the same as `en`, is `multi` worse for English, and does Deepgram's regional English model suit your accent better? |
 | `isolation` | `iso-off`, `iso-hq70`, `iso-hq100` | Does Apple's voice isolation (PR 3) help in noise or hurt in quiet? Needs 44.1/48 kHz masters and macOS 15. |
 | `frames` | `f50`, `f20`, `f100`, `f250`, `f50-1.25x`, `f50-burst` | Do PR 2's 50 ms frames matter, and does sending faster than real time change results or latency? |
 | `determinism` | `same-1`, `same-2`, `same-3` | How much do results vary when nothing changes? |
+| `providers` | `dg-nova3`, `aai-u36`, `aai-u36-noprompt`, `aai-u36-nokt` | Is AssemblyAI Universal-3.6 Pro more accurate than Deepgram Nova-3 on your speech, and do its fixed prompt and its keyterms help? `dg-nova3` is today's app request with every keyterm; `aai-u36` is the app's AssemblyAI request with every keyterm and the general dictation prompt. Needs both keys (section 4); the keyterm variants need the keyterms column. |
 
 On 48 kHz masters, `legacy24` first converts to 16 kHz with an untouched
 `AVAudioConverter`. That is a stand-in, because the app's capture-side
@@ -228,8 +264,9 @@ converter is undocumented.
 While it runs, the tool prints one line per stream, such as
 `[3/40] ep500 item 2 repeat 1: ok`. The other statuses are `connect_failed`,
 `http_NNN` (for example `http_401` for a refused key, which stops new streams),
-`server_error`, `send_failed`, `closed_early` and `timeout`. Only `ok` runs are
-scored.
+`server_error`, `send_failed`, `closed_early` and `timeout`, and for AssemblyAI
+also `key_refused` (which stops new streams too) and `account_limit` (its
+new-sessions-per-minute limit or a low balance). Only `ok` runs are scored.
 
 At the end it prints a table with one row per variant:
 
@@ -263,6 +300,16 @@ At the end it prints a table with one row per variant:
   the finals only, so these tail words count as missing words here.
 - **Failed**: runs that were not `ok`.
 
+AssemblyAI rows use the same columns. Its stream starts at its `Begin`
+message, as in the app, and ends like the app's release: `ForceEndpoint`, then
+`Terminate`. Its finals are ended turns. **from_finalize** is the release-to-final
+time: milliseconds from the last audio chunk to the first `end_of_turn` turn
+after `ForceEndpoint`, missing when the turn had already ended in silence.
+**Metadata** is the time to its closing `Termination` message, and a run is
+`ok` only once that arrives, because by then every turn is flushed. **Unfinal**
+counts runs that still had an unfinished turn with words. The table repeats
+this mapping below itself when an AssemblyAI variant ran.
+
 Below the table, the "Paired vs <baseline>" section compares each variant with
 the first one, file by file, using each file's WER averaged over repeats:
 
@@ -281,14 +328,22 @@ status is 0 only when every stream ran and returned `ok`.
 
 ## 8. Privacy
 
-- Audio is sent only to Deepgram, only after you confirm, with
-  `mip_opt_out=true` (opting out of Deepgram's Model Improvement Program) unless
-  a variant changes it.
+- Audio is sent only to the providers your variants name, only after you
+  confirm. Deepgram gets it with `mip_opt_out=true` (opting out of Deepgram's
+  Model Improvement Program) unless a variant changes it. AssemblyAI gets the
+  audio, the variant's keyterms and its fixed scenario prompt (never any of
+  your text); it retains nothing only when your account is opted out of model
+  training (section 4).
 - `--out` inside any git work tree is refused, and so is a `--key-file` inside
   one.
 - `results.csv` and the terminal show only numbers, variant names, statuses and
   the paths you typed: never transcript text, the request URL (it carries your
-  keyterms) or the key.
+  keyterms and, for AssemblyAI, the prompt), a key or a provider's error text.
+- AssemblyAI bills the time a session is open, so the tool closes every session
+  it opens: after `Termination`, after an error, when a send fails, and after
+  10 seconds without `Begin` or without `Termination`. The request also sets
+  AssemblyAI's 30-second `inactivity_timeout`, so the server ends a stalled
+  session on its own.
 - Transcripts are written only with `--save-transcripts`, as
   `transcripts/item001-<variant>-r1.txt` files with mode 0600 inside `--out`
   (folders are created with mode 0700). Files are never overwritten.
@@ -304,6 +359,15 @@ prompting may be billed separately. Use `--price-per-minute` for your plan's
 rate, and check the usage page in the Deepgram console after a first small
 run, such as two clips with `--variants determinism`.
 
+AssemblyAI bills the time each session is open, not the audio. Its estimate
+is, per stream, the audio at the variant's pace (real time, or 1/1.25 of it
+for `pacing=1.25x`) plus about a second for the handshake and the final turn,
+times $0.0075 per minute (the Universal-3.6 Pro streaming list price, which
+may be out of date). Use `--assemblyai-price-per-minute` for your plan's rate.
+When a run uses both providers, the plan shows each provider's estimate and
+the total. Check the usage page in the AssemblyAI dashboard after a first
+small run, such as two clips with `--variants providers`.
+
 ## 10. Writing your own variants
 
 `--variants` takes a preset name or a file. A name that matches a preset and
@@ -314,7 +378,26 @@ lists every key with its default and allowed values, plus examples: the
 closest match to today's app request, a gain ladder and a larger keyterm
 budget.
 
-The defaults are `rate=16000 src=minphase endpointing=500 language=en
-mip_opt_out=true smart_format=true punctuate=true interim_results=true
-keyterms=none frame_ms=50 pacing=realtime isolation=off gain_db=0`. As in the
-app, at most 100 keyterms (1,200 characters) are sent.
+The defaults are `provider=deepgram rate=16000 src=minphase endpointing=500
+language=en mip_opt_out=true smart_format=true punctuate=true
+interim_results=true keyterms=none frame_ms=50 pacing=realtime isolation=off
+gain_db=0`. As in the app, at most 100 keyterms (1,200 characters) are sent.
+
+`provider=assemblyai` sends the app's AssemblyAI request instead: Universal-3.6
+Pro, English, the variant's rate, and AssemblyAI's caps on keyterms (at most
+100, each at most 50 characters). Three keys apply to it only:
+
+- `prompt`: `dictation` (the default, the app's prompt for an ordinary text
+  field), `coding`, `ai-chat`, `search`, `email`, `terminal`, or `off` for
+  none. Each is one of the app's fixed one-sentence scenario prompts.
+- `mode`: `default` (none sent, so the server picks, as in the app),
+  `min_latency`, `balanced` or `max_accuracy`.
+- `keyterms` works as for Deepgram.
+
+The Deepgram query keys (`endpointing`, `language`, `mip_opt_out`,
+`smart_format`, `punctuate`, `interim_results`) are refused with
+`provider=assemblyai`, and `prompt` and `mode` without it. AssemblyAI closes a
+session for audio chunks outside 50-1000 ms and processes at most about 1.25x
+real time, so its variants need `frame_ms` 50-1000 and `pacing=realtime` or
+`1.25x`. The tool rounds each chunk up to whole samples and pads a last chunk
+shorter than 50 ms with silence, as the app does.

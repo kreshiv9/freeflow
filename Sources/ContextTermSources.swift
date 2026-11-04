@@ -52,6 +52,11 @@ enum ContextTarget: String, Equatable, Sendable {
         return chromeBundles.contains(bundle) || vscodeBundles.contains(bundle) || bundle == chatGPTAppBundle
     }
 
+    /// Chrome in any channel, whose window title marks Incognito and Guest windows.
+    static func isChrome(bundleIdentifier: String?) -> Bool {
+        normalized(bundleIdentifier).map(chromeBundles.contains) ?? false
+    }
+
     /// Only VS Code needs the focused field's label, to tell the Claude composer apart.
     static func readsFocusedLabel(bundleIdentifier: String?) -> Bool {
         guard let bundle = normalized(bundleIdentifier) else { return false }

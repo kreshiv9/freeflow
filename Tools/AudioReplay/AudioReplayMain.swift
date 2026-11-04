@@ -1,9 +1,9 @@
 import Foundation
 
-/// build/audio-replay: replays your own recordings through Deepgram under named
-/// variants and scores them (Tools/AudioReplay/README.md). Output carries only
-/// numbers, variant names, statuses and paths you typed: never transcript text,
-/// the listen URL or the key.
+/// build/audio-replay: replays your own recordings through Deepgram or AssemblyAI
+/// under named variants and scores them (Tools/AudioReplay/README.md). Output carries
+/// only numbers, variant names, statuses and paths you typed: never transcript text,
+/// the listen URL or a key.
 @main
 struct AudioReplayMain {
     static func main() async {
@@ -25,22 +25,26 @@ struct AudioReplayMain {
     }
 
     private static let usage = """
-        audio-replay: A/B audio and Deepgram settings on your own recordings (developer tool).
+        audio-replay: A/B audio, Deepgram and AssemblyAI settings on your own recordings (developer tool).
 
         Usage:
           audio-replay stats <audio file>...
               Offline level and spectrum numbers. Needs no key and sends nothing.
 
           audio-replay run --manifest <tsv> --variants <preset|file> --out <dir> [options]
-              Streams every manifest item to Deepgram once per variant and repeat,
-              after printing the estimated cost and asking you to confirm.
+              Streams every manifest item to each variant's provider (Deepgram unless
+              the variant sets provider=assemblyai) once per variant and repeat, after
+              printing the estimated cost and asking you to confirm.
               --repeat N              runs per item and variant, 1-10 (default 1)
               --concurrency N         streams in flight, 1-4 (default 2)
-              --key-file <path>       read the key from a file outside any git repository
+              --key-file <path>       read the Deepgram key from a file outside any git repository
                                       (default: the DEEPGRAM_API_KEY environment variable)
-              --price-per-minute USD  price used for the estimate (default 0.0077)
+              --price-per-minute USD  Deepgram price used for the estimate (default 0.0077)
+              --assemblyai-price-per-minute USD
+                                      AssemblyAI price per minute of open socket (default 0.0075)
               --save-transcripts      also write each hypothesis to <out>/transcripts (0600 files)
               --yes                   confirm the cost without a prompt
+              The AssemblyAI key comes from the ASSEMBLYAI_API_KEY environment variable.
 
         Presets: \(ReplayEvalCore.presetNames.joined(separator: ", "))
         Manifest lines: <audio path><TAB><reference text path>[<TAB><keyterms file>]
@@ -126,6 +130,7 @@ struct AudioReplayMain {
         var concurrency = 2
         var keyFile: String?
         var pricePerMinute = ReplayEvalCore.defaultPricePerMinuteUSD
+        var assemblyAIPricePerMinute = ReplayEvalCore.defaultAssemblyAIPricePerMinuteUSD
         var saveTranscripts = false
         var yes = false
     }
@@ -144,6 +149,12 @@ struct AudioReplayMain {
             }
             return parsed
         }
+        func price(for flag: String) throws -> Double {
+            guard let price = Double(try value(for: flag)), price.isFinite, (0...100).contains(price) else {
+                throw UsageError(message: "\(flag) must be a number of US dollars, 0-100.")
+            }
+            return price
+        }
         while index < arguments.count {
             let flag = arguments[index]
             switch flag {
@@ -153,11 +164,8 @@ struct AudioReplayMain {
             case "--repeat": options.repeats = try integer(for: flag, in: 1...10)
             case "--concurrency": options.concurrency = try integer(for: flag, in: 1...4)
             case "--key-file": options.keyFile = try value(for: flag)
-            case "--price-per-minute":
-                guard let price = Double(try value(for: flag)), price.isFinite, (0...100).contains(price) else {
-                    throw UsageError(message: "--price-per-minute must be a number of US dollars, 0-100.")
-                }
-                options.pricePerMinute = price
+            case "--price-per-minute": options.pricePerMinute = try price(for: flag)
+            case "--assemblyai-price-per-minute": options.assemblyAIPricePerMinute = try price(for: flag)
             case "--save-transcripts": options.saveTranscripts = true
             case "--yes": options.yes = true
             default: throw UsageError(message: "Unknown option \(flag). Run audio-replay --help for usage.")
@@ -169,6 +177,74 @@ struct AudioReplayMain {
             throw UsageError(message: "run needs \(flag). Run audio-replay --help for usage.")
         }
         return options
+    }
+
+    /// --key-file wins over DEEPGRAM_API_KEY. Complains and returns nil when there is no usable key.
+    private static func deepgramKey(keyFile: String?) -> ReplayEvalCore.Secret? {
+        if let keyFile {
+            let keyURL = absoluteURL(keyFile)
+            guard !isInsideGitWorkTree(keyURL) else {
+                complain("Refusing --key-file inside a git work tree. Keep the key file outside every repository.")
+                return nil
+            }
+            guard let text = try? String(contentsOf: keyURL, encoding: .utf8) else {
+                complain("Could not read --key-file as UTF-8 text.")
+                return nil
+            }
+            // The message never shows the file: it may hold other credentials.
+            guard let secret = ReplayEvalCore.Secret(text) else {
+                complain("The key file must hold only the key: \(ReplayEvalCore.Secret.requirement). Nothing was sent.")
+                return nil
+            }
+            return secret
+        }
+        if let raw = ProcessInfo.processInfo.environment["DEEPGRAM_API_KEY"],
+           !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let secret = ReplayEvalCore.Secret(raw) else {
+                complain("DEEPGRAM_API_KEY must hold only the key: \(ReplayEvalCore.Secret.requirement). Nothing was sent.")
+                return nil
+            }
+            return secret
+        }
+        complain("""
+            No Deepgram key. Set one without it landing in your shell history:
+              read -s DEEPGRAM_API_KEY; export DEEPGRAM_API_KEY
+            or pass --key-file <path> (chmod 600, outside any git repository).
+            """)
+        return nil
+    }
+
+    /// ASSEMBLYAI_API_KEY only. Complains and returns nil when there is no usable key.
+    private static func assemblyAIKey() -> ReplayEvalCore.Secret? {
+        guard let raw = ProcessInfo.processInfo.environment["ASSEMBLYAI_API_KEY"],
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            complain("""
+                No AssemblyAI key. Set one without it landing in your shell history:
+                  read -s ASSEMBLYAI_API_KEY; export ASSEMBLYAI_API_KEY
+                """)
+            return nil
+        }
+        guard let secret = ReplayEvalCore.Secret(raw) else {
+            complain("ASSEMBLYAI_API_KEY must hold only the key: \(ReplayEvalCore.Secret.requirement). Nothing was sent.")
+            return nil
+        }
+        return secret
+    }
+
+    /// The price per billed minute used for the estimate, and where it came from.
+    private static func pricing(for provider: ReplayEvalCore.Provider, options: RunOptions) -> (Double, String) {
+        switch provider {
+        case .deepgram:
+            let price = options.pricePerMinute
+            return (price, price == ReplayEvalCore.defaultPricePerMinuteUSD
+                ? "Nova-3 streaming list price; set --price-per-minute for your plan"
+                : "from --price-per-minute")
+        case .assemblyAI:
+            let price = options.assemblyAIPricePerMinute
+            return (price, price == ReplayEvalCore.defaultAssemblyAIPricePerMinuteUSD
+                ? "Universal-3.6 Pro streaming list price; set --assemblyai-price-per-minute for your plan"
+                : "from --assemblyai-price-per-minute")
+        }
     }
 
     private struct PreparedItem {
@@ -253,43 +329,25 @@ struct AudioReplayMain {
             items.append(PreparedItem(entry: entry, reference: reference, keyterms: keyterms, audioSeconds: 0, pcm: [:]))
         }
 
-        // 3. Key: --key-file wins over DEEPGRAM_API_KEY.
-        let key: ReplayEvalCore.Secret
-        if let keyFile = options.keyFile {
-            let keyURL = absoluteURL(keyFile)
-            guard !isInsideGitWorkTree(keyURL) else {
-                complain("Refusing --key-file inside a git work tree. Keep the key file outside every repository.")
-                return 1
-            }
-            guard let text = try? String(contentsOf: keyURL, encoding: .utf8) else {
-                complain("Could not read --key-file as UTF-8 text.")
-                return 1
-            }
-            // The message never shows the file: it may hold other credentials.
-            guard let secret = ReplayEvalCore.Secret(text) else {
-                complain("The key file must hold only the key: \(ReplayEvalCore.Secret.requirement). Nothing was sent.")
-                return 1
-            }
-            key = secret
-        } else if let raw = ProcessInfo.processInfo.environment["DEEPGRAM_API_KEY"],
-                  !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            guard let secret = ReplayEvalCore.Secret(raw) else {
-                complain("DEEPGRAM_API_KEY must hold only the key: \(ReplayEvalCore.Secret.requirement). Nothing was sent.")
-                return 1
-            }
-            key = secret
-        } else {
-            complain("""
-                No Deepgram key. Set one without it landing in your shell history:
-                  read -s DEEPGRAM_API_KEY; export DEEPGRAM_API_KEY
-                or pass --key-file <path> (chmod 600, outside any git repository).
-                """)
-            return 1
+        // 3. Keys, only for the providers the variants use. Deepgram: --key-file wins over
+        // DEEPGRAM_API_KEY. AssemblyAI: ASSEMBLYAI_API_KEY.
+        let providers = ReplayEvalCore.Provider.allCases.filter { provider in
+            variants.contains { $0.provider == provider }
         }
-        // Variant names are printed and written to disk, and a key file parses as a variant.
-        guard !ReplayEvalCore.variantNamesExposeKey(variants.map(\.name), key: key) else {
-            complain("Refusing to run: a variant name contains the Deepgram key. Check that --variants is not the key file. Nothing was sent.")
-            return 1
+        var keys: [ReplayEvalCore.Provider: ReplayEvalCore.Secret] = [:]
+        for provider in providers {
+            let key: ReplayEvalCore.Secret?
+            switch provider {
+            case .deepgram: key = deepgramKey(keyFile: options.keyFile)
+            case .assemblyAI: key = assemblyAIKey()
+            }
+            guard let key else { return 1 }
+            // Variant names are printed and written to disk, and a key file parses as a variant.
+            guard !ReplayEvalCore.variantNamesExposeKey(variants.map(\.name), key: key) else {
+                complain("Refusing to run: a variant name contains the \(provider.displayName) key. Check that --variants is not the key file. Nothing was sent.")
+                return 1
+            }
+            keys[provider] = key
         }
 
         // 4. Output folder: outside any git work tree, never overwriting results.
@@ -341,24 +399,33 @@ struct AudioReplayMain {
         func show(_ text: String) { planHandle.write(Data((text + "\n").utf8)) }
         let totalSeconds = items.reduce(0) { $0 + $1.audioSeconds }
         let sentSeconds = totalSeconds * Double(variants.count * options.repeats)
-        let cost = ReplayEvalCore.estimatedCostUSD(
-            audioSeconds: totalSeconds,
-            variants: variants.count,
-            repeats: options.repeats,
-            pricePerMinute: options.pricePerMinute
+        // Deepgram bills the audio; AssemblyAI bills the time each socket is open.
+        let billedMinutes = ReplayEvalCore.billedMinutes(
+            itemAudioSeconds: items.map(\.audioSeconds),
+            variants: variants,
+            repeats: options.repeats
         )
         let jobCount = items.count * variants.count * options.repeats
         // Streaming time at each variant's pace, plus about a second per stream for the handshake and finalize.
         let pacedSeconds = variants.reduce(0) { $0 + totalSeconds * $1.pacing.wallTimeFactor } * Double(options.repeats)
         let wallSeconds = (pacedSeconds + Double(jobCount)) / Double(options.concurrency)
-        let priceSource = options.pricePerMinute == ReplayEvalCore.defaultPricePerMinuteUSD
-            ? "Nova-3 streaming list price; set --price-per-minute for your plan"
-            : "from --price-per-minute"
         show("")
         show("Plan")
         show("  Items: \(items.count), \(String(format: "%.1f", totalSeconds)) s of audio")
         show("  Audio sent: \(String(format: "%.1f", totalSeconds)) s × \(variants.count) variant(s) × \(options.repeats) repeat(s) = \(String(format: "%.1f", sentSeconds)) s (\(String(format: "%.2f", sentSeconds / 60)) min) in \(jobCount) stream(s)")
-        show("  Estimated cost: $\(String(format: "%.4f", cost)) at $\(String(format: "%.4f", options.pricePerMinute))/min (\(priceSource))")
+        var totalCost = 0.0
+        for provider in providers {
+            let (price, priceSource) = pricing(for: provider, options: options)
+            let minutes = billedMinutes[provider] ?? 0
+            totalCost += minutes * price
+            let label = providers.count > 1 ? " (\(provider.displayName))" : ""
+            let billedTime = provider == .assemblyAI
+                ? " for about \(String(format: "%.2f", minutes)) min of open sockets" : ""
+            show("  Estimated cost\(label): $\(String(format: "%.4f", minutes * price))\(billedTime) at $\(String(format: "%.4f", price))/min (\(priceSource))")
+        }
+        if providers.count > 1 {
+            show("  Estimated total: $\(String(format: "%.4f", totalCost))")
+        }
         show("  Estimated wall time: about \(String(format: "%.1f", wallSeconds / 60)) min at concurrency \(options.concurrency)")
         show("  Variants: \(variants.map(\.name).joined(separator: ", ")) (paired baseline: \(variants[0].name))")
         show("  Output: \(options.out)")
@@ -375,7 +442,8 @@ struct AudioReplayMain {
                 complain("Standard input is not a terminal: pass --yes to confirm the cost. Nothing was sent.")
                 return 1
             }
-            planHandle.write(Data("Send this audio to Deepgram? Type y to continue: ".utf8))
+            let recipients = providers.map(\.displayName).joined(separator: " and ")
+            planHandle.write(Data("Send this audio to \(recipients)? Type y to continue: ".utf8))
             let answer = readLine()?.trimmingCharacters(in: .whitespaces).lowercased()
             guard answer == "y" || answer == "yes" else {
                 show("Cancelled. Nothing was sent.")
@@ -422,20 +490,45 @@ struct AudioReplayMain {
                 started += 1
                 let item = items[job.itemIndex]
                 let variant = variants[job.variantIndex]
-                let frames = ReplayEvalCore.frames(
-                    of: item.pcm[variant.audioKey] ?? Data(),
-                    sampleRate: variant.sampleRate,
-                    frameMilliseconds: variant.frameMilliseconds
-                )
+                let pcm = item.pcm[variant.audioKey] ?? Data()
                 let sent = variant.keyterms.select(from: item.keyterms)
-                group.addTask {
-                    JobResult(
-                        job: job,
-                        outcome: await ReplayDeepgramClient.stream(frames: frames, variant: variant, keyterms: sent, key: key)
+                guard let key = keys[variant.provider] else {
+                    // Unreachable: step 3 found a key for every provider a variant uses.
+                    let outcome = ReplayStreamOutcome(
+                        status: .connectFailed, finalTranscript: "", finals: [], resultCount: 0, unfinalizedAtEnd: false
                     )
+                    group.addTask { JobResult(job: job, outcome: outcome) }
+                    return
+                }
+                switch variant.provider {
+                case .deepgram:
+                    let frames = ReplayEvalCore.frames(
+                        of: pcm,
+                        sampleRate: variant.sampleRate,
+                        frameMilliseconds: variant.frameMilliseconds
+                    )
+                    group.addTask {
+                        JobResult(
+                            job: job,
+                            outcome: await ReplayDeepgramClient.stream(frames: frames, variant: variant, keyterms: sent, key: key)
+                        )
+                    }
+                case .assemblyAI:
+                    let chunks = ReplayEvalCore.assemblyAIChunks(
+                        of: pcm,
+                        sampleRate: variant.sampleRate,
+                        frameMilliseconds: variant.frameMilliseconds
+                    )
+                    group.addTask {
+                        JobResult(
+                            job: job,
+                            outcome: await ReplayAssemblyAIClient.stream(chunks: chunks, variant: variant, keyterms: sent, key: key)
+                        )
+                    }
                 }
             }
             var stopScheduling = false
+            var accountLimitReported = false
             while started < min(options.concurrency, jobs.count) { startNext() }
             while let result = await group.next() {
                 completed += 1
@@ -472,7 +565,16 @@ struct AudioReplayMain {
                 say("[\(completed)/\(jobs.count)] \(variant.name) item \(item.entry.item) repeat \(result.job.repeatIndex): \(outcome.status.csvValue)")
                 if outcome.status.isAuthenticationFailure, !stopScheduling {
                     stopScheduling = true
-                    complain("Deepgram refused the key (HTTP 401/403). No new streams will start. Check the key and that its project can use live transcription.")
+                    switch variant.provider {
+                    case .deepgram:
+                        complain("Deepgram refused the key (HTTP 401/403). No new streams will start. Check the key and that its project can use live transcription.")
+                    case .assemblyAI:
+                        complain("AssemblyAI refused the key. No new streams will start. Check ASSEMBLYAI_API_KEY and that the account can use streaming.")
+                    }
+                }
+                if outcome.status == .accountLimit, !accountLimitReported {
+                    accountLimitReported = true
+                    complain("AssemblyAI refused a session for its new-sessions-per-minute limit (5 on a free account) or a low balance. Such runs are not scored; lower --concurrency or check the balance.")
                 }
                 if !stopScheduling, started < jobs.count { startNext() }
             }
@@ -512,6 +614,9 @@ struct AudioReplayMain {
                 "\(summary.failed)",
             ]
             say(pad(variant.name, nameWidth) + zip(cells, columns).map { pad($0, $1.width) }.joined())
+        }
+        if variants.contains(where: { $0.provider == .assemblyAI }) {
+            say("For AssemblyAI variants, from_finalize is the first end_of_turn after ForceEndpoint and Metadata is Termination.")
         }
 
         guard variants.count > 1 else { return }

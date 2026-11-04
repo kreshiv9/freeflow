@@ -15,9 +15,13 @@ enum ReplayEvalCoreTests {
         testVariantDefaultsAndOverrides()
         testVariantRejections()
         testPresetsParse()
+        testAssemblyAIVariants()
+        testAssemblyAIRequestFromVariant()
         testQueryOverridesKeepKeytermsAndDropOmitted()
         testPacingSchedule()
         testFrameSlicing()
+        testAssemblyAIChunksAndSchedule()
+        testAssemblyAIStatusAndBilling()
         testSignTestPValues()
         testPairedComparison()
         testLevelStatsOnSyntheticTones()
@@ -213,6 +217,10 @@ enum ReplayEvalCoreTests {
         TestSupport.expectEqual(base?.pacing, .realtime)
         TestSupport.expectEqual(base?.isolation, .off)
         TestSupport.expectEqual(base?.gainDecibels, 0)
+        TestSupport.expectEqual(base?.provider, .deepgram)
+        TestSupport.expectEqual(base?.prompt, nil)
+        TestSupport.expectEqual(base?.mode, nil)
+        TestSupport.expectEqual(try? Core.parseVariant("base provider=deepgram"), base)
 
         let legacy = try? Core.parseVariant(
             "legacy24 rate=24000 src=legacy-chain endpointing=default language=omit keyterms=top-20 frame_ms=20 pacing=1.25x isolation=hq70 gain_db=-6"
@@ -258,7 +266,10 @@ enum ReplayEvalCoreTests {
         }
         TestSupport.expect(audioKey("b isolation=hq70") != audioKey("b isolation=hq100"), "The wet percent is part of the key")
         TestSupport.expect(audioKey("b gain_db=6") != audioKey("b gain_db=-6"), "The gain sign is part of the key")
-        for line in ["b endpointing=10", "b frame_ms=20", "b pacing=burst", "b keyterms=all", "b language=multi"] {
+        for line in [
+            "b endpointing=10", "b frame_ms=20", "b pacing=burst", "b keyterms=all", "b language=multi",
+            "b provider=assemblyai", "b provider=assemblyai prompt=coding mode=max_accuracy",
+        ] {
             TestSupport.expectEqual(audioKey(line), reference)
         }
 
@@ -310,10 +321,11 @@ enum ReplayEvalCoreTests {
             ("src", 3, "src-default"),
             ("endpointing", 5, "ep10"),
             ("keyterms", 3, "kt-all"),
-            ("language", 4, "lang-omit"),
+            ("language", 8, "lang-omit"),
             ("isolation", 3, "iso-off"),
             ("frames", 6, "f50"),
             ("determinism", 3, "same-1"),
+            ("providers", 4, "dg-nova3"),
         ]
         TestSupport.expectEqual(Core.presetNames, expected.map { $0.name })
         for preset in expected {
@@ -362,7 +374,25 @@ enum ReplayEvalCoreTests {
             ["10", "300", "500", "1000", "false"]
         )
         TestSupport.expectEqual(parsed("keyterms").map(\.keyterms), [Core.KeytermSelection.all, .top(20), .none])
-        TestSupport.expectEqual(parsed("language").map { query($0, "language") }, [nil, "en", "en-US", "multi"])
+        TestSupport.expectEqual(
+            parsed("language").map { query($0, "language") },
+            [nil, "en", "en-US", "multi", "en-GB", "en-IN", "en-AU", "en-NZ"]
+        )
+        TestSupport.expect(
+            parsed("language").allSatisfy { $0.provider == .deepgram },
+            "The language preset compares Deepgram languages"
+        )
+        // Deepgram as the app sends it today, then AssemblyAI with and without its
+        // prompt and its keyterms.
+        let providers = parsed("providers")
+        TestSupport.expectEqual(providers.map(\.provider), [.deepgram, .assemblyAI, .assemblyAI, .assemblyAI])
+        TestSupport.expectEqual(providers.map(\.prompt), [nil, .dictation, nil, .dictation])
+        TestSupport.expectEqual(providers.map(\.keyterms), [Core.KeytermSelection.all, .all, .all, .none])
+        TestSupport.expect(providers.allSatisfy { $0.mode == nil }, "No provider variant changes the server's mode")
+        if let baseline = providers.first, let defaults = try? Core.parseVariant("dg-nova3") {
+            TestSupport.expectEqual(baseline.query, defaults.query)
+            TestSupport.expectEqual(baseline.sampleRate, 16000)
+        }
         TestSupport.expectEqual(
             parsed("isolation").map(\.isolation),
             [.off, .highQualityVoice(wetPercent: 70), .highQualityVoice(wetPercent: 100)]
@@ -393,6 +423,11 @@ enum ReplayEvalCoreTests {
             case "frames":
                 copy.frameMilliseconds = 0
                 copy.pacing = .realtime
+            case "providers":
+                copy.provider = .deepgram
+                copy.prompt = nil
+                copy.mode = nil
+                copy.keyterms = .none
             default:
                 TestSupport.expect(false, "Preset \(preset) needs its parameter listed in this test")
             }
@@ -420,6 +455,134 @@ enum ReplayEvalCoreTests {
                 )
             }
         }
+    }
+
+    private static func testAssemblyAIVariants() {
+        // An AssemblyAI variant without a prompt key gets the app's fallback scenario.
+        let plain = try? Core.parseVariant("aai provider=assemblyai")
+        TestSupport.expectEqual(plain?.provider, .assemblyAI)
+        TestSupport.expectEqual(plain?.prompt, .dictation)
+        TestSupport.expectEqual(plain?.mode, nil)
+        TestSupport.expectEqual(plain?.keyterms, Core.KeytermSelection.none)
+        TestSupport.expectEqual(plain?.frameMilliseconds, 50)
+        TestSupport.expectEqual(plain?.pacing, .realtime)
+        TestSupport.expectEqual(plain?.sampleRate, 16000)
+
+        TestSupport.expectEqual((try? Core.parseVariant("aai provider=assemblyai prompt=off"))?.prompt, nil)
+        let tuned = try? Core.parseVariant(
+            "aai mode=max_accuracy prompt=coding provider=assemblyai keyterms=top-20 frame_ms=1000 pacing=1.25x rate=48000"
+        )
+        TestSupport.expectEqual(tuned?.prompt, .codingAssistant)
+        TestSupport.expectEqual(tuned?.mode, .maxAccuracy)
+        TestSupport.expectEqual(tuned?.keyterms, .top(20))
+        TestSupport.expectEqual(tuned?.frameMilliseconds, 1000)
+        TestSupport.expectEqual(tuned?.pacing, .faster)
+        TestSupport.expectEqual(tuned?.sampleRate, 48000)
+        TestSupport.expectEqual((try? Core.parseVariant("aai provider=assemblyai mode=default"))?.mode, nil)
+        for scenario in AssemblyAIStreamingCore.PromptScenario.allCases {
+            TestSupport.expectEqual(
+                (try? Core.parseVariant("aai provider=assemblyai prompt=\(scenario.rawValue)"))?.prompt,
+                scenario
+            )
+        }
+        for mode in AssemblyAIStreamingCore.Mode.allCases {
+            TestSupport.expectEqual((try? Core.parseVariant("aai provider=assemblyai mode=\(mode.rawValue)"))?.mode, mode)
+        }
+        TestSupport.expectEqual((try? Core.parseVariant("aai provider=assemblyai frame_ms=50"))?.frameMilliseconds, 50)
+
+        for line in [
+            "x provider=assembly", "x provider=AssemblyAI", "x provider=",
+            "x provider=assemblyai prompt=anything", "x provider=assemblyai prompt=Coding",
+            "x provider=assemblyai mode=fast",
+        ] {
+            expectRejected(line)
+        }
+        TestSupport.expectEqual(parseError("x provider=openai"), .invalidValue(line: 1, key: "provider"))
+        TestSupport.expectEqual(
+            parseError("x provider=assemblyai prompt=off prompt=coding"),
+            .duplicateKey(line: 1, key: "prompt")
+        )
+        // Prompt and mode only mean something to AssemblyAI; Deepgram's query items only to Deepgram.
+        TestSupport.expectEqual(
+            parseError("x prompt=coding"),
+            .inconsistent(line: 1, reason: "prompt requires provider=assemblyai")
+        )
+        TestSupport.expectEqual(
+            parseError("x provider=deepgram mode=balanced"),
+            .inconsistent(line: 1, reason: "mode requires provider=assemblyai")
+        )
+        for key in ["endpointing=500", "language=en", "mip_opt_out=true", "smart_format=false", "punctuate=true", "interim_results=omit"] {
+            let name = String(key.prefix { $0 != "=" })
+            TestSupport.expectEqual(
+                parseError("x provider=assemblyai \(key)"),
+                .inconsistent(line: 1, reason: "\(name) is a Deepgram setting; remove it with provider=assemblyai")
+            )
+        }
+        // AssemblyAI closes the session for chunks outside 50-1000 ms and processes at
+        // most about 1.25x real time.
+        for line in ["x provider=assemblyai frame_ms=20", "x provider=assemblyai frame_ms=49"] {
+            TestSupport.expectEqual(
+                parseError(line),
+                .inconsistent(line: 1, reason: "provider=assemblyai requires frame_ms 50-1000")
+            )
+        }
+        TestSupport.expectEqual(
+            parseError("x provider=assemblyai pacing=burst"),
+            .inconsistent(line: 1, reason: "provider=assemblyai requires pacing=realtime or 1.25x")
+        )
+        TestSupport.expect(
+            (try? Core.parseVariant("x frame_ms=20 pacing=burst")) != nil,
+            "Deepgram variants keep every frame size and pace"
+        )
+        TestSupport.expectEqual(parseError("x\ny provider=assemblyai frame_ms=10"), .inconsistent(
+            line: 2, reason: "provider=assemblyai requires frame_ms 50-1000"
+        ))
+        let allowed = Core.ParseError.invalidValue(line: 1, key: "prompt").description
+        TestSupport.expect(
+            allowed.contains("off, coding, ai-chat, search, email, terminal, dictation"),
+            "The prompt error lists the scenarios"
+        )
+    }
+
+    private static func testAssemblyAIRequestFromVariant() {
+        func items(_ line: String, keyterms: [String]) -> [String: String] {
+            guard let variant = try? Core.parseVariant(line) else {
+                TestSupport.expect(false, "The variant parses")
+                return [:]
+            }
+            let url = AssemblyAIStreamingCore.listenURL(
+                for: Core.assemblyAIConfiguration(for: variant, keyterms: variant.keyterms.select(from: keyterms))
+            )
+            TestSupport.expect(!url.absoluteString.contains(syntheticKey), "The key never enters the URL")
+            let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            return Dictionary(queryItems.map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { first, _ in first })
+        }
+        let terms = ["Claude Code", "a+b", "FreeFlow"]
+        let full = items("aai provider=assemblyai keyterms=all", keyterms: terms)
+        TestSupport.expectEqual(full["speech_model"], "universal-3-6-pro")
+        TestSupport.expectEqual(full["language_codes"], #"["en"]"#)
+        TestSupport.expectEqual(full["sample_rate"], "16000")
+        TestSupport.expectEqual(full["encoding"], "pcm_s16le")
+        TestSupport.expectEqual(full["prompt"], AssemblyAIStreamingCore.PromptScenario.dictation.prompt)
+        TestSupport.expectEqual(full["keyterms_prompt"], #"["Claude Code","a+b","FreeFlow"]"#)
+        TestSupport.expectEqual(full["mode"], nil)
+
+        let top = items("aai provider=assemblyai keyterms=top-2 prompt=off mode=min_latency rate=48000", keyterms: terms)
+        TestSupport.expectEqual(top["keyterms_prompt"], #"["Claude Code","a+b"]"#)
+        TestSupport.expectEqual(top["prompt"], nil)
+        TestSupport.expectEqual(top["mode"], "min_latency")
+        TestSupport.expectEqual(top["sample_rate"], "48000")
+
+        let bare = items("aai provider=assemblyai keyterms=none prompt=email", keyterms: terms)
+        TestSupport.expectEqual(bare["keyterms_prompt"], nil)
+        TestSupport.expectEqual(bare["prompt"], AssemblyAIStreamingCore.PromptScenario.email.prompt)
+
+        // AssemblyAI's caps apply: terms over 50 characters are dropped, not cut.
+        let long = String(repeating: "x", count: 51)
+        TestSupport.expectEqual(
+            items("aai provider=assemblyai keyterms=all", keyterms: [long, "Kubernetes"])["keyterms_prompt"],
+            #"["Kubernetes"]"#
+        )
     }
 
     private static func testQueryOverridesKeepKeytermsAndDropOmitted() {
@@ -481,6 +644,138 @@ enum ReplayEvalCoreTests {
             TestSupport.expectEqual(frames.map(\.count).reduce(0, +), bytes)
         }
         TestSupport.expectEqual(Core.littleEndianData([1, -2]), Data([0x01, 0x00, 0xFE, 0xFF]))
+    }
+
+    private static func testAssemblyAIChunksAndSchedule() {
+        func counts(_ bytes: Int, _ rate: Int, _ milliseconds: Int) -> [Int] {
+            Core.assemblyAIChunks(of: Data(repeating: 1, count: bytes), sampleRate: rate, frameMilliseconds: milliseconds)
+                .map(\.count)
+        }
+        // A last chunk under 50 ms is padded to 50 ms with silence; one of 50 ms or more is kept.
+        TestSupport.expectEqual(counts(4000, 16000, 50), [1600, 1600, 1600])
+        TestSupport.expectEqual(counts(3500, 16000, 100), [3200, 1600])
+        TestSupport.expectEqual(counts(5200, 16000, 100), [3200, 2000])
+        TestSupport.expectEqual(counts(2, 16000, 1000), [1600])
+        TestSupport.expectEqual(counts(64000, 16000, 1000), [32000, 32000])
+        // 22.05 kHz rounds up to 1103 samples, so a 50 ms chunk never shrinks to 49.98 ms.
+        TestSupport.expectEqual(counts(5000, 22050, 50), [2206, 2206, 2206])
+        TestSupport.expectEqual(Core.assemblyAIChunks(of: Data(), sampleRate: 16000, frameMilliseconds: 50), [])
+
+        let padded = Core.assemblyAIChunks(of: Data(repeating: 7, count: 2000), sampleRate: 16000, frameMilliseconds: 50)
+        TestSupport.expectEqual(padded.map(\.count), [1600, 1600])
+        TestSupport.expect(padded[1].prefix(400).allSatisfy { $0 == 7 }, "The audio comes first")
+        TestSupport.expect(padded[1].dropFirst(400).allSatisfy { $0 == 0 }, "The padding is silence")
+
+        for (bytes, rate, milliseconds) in [
+            (2, 16000, 50), (3202, 16000, 50), (9602, 48000, 50), (2000, 8000, 50), (100_002, 44100, 1000),
+            (7778, 22050, 50), (12_346, 24000, 333), (88_200, 44100, 55),
+        ] {
+            let chunks = Core.assemblyAIChunks(of: Data(count: bytes), sampleRate: rate, frameMilliseconds: milliseconds)
+            let bytesPerSecond = rate * 2
+            for chunk in chunks {
+                // 50 ms <= count / bytesPerSecond <= 1000 ms, in integers.
+                TestSupport.expect(
+                    chunk.count * 1000 >= 50 * bytesPerSecond && chunk.count * 1000 <= 1000 * bytesPerSecond,
+                    "Every AssemblyAI chunk is 50-1000 ms"
+                )
+                TestSupport.expect(chunk.count % 2 == 0, "Chunks hold whole samples")
+            }
+            TestSupport.expect(chunks.map(\.count).reduce(0, +) >= bytes, "No audio is dropped")
+        }
+
+        // The schedule follows the audio before each chunk, so whole-sample frames match
+        // the Deepgram schedule and a padded last chunk does not move.
+        for pacing in Core.Pacing.allCases {
+            TestSupport.expectEqual(
+                Core.sendOffsetsMilliseconds(chunkByteCounts: [1600, 1600, 1600, 1600], sampleRate: 16000, pacing: pacing),
+                Core.sendOffsetsMilliseconds(frameCount: 4, frameMilliseconds: 50, pacing: pacing)
+            )
+        }
+        let rounded = Core.sendOffsetsMilliseconds(chunkByteCounts: [2206, 2206, 2206], sampleRate: 22050, pacing: .faster)
+        TestSupport.expectEqual(rounded.count, 3)
+        TestSupport.expectApproximatelyEqual(rounded[1], 1103.0 / 22.05 / 1.25, accuracy: 1e-9)
+        TestSupport.expectApproximatelyEqual(rounded[2], 2206.0 / 22.05 / 1.25, accuracy: 1e-9)
+        TestSupport.expectEqual(Core.sendOffsetsMilliseconds(chunkByteCounts: [], sampleRate: 16000, pacing: .realtime), [])
+    }
+
+    private static func testAssemblyAIStatusAndBilling() {
+        func status(
+            failure: AssemblyAIStreamingError? = nil,
+            closeFailure: AssemblyAIStreamingError? = nil,
+            httpStatus: Int? = 101,
+            began: Bool = true,
+            sendFailed: Bool = false,
+            terminated: Bool = false,
+            timedOut: Bool = false
+        ) -> Core.RunStatus {
+            Core.assemblyAIRunStatus(
+                failure: failure, closeFailure: closeFailure, httpStatus: httpStatus, began: began,
+                sendFailed: sendFailed, terminated: terminated, timedOut: timedOut
+            )
+        }
+        TestSupport.expectEqual(status(terminated: true), .ok)
+        TestSupport.expectEqual(status(timedOut: true), .timedOut)
+        TestSupport.expectEqual(status(), .closedEarly)
+        TestSupport.expectEqual(status(sendFailed: true, terminated: true), .sendFailed)
+        TestSupport.expectEqual(status(failure: .unauthorized, began: false), .keyRefused)
+        TestSupport.expectEqual(status(failure: .accountLimit, began: false), .accountLimit)
+        TestSupport.expectEqual(status(failure: .serverError(code: 3007), terminated: true), .serverError)
+        TestSupport.expectEqual(status(closeFailure: .serverError(code: 3005)), .serverError)
+        TestSupport.expectEqual(status(closeFailure: .unauthorized, began: false), .keyRefused)
+        TestSupport.expectEqual(status(httpStatus: 401, began: false), .httpError(401))
+        TestSupport.expectEqual(status(httpStatus: 101, began: false), .connectFailed)
+        TestSupport.expectEqual(status(httpStatus: nil, began: false), .connectFailed)
+        TestSupport.expectEqual(status(httpStatus: 500, began: true, terminated: true), .ok)
+
+        TestSupport.expectEqual(Core.RunStatus.keyRefused.csvValue, "key_refused")
+        TestSupport.expectEqual(Core.RunStatus.accountLimit.csvValue, "account_limit")
+        TestSupport.expect(Core.RunStatus.keyRefused.isAuthenticationFailure, "A refused AssemblyAI key stops scheduling")
+        TestSupport.expect(!Core.RunStatus.accountLimit.isAuthenticationFailure, "A rate limit does not stop scheduling")
+        TestSupport.expectEqual(Core.RunStatus(assemblyAIFailure: .commitTimedOut), .serverError)
+
+        let turn = #"""
+        {"type":"Turn","turn_order":0,"end_of_turn":true,"transcript":"Ship it.",
+        "words":[{"text":"Ship","start":1216,"end":1635},{"text":"it.","start":1676,"end":"x"},{"text":"now","start":2000,"end":2400}]}
+        """#
+        TestSupport.expectEqual(
+            Core.wordTimings(fromTurnJSON: Data(turn.utf8)),
+            [Core.WordTiming(start: 1.216, end: 1.635), Core.WordTiming(start: 2.0, end: 2.4)]
+        )
+        TestSupport.expectEqual(Core.wordTimings(fromTurnJSON: Data("[".utf8)), [])
+        TestSupport.expectEqual(Core.wordTimings(fromTurnJSON: Data(#"{"type":"Termination"}"#.utf8)), [])
+
+        // Deepgram bills the audio; AssemblyAI bills the open socket, about the paced audio
+        // plus a second per stream, and never less than the server's 1.25x processing.
+        func variant(_ line: String) -> Core.Variant {
+            (try? Core.parseVariant(line)) ?? Core.Variant(name: "unparsed")
+        }
+        let deepgram = Core.billedMinutes(itemAudioSeconds: [30, 90], variants: [variant("a"), variant("b")], repeats: 2)
+        TestSupport.expectApproximatelyEqual(deepgram[.deepgram] ?? -1, 8)
+        TestSupport.expectEqual(deepgram[.assemblyAI], nil)
+        TestSupport.expectApproximatelyEqual(
+            (deepgram[.deepgram] ?? 0) * 0.0077,
+            Core.estimatedCostUSD(audioSeconds: 120, variants: 2, repeats: 2, pricePerMinute: 0.0077),
+            accuracy: 1e-12
+        )
+        let realtime = Core.billedMinutes(itemAudioSeconds: [30, 90], variants: [variant("a provider=assemblyai")], repeats: 2)
+        TestSupport.expectApproximatelyEqual(realtime[.assemblyAI] ?? -1, (120 + 2) / 60 * 2)
+        let faster = Core.billedMinutes(
+            itemAudioSeconds: [30, 90], variants: [variant("a provider=assemblyai pacing=1.25x")], repeats: 1
+        )
+        TestSupport.expectApproximatelyEqual(faster[.assemblyAI] ?? -1, (120 / 1.25 + 2) / 60)
+        var burst = variant("a provider=assemblyai")
+        burst.pacing = .burst
+        TestSupport.expectApproximatelyEqual(
+            Core.billedMinutes(itemAudioSeconds: [60], variants: [burst], repeats: 1)[.assemblyAI] ?? -1,
+            (60 / 1.25 + 1) / 60
+        )
+        let mixed = Core.billedMinutes(
+            itemAudioSeconds: [60],
+            variants: (try? Core.parseVariants(Core.preset(named: "providers") ?? "")) ?? [],
+            repeats: 1
+        )
+        TestSupport.expectApproximatelyEqual(mixed[.deepgram] ?? -1, 1)
+        TestSupport.expectApproximatelyEqual(mixed[.assemblyAI] ?? -1, 3 * 61 / 60)
     }
 
     private static func testSignTestPValues() {

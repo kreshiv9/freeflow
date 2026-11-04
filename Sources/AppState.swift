@@ -4435,7 +4435,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
             : AppContextService.textContextScreenshotStatus
         // This recording's stream (startStreamingIfEnabled ran first); nil for any other provider.
         let keytermStream = realtimeService as? KeytermStreamingSession
-        let wantsSpeechTerms = keytermStream != nil
+        // On-screen names are read only for a stream that takes them (not AssemblyAI with its
+        // keyterms switched off); the stream is still kept for the prompt refinement below.
+        let wantsSpeechTerms = keytermStream?.acceptsKeytermUpdates ?? false
         let startedAt = CFAbsoluteTimeGetCurrent()
 
         contextCaptureTask = Task { [weak self, weak keytermStream] in
@@ -4451,11 +4453,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     keytermStream?.updateKeyterms(screenTerms: screenTerms, identifiers: identifiers)
                 }
             // AssemblyAI's scenario prompt, refined from the bundle and page domain only (text
-            // context exists only with Context Awareness on).
-            if !Task.isCancelled, let snapshot = context.textContext {
-                (keytermStream as? AssemblyAIStreamingService)?.updatePromptScenario(.resolve(
-                    bundleIdentifier: snapshot.bundleIdentifier, websiteDomain: snapshot.websiteDomain
-                ))
+            // context exists only with Context Awareness on); never from a private Chrome window.
+            if !Task.isCancelled, let snapshot = context.textContext,
+               let scenario = AssemblyAIStreamingCore.PromptScenario.refinement(
+                   bundleIdentifier: snapshot.bundleIdentifier,
+                   websiteDomain: snapshot.websiteDomain,
+                   windowTitle: snapshot.windowTitle
+               ) {
+                (keytermStream as? AssemblyAIStreamingService)?.updatePromptScenario(scenario)
             }
             os_log(
                 .info, log: recordingLog, "context ready +%.0f ms after recording start",
