@@ -19,9 +19,7 @@
   <img src="Resources/demo.gif" alt="FreeFlow demo" width="600">
 </p>
 
-<p align="center">
-  <i>Thank you to <a href="https://github.com/marcbodea">@marcbodea</a> for maintaining FreeFlow!</i>
-</p>
+
 
 ## Overview
 
