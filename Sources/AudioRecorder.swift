@@ -109,12 +109,14 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     /// buffer, and never when that rate is nil. The tail is flushed through it
     /// inside ``stopRecording`` before its completion runs. Lock-backed because
     /// AppState sets and clears it on main while the capture queue reads it
-    /// (B12). The recorder writes a 16 kHz mono PCM16 WAV file independently.
+    /// (B12), as a plain locked property: OSAllocatedUnfairLock<closure>
+    /// re-wraps the closure on every read, which overflowed the capture stack.
+    /// The recorder writes a 16 kHz mono PCM16 WAV file independently.
     var onPCM16Samples: ((Data) -> Void)? {
-        get { pcm16SamplesHandler.withLock { $0 } }
-        set { pcm16SamplesHandler.withLock { $0 = newValue } }
+        get { pcm16SamplesHandler.load() }
+        set { pcm16SamplesHandler.store(newValue) }
     }
-    private let pcm16SamplesHandler = OSAllocatedUnfairLock<((Data) -> Void)?>(initialState: nil)
+    private let pcm16SamplesHandler = PCMSampleHandlerSlot()
     private let recordingTargetFormat: AVAudioFormat = {
         AVAudioFormat(
             commonFormat: .pcmFormatInt16,
