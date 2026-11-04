@@ -109,12 +109,12 @@ extension AppState {
         DispatchQueue.main.asyncAfter(deadline: .now() + LearnedVocabulary.saveDelay, execute: save)
     }
 
-    /// Saves the learned store at once: after the delay, on Delete all, and when the app quits
-    /// with a save pending.
+    /// Saves the learned store at once, after the delay and when the app quits, if it changed
+    /// since the load or the last save and this build may write it (learnedVocabularySaver).
     func saveLearnedVocabularyNow() {
         learnedSaveWorkItem?.cancel()
         learnedSaveWorkItem = nil
-        learnedVocabulary.save(to: .standard)
+        learnedVocabularySaver.saveIfChanged(learnedVocabulary, to: .standard)
     }
 
     /// Run Log "Fix": learns from what the row pasted and what the user says it should have
@@ -229,13 +229,17 @@ extension AppState {
         os_log(.info, log: learningLog, "undo last learned: %d terms, %d rules", change.addedItemIDs.count, change.addedRules.count)
     }
 
-    /// Removes every learned item, pending hash, tombstone and counter. The manual Custom
-    /// Vocabulary and Corrections are not touched.
+    /// Removes every learned item, pending hash, tombstone, counted Run Log entry and counter,
+    /// and the stored store, even one kept unread. The manual Custom Vocabulary and
+    /// Corrections are not touched.
     @MainActor
     func deleteAllLearnedData() {
         learnedVocabulary = LearnedVocabulary()
-        // Saving the empty store removes the stored key now, not after the save delay.
-        saveLearnedVocabularyNow()
+        // The stored key goes now, not after the save delay.
+        learnedSaveWorkItem?.cancel()
+        learnedSaveWorkItem = nil
+        learnedVocabularySaver.deleteAll(from: .standard)
+        learnedStoreKeptUnread = false
         dictationRecords = DictationRecordRing()
         clearLearnedUndoOffer()
         overlayManager.dismissLearnedToast()

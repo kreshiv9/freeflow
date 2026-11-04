@@ -47,6 +47,9 @@ enum LearnedVocabularyTests {
         testLearnedKeytermsMatchMerge()
         testLearnedKeytermIndex()
         testListedRulesShowWhatIsNotApplied()
+        testSaverWritesOnlyChanges()
+        testStoreThisBuildCannotReadIsKept()
+        testLaunchSaveRemovesUnstorableTerms()
     }
 
     // MARK: Fixtures
@@ -854,6 +857,45 @@ enum LearnedVocabularyTests {
         TestSupport.expect(corrected?.hasLearned == true, "the corrected Fix of the same entry is learned")
         TestSupport.expectEqual(store.items.map(\.text), ["Claude"])
 
+        // Undo also forgets the pending sightings the Fix added, so a corrected Fix of the same
+        // entry counts the weak term once: it stays pending.
+        var mixed = Store()
+        let mixedEntry = UUID()
+        let weakGroqq = candidate("grok", "Groqq", strength: .weak)
+        guard let mixedFix = RunLogFix.apply(.learned([candidate("claud", "Claud"), weakGroqq]), entryID: mixedEntry, observation: observation(), to: &mixed, now: start),
+              mixedFix.hasLearned, mixed.pending.count == 1 else {
+            TestSupport.expect(false, "the mixed Fix learns one term and pends one")
+            return
+        }
+        mixed.undo(mixedFix)
+        TestSupport.expect(mixed.items.isEmpty && mixed.pending.isEmpty, "Undo removes the term and forgets the pending sighting")
+        TestSupport.expect(!mixed.hasCounted(entryID: mixedEntry, now: start + 1), "and releases the entry")
+        let mixedAgain = RunLogFix.apply(.learned([candidate("claud", "Claude"), weakGroqq]), entryID: mixedEntry, observation: observation(), to: &mixed, now: start + 2)
+        TestSupport.expectEqual(mixedAgain?.learnedTerms, ["Claude"])
+        TestSupport.expectEqual(mixed.items.map(\.text), ["Claude"])
+        TestSupport.expectEqual(mixed.pending.count, 1)
+
+        // A Fix that also counted a sighting of a term already learned keeps its entry counted
+        // after Undo: Undo cannot take that sighting back, so fixing the same dictation again
+        // would count it twice and could make a rule from one dictation.
+        var older = Store()
+        learn(&older, [candidate("Versal", "Vercel")], at: start)
+        let olderEntry = UUID()
+        let sightingAndTerm = CorrectionLearner.Outcome.learned([candidate("versel", "Vercel", ruleLater: true), candidate("claud", "Claud")])
+        let keytermObservation = observation(sentKeyterms: ["Vercel"])
+        guard let olderFix = RunLogFix.apply(sightingAndTerm, entryID: olderEntry, observation: keytermObservation, to: &older, now: start + day),
+              olderFix.hasLearned, olderFix.updatedTerms == ["Vercel"], older.ruleRows.isEmpty else {
+            TestSupport.expect(false, "the Fix learns Claud and counts a Vercel sighting without a rule")
+            return
+        }
+        TestSupport.expect(olderFix.countedEntryHashes.isEmpty, "Undo will not release this entry")
+        older.undo(olderFix)
+        TestSupport.expect(older.hasCounted(entryID: olderEntry, now: start + day + 1), "the entry stays counted")
+        let olderAgain = RunLogFix.apply(sightingAndTerm, entryID: olderEntry, observation: keytermObservation, to: &older, now: start + day + 2)
+        TestSupport.expect(olderAgain == nil, "a second Fix of the same dictation is not applied")
+        TestSupport.expect(older.ruleRows.isEmpty, "no rule from one dictation")
+        TestSupport.expectEqual(older.items.first?.variants.first { Store.key($0.heard) == "versel" }?.sightings.count, 1)
+
         // A batched Undo releases every entry of the batch; other entries stay counted.
         var batch = Store()
         let (a, b, c) = (UUID(), UUID(), UUID())
@@ -1117,5 +1159,185 @@ enum LearnedVocabularyTests {
             TestSupport.expectEqual(applied.contains(row.rule.variant.id), row.unused == nil)
         }
         TestSupport.expect(EffectiveVocabulary.listedRules(manualVocabulary: "", manualCorrections: [], learned: Store()).isEmpty, "nothing learned, no rows")
+    }
+
+    /// A store with every kind of field, as this build writes it.
+    private static func richStore() -> Store {
+        var store = Store()
+        learn(&store, [candidate("versel", "Vercel", ruleNow: true)], category: .coding, sentKeyterms: ["Vercel"], at: start)
+        learn(&store, [candidate("kwen", "Qwen")], category: .aiChat, at: start + 1)
+        learn(&store, [candidate("zkold", "Zqold")], at: start + 2)
+        learn(&store, [candidate("anthropic", "Anthropic", strength: .weak)], at: start + 3)
+        learn(&store, [candidate("Qwen", "queen", strength: .weak, isRevert: true)], at: start + 4)
+        _ = store.recordHits(inRawTranscript: "deploy to vercel", now: start + 5)
+        _ = store.apply(.nothing(.rewrite), from: observation(), now: start + 6)
+        _ = store.markCounted(entryID: UUID(), now: start + 7)
+        store.setStarred(store.items[0].id, true)
+        store.removeItem(store.items[2].id)
+        return store
+    }
+
+    /// Only a change is written: a quit or an assignment that changes nothing writes nothing,
+    /// and a store this build wrote reads back in full.
+    private static func testSaverWritesOnlyChanges() {
+        withDefaults { defaults in
+            TestSupport.expectEqual(Store.loadChecked(from: defaults).status, .missing)
+            var fresh = LearnedVocabularySaver(status: .missing)
+            TestSupport.expect(!fresh.saveIfChanged(Store(), to: defaults), "nothing changed, nothing written")
+
+            let rich = richStore()
+            TestSupport.expect(!rich.tombstones.isEmpty && !rich.pending.isEmpty && rich.countedEntries != nil, "the fixture has every field")
+            rich.save(to: defaults)
+            let loaded = Store.loadChecked(from: defaults)
+            TestSupport.expectEqual(loaded.status, .loaded)
+            TestSupport.expectEqual(loaded.store, rich)
+
+            var saver = LearnedVocabularySaver(status: loaded.status)
+            TestSupport.expect(!saver.keepsStoredUnread, "a store read in full is written")
+            TestSupport.expect(!saver.noteChange(from: loaded.store, to: loaded.store), "an equal assignment is no change")
+            TestSupport.expect(!saver.saveIfChanged(loaded.store, to: defaults), "a quit with nothing changed writes nothing")
+
+            var changed = loaded.store
+            learn(&changed, [candidate("post gress", "Postgres")], at: start + day)
+            TestSupport.expect(saver.noteChange(from: loaded.store, to: changed), "learning is a change")
+            TestSupport.expect(saver.saveIfChanged(changed, to: defaults), "a change is written")
+            TestSupport.expectEqual(Store.load(from: defaults), changed)
+            TestSupport.expect(!saver.saveIfChanged(changed, to: defaults), "and only once")
+
+            // Deleting the last item writes the empty store, which removes the key.
+            saver.noteChange(from: changed, to: Store())
+            TestSupport.expect(saver.saveIfChanged(Store(), to: defaults), "the empty store is written")
+            TestSupport.expect(defaults.object(forKey: Store.storageKey) == nil, "and leaves nothing behind")
+        }
+    }
+
+    /// A stored store this build cannot read in full (undecodable, a newer version, or fields
+    /// it does not know) keeps its bytes: learning stays in memory and nothing is written, not
+    /// even an empty store. Delete all still removes it.
+    private static func testStoreThisBuildCannotReadIsKept() {
+        let rich = richStore()
+        let richObject = (try? JSONEncoder().encode(rich))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        TestSupport.expect(!richObject.isEmpty, "the fixture encodes")
+        func edited(_ edit: (inout [String: Any]) -> Void) -> Data {
+            var object = richObject
+            edit(&object)
+            return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+        }
+        func editFirstItem(_ object: inout [String: Any], _ edit: (inout [String: Any]) -> Void) {
+            var items = object["items"] as? [[String: Any]] ?? []
+            guard !items.isEmpty else { return }
+            edit(&items[0])
+            object["items"] = items
+        }
+        let cases: [(label: String, stored: Any, keepsItems: Bool)] = [
+            ("not JSON", Data("not json".utf8), false),
+            ("not data", "a string", false),
+            ("an unknown state", edited { editFirstItem(&$0) { $0["state"] = "dormant" } }, false),
+            ("a newer version", edited { $0["version"] = Store.currentVersion + 1 }, true),
+            ("an unknown top-level field", edited { $0["futureField"] = ["count": 1] }, true),
+            ("an unknown item field", edited { editFirstItem(&$0) { $0["futureItemField"] = 1 } }, true),
+            ("an unknown variant field", edited {
+                editFirstItem(&$0) { item in
+                    var variants = item["variants"] as? [[String: Any]] ?? []
+                    if !variants.isEmpty { variants[0]["futureVariantField"] = true }
+                    item["variants"] = variants
+                }
+            }, true),
+        ]
+        for testCase in cases {
+            withDefaults { defaults in
+                defaults.set(testCase.stored, forKey: Store.storageKey)
+                let before = defaults.object(forKey: Store.storageKey) as? NSObject
+                let loaded = Store.loadChecked(from: defaults)
+                TestSupport.expect(loaded.status == .keptUnread, "\(testCase.label) is kept unread")
+                TestSupport.expect(
+                    loaded.store.items.map(\.text) == (testCase.keepsItems ? rich.items.map(\.text) : []),
+                    "\(testCase.label): what is readable is used in memory"
+                )
+                var saver = LearnedVocabularySaver(status: loaded.status)
+                TestSupport.expect(saver.keepsStoredUnread, "\(testCase.label): not written")
+
+                // Learning goes on in memory; the save and the quit write nothing.
+                var store = loaded.store
+                learn(&store, [candidate("post gress", "Postgres")], at: start + day)
+                TestSupport.expect(saver.noteChange(from: loaded.store, to: store), "\(testCase.label): learning is a change")
+                TestSupport.expect(!saver.saveIfChanged(store, to: defaults), "\(testCase.label): the change stays in memory")
+                saver.noteChange(from: store, to: Store())
+                TestSupport.expect(!saver.saveIfChanged(Store(), to: defaults), "\(testCase.label): an empty store does not remove it")
+                // Deleting a learned term lasts only until the app quits too (the Learning card
+                // says so): the next load has it again.
+                if let first = loaded.store.items.first {
+                    var removed = loaded.store
+                    removed.removeItem(first.id)
+                    saver.noteChange(from: loaded.store, to: removed)
+                    TestSupport.expect(!saver.saveIfChanged(removed, to: defaults), "\(testCase.label): the delete stays in memory")
+                    TestSupport.expect(Store.load(from: defaults).items.contains { $0.id == first.id }, "\(testCase.label): the deleted term is back at the next load")
+                }
+                TestSupport.expect(
+                    (defaults.object(forKey: Store.storageKey) as? NSObject)?.isEqual(before) == true,
+                    "\(testCase.label): the stored bytes are unchanged"
+                )
+
+                // Delete all removes it, and changes are written from then on.
+                saver.deleteAll(from: defaults)
+                TestSupport.expect(defaults.object(forKey: Store.storageKey) == nil, "\(testCase.label): Delete all removes it")
+                TestSupport.expect(!saver.keepsStoredUnread, "\(testCase.label): written after Delete all")
+                saver.noteChange(from: Store(), to: store)
+                TestSupport.expect(saver.saveIfChanged(store, to: defaults), "\(testCase.label): the next change is written")
+                TestSupport.expectEqual(Store.load(from: defaults), store)
+            }
+        }
+    }
+
+    /// A stored term the current filters reject (here an invented secret-shaped one) is left
+    /// out at load and removed from defaults by the launch save, with nothing else changed. A
+    /// store kept unread still keeps its bytes.
+    private static func testLaunchSaveRemovesUnstorableTerms() {
+        let fakeSecret = "sk-ant-FAKE0example0000"
+        TestSupport.expect(!Store.isStorable(fakeSecret), "the fixture is unstorable")
+        var store = Store()
+        learn(&store, [candidate("versel", "Vercel"), candidate("kwen", "Qwen")], at: start)
+        func stored(version: Int) -> Data {
+            let data = (try? JSONEncoder().encode(store)) ?? Data()
+            var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            var items = object["items"] as? [[String: Any]] ?? []
+            if items.count == 2 { items[1]["text"] = fakeSecret }
+            object["items"] = items
+            object["version"] = version
+            return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+        }
+        func storedText(_ defaults: UserDefaults) -> String {
+            defaults.data(forKey: Store.storageKey).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        }
+
+        withDefaults { defaults in
+            defaults.set(stored(version: Store.currentVersion), forKey: Store.storageKey)
+            TestSupport.expect(storedText(defaults).contains(fakeSecret), "the fixture is stored")
+            let loaded = Store.loadChecked(from: defaults)
+            TestSupport.expectEqual(loaded.status, .loaded)
+            TestSupport.expect(loaded.droppedItems, "the load reports the dropped term")
+            TestSupport.expectEqual(loaded.store.items.map(\.text), ["Vercel"])
+            // AppState's launch: the saver from the load, then saveIfChanged.
+            var saver = LearnedVocabularySaver(loaded: loaded)
+            TestSupport.expect(saver.saveIfChanged(loaded.store, to: defaults), "the launch save rewrites the store")
+            TestSupport.expect(!storedText(defaults).contains(fakeSecret), "the dropped term is gone from defaults")
+            let reloaded = Store.loadChecked(from: defaults)
+            TestSupport.expect(reloaded.status == .loaded && !reloaded.droppedItems, "the rewritten store loads in full")
+            TestSupport.expectEqual(reloaded.store, loaded.store)
+            var next = LearnedVocabularySaver(loaded: reloaded)
+            TestSupport.expect(!next.saveIfChanged(reloaded.store, to: defaults), "the next launch writes nothing")
+        }
+
+        withDefaults { defaults in
+            defaults.set(stored(version: Store.currentVersion + 1), forKey: Store.storageKey)
+            let before = defaults.data(forKey: Store.storageKey)
+            let loaded = Store.loadChecked(from: defaults)
+            TestSupport.expect(loaded.status == .keptUnread && loaded.droppedItems, "a newer store drops the term in memory")
+            TestSupport.expectEqual(loaded.store.items.map(\.text), ["Vercel"])
+            var saver = LearnedVocabularySaver(loaded: loaded)
+            TestSupport.expect(!saver.saveIfChanged(loaded.store, to: defaults), "a store kept unread is not written")
+            TestSupport.expectEqual(defaults.data(forKey: Store.storageKey), before)
+        }
     }
 }

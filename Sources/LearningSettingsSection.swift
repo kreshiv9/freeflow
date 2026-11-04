@@ -183,6 +183,12 @@ struct LearningSettingsSection: View {
             Text(appState.learnedVocabulary.activityLine)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            if appState.learnedStoreKeptUnread {
+                Text("Learned data saved by another FreeFlow version is kept as it is. This version uses what it can read of it but does not save over it, so changes here, including learning, deleting or editing a learned term or correction, last only until you quit. Delete all learned data removes it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .alert("Delete all learned data?", isPresented: $confirmsDeleteAll) {
             Button("Delete", role: .destructive) {

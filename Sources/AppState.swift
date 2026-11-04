@@ -767,14 +767,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     /// Terms and rules learned from the user's fixes (AppState+Learning.swift); local only.
-    /// Saved LearnedVocabulary.saveDelay after the last change, or when the app quits before
-    /// that.
+    /// A change is saved LearnedVocabulary.saveDelay later, or when the app quits before that;
+    /// an assignment that changes nothing writes nothing (learnedVocabularySaver).
     @Published var learnedVocabulary = LearnedVocabulary() {
         didSet {
+            guard learnedVocabularySaver.noteChange(from: oldValue, to: learnedVocabulary) else { return }
             scheduleLearnedVocabularySave()
             refreshLearnedKeytermIndex()
         }
     }
+    /// Whether the learned store changed since the load or the last save, and whether this
+    /// build may write it: a stored store it could not read in full is kept as it was.
+    var learnedVocabularySaver = LearnedVocabularySaver(status: .missing)
+    /// The stored learned data is kept unread (LearnedVocabulary.LoadStatus.keptUnread), so
+    /// learning and edits of learned items last until the app quits; the Learning card says so.
+    @Published var learnedStoreKeptUnread = false
 
     /// "Learn automatically". Off stops learning; learned items stay in use until deleted.
     @Published var learningEnabled: Bool {
@@ -1106,7 +1113,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.soundVolume = soundVolume
         self.voiceMacros = initialMacros
         self.dictionaryCorrections = DictionaryCorrection.load(from: .standard)
-        self.learnedVocabulary = LearnedVocabulary.load(from: .standard)
+        let loadedLearnedVocabulary = LearnedVocabulary.loadChecked(from: .standard)
+        self.learnedVocabulary = loadedLearnedVocabulary.store
+        self.learnedVocabularySaver = LearnedVocabularySaver(loaded: loadedLearnedVocabulary)
+        self.learnedStoreKeptUnread = loadedLearnedVocabulary.status == .keptUnread
         self.pipelineHistory = savedHistory
         self.hasAccessibility = initialAccessibility
         self.hasScreenRecordingPermission = initialScreenCapturePermission
@@ -1149,20 +1159,26 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         // didSet does not run in init: age the learned store at launch and save explicitly.
         // Expired evidence goes even while learning is off; learned items age only while it is on.
+        // The save also rewrites a store loaded without terms the current filters reject. A
+        // store kept unread is aged in memory only.
         let launchedAt = Date()
+        let learnedAtLaunch = learnedVocabulary
         if learningEnabled ? learnedVocabulary.prune(now: launchedAt) : learnedVocabulary.expireEvidence(now: launchedAt) {
-            learnedVocabulary.save(to: .standard)
+            learnedVocabularySaver.noteChange(from: learnedAtLaunch, to: learnedVocabulary)
+        }
+        learnedVocabularySaver.saveIfChanged(learnedVocabulary, to: .standard)
+        if learnedStoreKeptUnread {
+            os_log(.info, log: recordingLog, "learned store kept unread; learning stays in memory")
         }
         refreshLearnedKeytermIndex()
-        // Quitting writes only a pending change: an unchanged store is never rewritten, so a
-        // store this build cannot read (from a newer build) is not deleted or cut down.
+        // Quitting writes only a change not saved yet: an unchanged store is never rewritten,
+        // and one this build could not read in full is never written (learnedVocabularySaver).
         learnedTerminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, self.learnedSaveWorkItem != nil else { return }
-            self.saveLearnedVocabularyNow()
+            self?.saveLearnedVocabularyNow()
         }
         overlayManager.onLearnedUndoPressed = { [weak self] in
             DispatchQueue.main.async {
@@ -4694,11 +4710,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     /// The learned toast is skipped while a dictation, a transform or a shortcut start owns
-    /// the overlay, and while another pill (the failure indicator) waits for its timed
-    /// dismiss; Undo stays in the menu bar.
+    /// the overlay, while the failure indicator waits for its timed dismiss, and while any
+    /// other pill (an error) is showing; Undo stays in the menu bar. showLearned checks the
+    /// pill again when it runs.
     var canShowLearnedToast: Bool {
         !isRecording && !isTranscribing && !isTransforming && pendingShortcutStartMode == nil
-            && pendingOverlayDismissToken == nil
+            && pendingOverlayDismissToken == nil && !overlayManager.showsPillOtherThanLearned
     }
 
     private func scheduleOverlayDismissAfterFailureIndicator(after delay: TimeInterval) {

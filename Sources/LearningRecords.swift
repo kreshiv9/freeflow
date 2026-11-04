@@ -85,8 +85,10 @@ enum RunLogFix {
     /// counted a sighting within the evidence window (the store keeps a hash of the entry id,
     /// so this holds across relaunches): one dictation is one observation however often it is
     /// fixed, so repeating a Fix never activates a pending term or makes a rule. Nil when
-    /// nothing was applied. A Fix that counted nothing can be retried, and Undo of what a Fix
-    /// learned releases its entry.
+    /// nothing was applied. A Fix that counted nothing can be retried. Undo of what a Fix
+    /// learned releases its entry only when Undo takes back every sighting the Fix counted
+    /// (new terms, their rules and pending sightings): a sighting of a term already in the
+    /// store, or a revert, stays, so that entry stays counted.
     static func apply(
         _ outcome: CorrectionLearner.Outcome,
         entryID: UUID,
@@ -97,7 +99,10 @@ enum RunLogFix {
         guard !store.hasCounted(entryID: entryID, now: now) else { return nil }
         var change = store.apply(outcome, from: observation, now: now)
         if change.countedSighting {
-            change.countedEntryHashes = [store.markCounted(entryID: entryID, now: now)]
+            let entryHash = store.markCounted(entryID: entryID, now: now)
+            if change.updatedTerms.isEmpty, change.reverts == 0 {
+                change.countedEntryHashes = [entryHash]
+            }
         }
         return change
     }

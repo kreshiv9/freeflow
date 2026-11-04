@@ -245,9 +245,15 @@ final class RecordingOverlayManager {
 
     static let learnedToastSeconds: TimeInterval = 4
 
-    /// "Learned: X · Undo" in the drop-down pill for learnedToastSeconds. The panel stays
-    /// non-activating, so the Undo click never takes focus, and any recording start replaces
-    /// the toast.
+    /// The panel shows a pill other than the learned toast: a dictation or transform, the
+    /// failure indicator or an error. Main thread only.
+    var showsPillOtherThanLearned: Bool {
+        overlayWindow != nil && overlayState.phase != .learned
+    }
+
+    /// "Learned: X · Undo" in the drop-down pill for learnedToastSeconds, unless another pill
+    /// is showing by then (it is never replaced). The panel stays non-activating, so the Undo
+    /// click never takes focus, and any recording start replaces the toast.
     func showLearned(_ message: String) {
         let truncated: String = {
             if message.count <= Self.maxToastMessageLength { return message }
@@ -255,6 +261,7 @@ final class RecordingOverlayManager {
             return String(message[..<cutoff]) + "…"
         }()
         DispatchQueue.main.async { [self] in
+            guard !self.showsPillOtherThanLearned else { return }
             let toastID = UUID()
             self.overlayState.learnedMessage = truncated
             self.overlayState.toastID = toastID

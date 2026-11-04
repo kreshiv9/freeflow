@@ -45,6 +45,8 @@ enum LearningSource: String, Codable, CaseIterable, Sendable {
 /// ids. Pure: no logging and no clock; callers pass `now`.
 struct LearnedVocabulary: Codable, Equatable {
     static let storageKey = "learned_vocabulary_v1"
+    /// The newest `version` this build reads in full.
+    static let currentVersion = 1
 
     static let maxActiveItems = 200
     static let maxPending = 500
@@ -200,7 +202,9 @@ struct LearnedVocabulary: Codable, Equatable {
     struct Change: Equatable {
         var addedItemIDs: [UUID] = []
         var addedRules: [RuleRef] = []
-        var pendingAdded = 0
+        /// The pending sightings this change added (pairHash): Undo forgets them.
+        var pendingHashes: [String] = []
+        var pendingAdded: Int { pendingHashes.count }
         /// Existing terms seen again.
         var updatedTerms: [String] = []
         var reverts = 0
@@ -209,8 +213,10 @@ struct LearnedVocabulary: Codable, Equatable {
         var code = ""
         var learnedTerms: [String] = []
         var learnedRules: [RulePair] = []
-        /// The Run Log entries this change counted (entryHash): Undo releases them, so the
-        /// same dictation can be fixed again.
+        /// The Run Log entries this change counted whose every sighting Undo takes back
+        /// (entryHash): Undo releases them, so the same dictation can be fixed again. A Fix
+        /// that also counted a sighting of a term already in the store, or a revert, keeps its
+        /// entry counted (RunLogFix.apply).
         var countedEntryHashes: [String] = []
 
         /// A new term or rule that the toast announces and Undo removes.
@@ -252,7 +258,7 @@ struct LearnedVocabulary: Codable, Equatable {
             var merged = self
             merged.addedItemIDs += later.addedItemIDs.filter { !merged.addedItemIDs.contains($0) }
             merged.addedRules += later.addedRules.filter { !merged.addedRules.contains($0) }
-            merged.pendingAdded += later.pendingAdded
+            merged.pendingHashes += later.pendingHashes
             merged.updatedTerms += later.updatedTerms.filter { !merged.updatedTerms.contains($0) }
             merged.reverts += later.reverts
             merged.refused += later.refused
@@ -264,7 +270,7 @@ struct LearnedVocabulary: Codable, Equatable {
         }
     }
 
-    var version = 1
+    var version = currentVersion
     var items: [Item] = []
     var pending: [Pending] = []
     /// Sorted SHA-256 hex of deleted terms and pairs; never re-learned.
@@ -278,22 +284,80 @@ struct LearnedVocabulary: Codable, Equatable {
 
     // MARK: Persistence
 
-    /// The stored store; a missing key or undecodable data loads as empty, like
-    /// DictionaryCorrection.load, and is replaced on the next write. Only a change writes (a
-    /// quit without a pending save does not), so data from a newer build stays until this
-    /// build changes the store. Terms are checked here once rather than on every dictation:
-    /// apply stores only storable text, and this drops any term the current filters (secrets
-    /// included) reject.
-    static func load(from defaults: UserDefaults) -> LearnedVocabulary {
-        guard let data = defaults.data(forKey: storageKey),
-              var decoded = try? JSONDecoder().decode(LearnedVocabulary.self, from: data) else {
-            return LearnedVocabulary()
-        }
-        decoded.items.removeAll { !isStorable($0.text) }
-        return decoded
+    /// How the stored store loaded, which decides whether this build may write it.
+    enum LoadStatus {
+        /// Nothing stored.
+        case missing
+        /// Read in full: this build may rewrite it.
+        case loaded
+        /// Undecodable, from a newer version or holding fields this build does not know (a
+        /// later build's): kept byte for byte, so learning and edits stay in memory until the
+        /// app quits. Only Delete all removes it.
+        case keptUnread
     }
 
-    /// An empty store removes the key, so nothing learned leaves nothing behind.
+    struct Loaded {
+        var store: LearnedVocabulary
+        var status: LoadStatus
+        /// Stored terms the current filters reject were left out of `store`, so it differs
+        /// from what is stored (LearnedVocabularySaver(loaded:) rewrites it).
+        var droppedItems = false
+    }
+
+    /// The stored store, or an empty one for a missing key or undecodable data. Terms are
+    /// checked here once rather than on every dictation: apply stores only storable text, and
+    /// this drops any term the current filters (secrets included) reject.
+    static func load(from defaults: UserDefaults) -> LearnedVocabulary {
+        loadChecked(from: defaults).store
+    }
+
+    /// `load`, and whether this build may write the stored store (LearnedVocabularySaver).
+    /// Data that decodes but holds a key a re-encode would drop, or a newer version, is used
+    /// in memory and marked keptUnread; undecodable data loads as empty and keptUnread.
+    static func loadChecked(from defaults: UserDefaults) -> Loaded {
+        guard let stored = defaults.object(forKey: storageKey) else {
+            return Loaded(store: LearnedVocabulary(), status: .missing)
+        }
+        guard let data = stored as? Data,
+              var decoded = try? JSONDecoder().decode(LearnedVocabulary.self, from: data) else {
+            return Loaded(store: LearnedVocabulary(), status: .keptUnread)
+        }
+        let readInFull = decoded.version <= currentVersion
+            && !dropsStoredFields(stored: data, decoded: decoded)
+        let storedItemCount = decoded.items.count
+        decoded.items.removeAll { !isStorable($0.text) }
+        return Loaded(
+            store: decoded,
+            status: readInFull ? .loaded : .keptUnread,
+            droppedItems: decoded.items.count < storedItemCount
+        )
+    }
+
+    /// Whether the stored JSON holds a key, at any depth, that encoding `decoded` would drop.
+    private static func dropsStoredFields(stored data: Data, decoded: LearnedVocabulary) -> Bool {
+        guard let stored = try? JSONSerialization.jsonObject(with: data),
+              let encoded = try? JSONEncoder().encode(decoded),
+              let reencoded = try? JSONSerialization.jsonObject(with: encoded) else { return true }
+        return dropsFields(stored, reencoded)
+    }
+
+    private static func dropsFields(_ stored: Any, _ reencoded: Any) -> Bool {
+        if let stored = stored as? [String: Any] {
+            guard let reencoded = reencoded as? [String: Any] else { return true }
+            return stored.contains { key, value in
+                guard let kept = reencoded[key] else { return !(value is NSNull) }
+                return dropsFields(value, kept)
+            }
+        }
+        if let stored = stored as? [Any] {
+            guard let reencoded = reencoded as? [Any], reencoded.count == stored.count else { return true }
+            return zip(stored, reencoded).contains { dropsFields($0, $1) }
+        }
+        return false
+    }
+
+    /// An empty store removes the key, so nothing learned leaves nothing behind. Callers in the
+    /// app go through LearnedVocabularySaver, which writes only a change this build may write.
     func save(to defaults: UserDefaults) {
         guard self != LearnedVocabulary() else {
             Self.removeStored(from: defaults)
@@ -561,7 +625,7 @@ struct LearnedVocabulary: Codable, Equatable {
         // A first sighting that is weak or unsettled waits; a second one activates the term.
         if sightingDates.count == 1, candidate.strength == .weak || !observation.settled {
             pending.append(Pending(pairHash: pairHash, count: 1, firstSeen: now, lastSeen: now))
-            change.pendingAdded += 1
+            change.pendingHashes.append(pairHash)
             count("pending")
             return
         }
@@ -660,9 +724,10 @@ struct LearnedVocabulary: Codable, Equatable {
 
     // MARK: Review and undo
 
-    /// Removes what `change` added: its new terms (tombstoned with all their pairs) and its
-    /// new rules on older terms (tombstoned pairs). Counts on older terms stay. The Run Log
-    /// entries it counted are released, so a corrected Fix of the same dictation can count.
+    /// Removes what `change` added: its new terms (tombstoned with all their pairs), its new
+    /// rules on older terms (tombstoned pairs) and its pending sightings (forgotten, not
+    /// tombstoned). Counts on older terms stay. The Run Log entries in countedEntryHashes are
+    /// released, so a corrected Fix of the same dictation can count.
     mutating func undo(_ change: Change) {
         for id in change.addedItemIDs {
             if let index = items.firstIndex(where: { $0.id == id }) {
@@ -672,6 +737,8 @@ struct LearnedVocabulary: Codable, Equatable {
         for rule in change.addedRules where !change.addedItemIDs.contains(rule.itemID) {
             removeRule(itemID: rule.itemID, variantID: rule.variantID)
         }
+        let forgotten = Set(change.pendingHashes)
+        pending.removeAll { forgotten.contains($0.pairHash) }
         let released = Set(change.countedEntryHashes)
         keepCountedEntries { !released.contains($0.entryHash) }
         count("undo")
@@ -845,5 +912,54 @@ struct LearnedVocabulary: Codable, Equatable {
         parts.append(days == 0 ? "today" : "\(days) d ago")
         if item.state == .ambiguous { parts.append("not sure") }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// When the app writes the learned store: only after it changed since the load or the last
+/// save (a quit with nothing changed writes nothing), and never over a stored store this build
+/// could not read in full (LearnedVocabulary.LoadStatus.keptUnread), which only Delete all
+/// removes.
+struct LearnedVocabularySaver {
+    private(set) var canWrite: Bool
+    private(set) var hasUnsavedChange = false
+
+    init(status: LearnedVocabulary.LoadStatus) {
+        canWrite = status != .keptUnread
+    }
+
+    /// A store loaded without terms the current filters reject (secrets included) counts as
+    /// changed, so the launch save removes them from the stored store; one kept unread is
+    /// still never written.
+    init(loaded: LearnedVocabulary.Loaded) {
+        self.init(status: loaded.status)
+        hasUnsavedChange = loaded.droppedItems
+    }
+
+    /// The stored store is kept as it was and learning stays in memory.
+    var keepsStoredUnread: Bool { !canWrite }
+
+    /// Notes an assignment of the store; true when it changed.
+    @discardableResult
+    mutating func noteChange(from old: LearnedVocabulary, to new: LearnedVocabulary) -> Bool {
+        guard old != new else { return false }
+        hasUnsavedChange = true
+        return true
+    }
+
+    /// Writes `store` when it changed and this build may write it. True when it wrote.
+    @discardableResult
+    mutating func saveIfChanged(_ store: LearnedVocabulary, to defaults: UserDefaults) -> Bool {
+        guard hasUnsavedChange, canWrite else { return false }
+        store.save(to: defaults)
+        hasUnsavedChange = false
+        return true
+    }
+
+    /// Delete all: removes the stored store, even one this build could not read, and writes
+    /// as usual from then on.
+    mutating func deleteAll(from defaults: UserDefaults) {
+        LearnedVocabulary.removeStored(from: defaults)
+        canWrite = true
+        hasUnsavedChange = false
     }
 }
