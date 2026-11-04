@@ -34,6 +34,7 @@ enum DeepgramStreamingCoreTests {
         testParsesFinalAndInterimResults()
         testParsesMetadataUtteranceEndSpeechStartedAndError()
         testParsingToleratesMissingFieldsAndMalformedInput()
+        testFinalWordsParsing()
         testAssemblerAppendsFinalsInOrderAndIgnoresInterim()
         testAssemblerKeepsInterimTail()
         testAssemblerDropsResentFinals()
@@ -540,6 +541,35 @@ enum DeepgramStreamingCoreTests {
                 start: 0.0, duration: 2.0
             )
         )
+    }
+
+    /// words[] of final Results only, for the learning loop's confidence evidence.
+    private static func testFinalWordsParsing() {
+        func words(_ json: String) -> [Core.RecognizedWord] { Core.finalWords(in: Data(json.utf8)) }
+        let final = #"{"type":"Results","is_final":true,"channel":{"alternatives":[{"transcript":"ask kwen today.","words":[{"word":"ask","punctuated_word":"Ask","confidence":0.99,"start":0.1,"end":0.3},{"word":"kwen","punctuated_word":"kwen","confidence":0.41},{"word":"today","punctuated_word":"today.","confidence":0.93}]}]}}"#
+        TestSupport.expectEqual(words(final), [
+            Core.RecognizedWord(word: "ask", punctuatedWord: "Ask", confidence: 0.99),
+            Core.RecognizedWord(word: "kwen", punctuatedWord: "kwen", confidence: 0.41),
+            Core.RecognizedWord(word: "today", punctuatedWord: "today.", confidence: 0.93),
+        ])
+        let interim = #"{"type":"Results","is_final":false,"channel":{"alternatives":[{"words":[{"word":"ask","confidence":0.9}]}]}}"#
+        TestSupport.expectEqual(words(interim), [])
+        TestSupport.expectEqual(words(#"{"type":"Metadata","request_id":"synthetic"}"#), [])
+        TestSupport.expectEqual(words("not json"), [])
+        TestSupport.expectEqual(words(#"[1,2,3]"#), [])
+        TestSupport.expectEqual(words(#"{"type":"Results","is_final":true,"channel":{"alternatives":[]}}"#), [])
+        let odd = #"{"type":"Results","is_final":true,"channel":{"alternatives":[{"words":[{"word":"plain","confidence":0.5},{"word":"high","confidence":"high"},{"word":"flag","confidence":true},{"confidence":0.7},{"word":"over","confidence":1.4},{"word":"under","confidence":-0.2}]}]}}"#
+        TestSupport.expectEqual(words(odd), [
+            Core.RecognizedWord(word: "plain", punctuatedWord: "plain", confidence: 0.5),
+            Core.RecognizedWord(word: "over", punctuatedWord: "over", confidence: 1),
+            Core.RecognizedWord(word: "under", punctuatedWord: "under", confidence: 0),
+        ])
+        // The transcript path is unchanged by the words.
+        TestSupport.expectEqual(
+            message(final),
+            .results(transcript: "ask kwen today.", isFinal: true, speechFinal: false, fromFinalize: false)
+        )
+        TestSupport.expectEqual(Core.maxRecognizedWords, 2_000)
     }
 
     private static func testParsesMetadataUtteranceEndSpeechStartedAndError() {

@@ -11,6 +11,7 @@ final class RecordingOverlayState: ObservableObject {
     @Published var recordingTriggerMode: RecordingTriggerMode = .hold
     @Published var isCommandMode = false
     @Published var errorMessage: String?
+    @Published var learnedMessage: String?
     @Published var toastID: UUID?
 }
 
@@ -19,6 +20,7 @@ enum OverlayPhase {
     case recording
     case transcribing
     case feedback
+    case learned
 }
 
 // MARK: - NSScreen Helpers
@@ -78,6 +80,7 @@ final class RecordingOverlayManager {
     private var lockedOverlayWidth: CGFloat?
 
     var onStopButtonPressed: (() -> Void)?
+    var onLearnedUndoPressed: (() -> Void)?
 
     /// The screen the overlay should drop down on. The user picks one of
     /// three modes in Settings, stored in UserDefaults under
@@ -123,7 +126,8 @@ final class RecordingOverlayManager {
     }
 
     private var overlayAcceptsMouseEvents: Bool {
-        overlayState.phase == .recording && overlayState.recordingTriggerMode == .toggle
+        (overlayState.phase == .recording && overlayState.recordingTriggerMode == .toggle)
+            || overlayState.phase == .learned
     }
 
     func showInitializing(mode: RecordingTriggerMode = .hold, isCommandMode: Bool = false) {
@@ -239,6 +243,51 @@ final class RecordingOverlayManager {
         }
     }
 
+    static let learnedToastSeconds: TimeInterval = 4
+
+    /// The panel shows a pill other than the learned toast: a dictation or transform, the
+    /// failure indicator or an error. Main thread only.
+    var showsPillOtherThanLearned: Bool {
+        overlayWindow != nil && overlayState.phase != .learned
+    }
+
+    /// "Learned: X · Undo" in the drop-down pill for learnedToastSeconds, unless another pill
+    /// is showing by then (it is never replaced). The panel stays non-activating, so the Undo
+    /// click never takes focus, and any recording start replaces the toast.
+    func showLearned(_ message: String) {
+        let truncated: String = {
+            if message.count <= Self.maxToastMessageLength { return message }
+            let cutoff = message.index(message.startIndex, offsetBy: Self.maxToastMessageLength - 1)
+            return String(message[..<cutoff]) + "…"
+        }()
+        DispatchQueue.main.async { [self] in
+            guard !self.showsPillOtherThanLearned else { return }
+            let toastID = UUID()
+            self.overlayState.learnedMessage = truncated
+            self.overlayState.toastID = toastID
+            self.lockedOverlayWidth = nil
+            self.overlayState.isCommandMode = false
+            self.overlayState.phase = .learned
+            self.showOverlayPanel(animatedResize: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.learnedToastSeconds) { [weak self] in
+                guard let self, self.overlayState.phase == .learned, self.overlayState.toastID == toastID else {
+                    return
+                }
+                self.overlayState.toastID = nil
+                self.dismissAll()
+            }
+        }
+    }
+
+    /// Dismisses the learned toast only; any other phase is left alone.
+    func dismissLearnedToast() {
+        DispatchQueue.main.async {
+            guard self.overlayState.phase == .learned else { return }
+            self.overlayState.toastID = nil
+            self.dismissAll()
+        }
+    }
+
     func dismiss() {
         DispatchQueue.main.async {
             self.dismissAll()
@@ -322,6 +371,9 @@ final class RecordingOverlayManager {
                     state: overlayState,
                     onStopButtonPressed: { [weak self] in
                         self?.onStopButtonPressed?()
+                    },
+                    onLearnedUndoPressed: { [weak self] in
+                        self?.onLearnedUndoPressed?()
                     }
                 )
                 .padding(.top, screenHasNotch ? notchOverlap : 0)
@@ -353,6 +405,8 @@ final class RecordingOverlayManager {
             return true
         case .feedback:
             return overlayState.errorMessage?.isEmpty ?? true
+        case .learned:
+            return false
         }
     }
 
@@ -382,8 +436,9 @@ final class RecordingOverlayManager {
 
         let width = overlayWidth
         let useCompact = (UserDefaults.standard.object(forKey: "use_compact_overlay") as? Bool) ?? true
-        let forceDropDownPill = overlayState.phase == .feedback
-            && !(overlayState.errorMessage?.isEmpty ?? true)
+        let forceDropDownPill = (overlayState.phase == .feedback
+            && !(overlayState.errorMessage?.isEmpty ?? true))
+            || overlayState.phase == .learned
         // Compact mode: overlay sits flush with the menu bar on every display.
         // notchOverlap equals the menu-bar height on non-notched screens too,
         // so zero protrusion is universal — not notch-only. The legacy
@@ -421,6 +476,14 @@ final class RecordingOverlayManager {
             return max(notchWidth, feedbackWidth)
         }
 
+        if overlayState.phase == .learned {
+            // Like the error toast, plus room for the Undo button.
+            let count = CGFloat(overlayState.learnedMessage?.count ?? 0)
+            let learnedWidth = min(420, max(200, count * 6.8 + 110))
+            guard screenHasNotch else { return learnedWidth }
+            return max(notchWidth, learnedWidth)
+        }
+
         let commandModeWidth: CGFloat = 180
         let toggleWidth: CGFloat = 150
         let defaultWidth: CGFloat = 92
@@ -452,6 +515,7 @@ final class RecordingOverlayManager {
         lockedOverlayWidth = nil
         overlayState.recordingStartedAt = nil
         overlayState.isCommandMode = false
+        overlayState.learnedMessage = nil
         if let panel = overlayWindow {
             panel.orderOut(nil)
             // orderOut alone leaves the panel retained in NSApp.windows with its
@@ -932,6 +996,7 @@ struct InitializingDotsView: View {
 struct RecordingOverlayView: View {
     @ObservedObject var state: RecordingOverlayState
     let onStopButtonPressed: () -> Void
+    let onLearnedUndoPressed: () -> Void
 
     private var leadingAccessoryWidth: CGFloat {
         guard showsLiveRecordingContent && state.showsRecordingTimer else { return 24 }
@@ -953,6 +1018,8 @@ struct RecordingOverlayView: View {
                 ErrorOverlayView(message: message)
             } else if state.phase == .feedback {
                 FailureIndicatorView()
+            } else if state.phase == .learned {
+                LearnedToastView(message: state.learnedMessage ?? "", onUndo: onLearnedUndoPressed)
             } else {
                 ZStack {
                     Group {
@@ -1080,6 +1147,37 @@ struct ErrorOverlayView: View {
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .truncationMode(.tail)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+}
+
+/// "Learned: X · Undo": what the learning loop just learned, with a one-click Undo.
+struct LearnedToastView: View {
+    let message: String
+    let onUndo: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+            Text(message)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Text("·")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white.opacity(0.6))
+            Button(action: onUndo) {
+                Text("Undo")
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Undo learned")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }

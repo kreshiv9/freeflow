@@ -28,10 +28,12 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/CommandModeIntent.swift \
 	Sources/ContextInferenceFailure.swift \
 	Sources/ContextTermSources.swift \
+	Sources/CorrectionLearner.swift \
 	Sources/CursorFormatting.swift \
 	Sources/DeepgramStreamingCore.swift \
 	Sources/DictationStyle.swift \
 	Sources/DictionaryCorrections.swift \
+	Sources/EffectiveVocabulary.swift \
 	Sources/EverydayWords.swift \
 	Sources/FileTagMatcher.swift \
 	Sources/HandsFreeAutoStop.swift \
@@ -39,6 +41,10 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/KeychainStorage.swift \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
+	Sources/LearnedVocabulary.swift \
+	Sources/LearningPhonetics.swift \
+	Sources/LearningRecords.swift \
+	Sources/LearningWordList.swift \
 	Sources/ModelConfiguration.swift \
 	Sources/NameExtractor.swift \
 	Sources/OriginalFieldInsertionPreference.swift \
@@ -63,6 +69,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/TransformCore.swift \
 	Sources/TransformService.swift \
 	Sources/UpdateManager.swift \
+	Sources/VocabularyDraftMerge.swift \
 	Sources/VoiceIsolationFilter.swift \
 	Sources/VoiceIsolationPreference.swift \
 	Sources/VoiceProcessingCapture.swift \
@@ -126,6 +133,7 @@ endif
 	@plutil -replace CFBundleExecutable -string "$(APP_NAME)" "$(CONTENTS)/Info.plist"
 	@plutil -replace CFBundleIdentifier -string "$(BUNDLE_ID)" "$(CONTENTS)/Info.plist"
 	@cp $(ICON_ICNS) "$(RESOURCES)/AppIcon.icns"
+	@cp Resources/LearningKnownWords.txt "$(RESOURCES)/LearningKnownWords.txt"
 	@plutil -replace NSMicrophoneUsageDescription -string "$(APP_NAME) needs microphone access to transcribe your speech." "$(CONTENTS)/Info.plist"
 	@plutil -replace NSSpeechRecognitionUsageDescription -string "$(APP_NAME) needs speech recognition to convert your voice to text." "$(CONTENTS)/Info.plist"
 	@plutil -replace NSAccessibilityUsageDescription -string "$(APP_NAME) needs accessibility access to detect the text cursor position and paste transcribed text." "$(CONTENTS)/Info.plist"

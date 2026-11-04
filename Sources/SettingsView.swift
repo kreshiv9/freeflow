@@ -627,7 +627,8 @@ struct GeneralSettingsView: View {
     @State private var isValidatingKey = false
     @State private var keyValidationError: String?
     @State private var successfulAPIConfiguration: ValidatedAPIConfiguration?
-    @State private var customVocabularyInput: String = ""
+    @State private var vocabularyDraft = VocabularyDraft(stored: "")
+    @State private var vocabularySaveWorkItem: DispatchWorkItem?
     @FocusState private var customVocabularyFocused: Bool
     @State private var micPermissionGranted = false
     @State private var showMutedHint = false
@@ -773,6 +774,9 @@ struct GeneralSettingsView: View {
                 SettingsCard("Corrections", icon: "arrow.left.arrow.right") {
                     DictionaryCorrectionsSection()
                 }
+                SettingsCard("Learning", icon: "brain") {
+                    LearningSettingsSection()
+                }
                 SettingsCard("Permissions", icon: "lock.shield.fill") {
                     permissionsSection
                 }
@@ -787,12 +791,18 @@ struct GeneralSettingsView: View {
             isValidatingKey = false
             keyValidationError = nil
             successfulAPIConfiguration = nil
-            customVocabularyInput = appState.customVocabulary
+            vocabularyDraft = VocabularyDraft(stored: appState.customVocabulary)
             checkMicPermission()
             appState.refreshLaunchAtLoginStatus()
         }
         .onDisappear {
             apiDraft.dismiss()
+            commitCustomVocabulary()
+        }
+        .onChange(of: appState.customVocabulary) { stored in
+            vocabularyDraft.storedDidChange(to: stored)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             commitCustomVocabulary()
         }
         .onChange(of: appState.committedAPIConfiguration) { saved in
@@ -1596,11 +1606,24 @@ struct GeneralSettingsView: View {
 
     // MARK: Custom Vocabulary
 
+    /// Saves the editor through a three-way merge, so words added elsewhere while it was open
+    /// (Paste Custom Word to Vocabulary, a learned term moved here) are kept.
     private func commitCustomVocabulary() {
-        let trimmed = customVocabularyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if appState.customVocabulary != trimmed {
-            appState.customVocabulary = trimmed
+        vocabularySaveWorkItem?.cancel()
+        vocabularySaveWorkItem = nil
+        if let value = vocabularyDraft.commit(stored: appState.customVocabulary) {
+            appState.customVocabulary = value
         }
+    }
+
+    /// Saves VocabularyDraftMerge.saveDelaySeconds after the last change.
+    private func scheduleCustomVocabularySave() {
+        vocabularySaveWorkItem?.cancel()
+        let saveWorkItem = DispatchWorkItem {
+            commitCustomVocabulary()
+        }
+        vocabularySaveWorkItem = saveWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + VocabularyDraftMerge.saveDelaySeconds, execute: saveWorkItem)
     }
 
     private var vocabularySection: some View {
@@ -1609,7 +1632,7 @@ struct GeneralSettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            TextEditor(text: $customVocabularyInput)
+            TextEditor(text: $vocabularyDraft.text)
                 .font(.system(.body, design: .monospaced))
                 .frame(minHeight: 80, maxHeight: 140)
                 .focused($customVocabularyFocused)
@@ -1617,6 +1640,9 @@ struct GeneralSettingsView: View {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                 )
+                .onChange(of: vocabularyDraft.text) { _ in
+                    scheduleCustomVocabularySave()
+                }
                 .onChange(of: customVocabularyFocused) { focused in
                     if !focused { commitCustomVocabulary() }
                 }
@@ -1624,6 +1650,8 @@ struct GeneralSettingsView: View {
             Text("Separate entries with commas, new lines, or semicolons.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            LearnedVocabularyChips()
         }
     }
 
@@ -1725,9 +1753,11 @@ struct MicrophoneOptionRow: View {
 
 // MARK: - Dictionary Corrections
 
-/// Edits `AppState.dictionaryCorrections` through a local copy, like the vocabulary
-/// editor: rows are committed (trimmed, cut to the limit, blank rows left out) when a
-/// field loses focus, on Return, and when the view disappears.
+/// Edits `AppState.dictionaryCorrections` through a draft merged three ways with the stored
+/// rows, like the vocabulary editor, so rows added elsewhere (a learned rule moved here) are
+/// kept. Edits are saved VocabularyDraftMerge.saveDelaySeconds after each change (normalized,
+/// blank rows left out, the displayed rows untouched), and rows are normalized and saved when
+/// a field loses focus, on Return, when the view disappears and when the app quits.
 struct DictionaryCorrectionsSection: View {
     private enum Field: Hashable {
         case heard(UUID)
@@ -1735,7 +1765,8 @@ struct DictionaryCorrectionsSection: View {
     }
 
     @EnvironmentObject var appState: AppState
-    @State private var rows: [DictionaryCorrection] = []
+    @State private var draft = CorrectionsDraft(stored: [])
+    @State private var saveWorkItem: DispatchWorkItem?
     @FocusState private var focusedField: Field?
 
     var body: some View {
@@ -1751,7 +1782,7 @@ struct DictionaryCorrectionsSection: View {
             }
 
             VStack(spacing: 6) {
-                ForEach($rows) { $row in
+                ForEach($draft.rows) { $row in
                     HStack(spacing: 8) {
                         TextField("Heard", text: $row.from)
                             .textFieldStyle(.roundedBorder)
@@ -1774,30 +1805,53 @@ struct DictionaryCorrectionsSection: View {
                         .accessibilityLabel("Remove correction")
                     }
                 }
+                LearnedRuleRows()
             }
         }
-        .onAppear { rows = appState.dictionaryCorrections }
+        .onAppear { draft = CorrectionsDraft(stored: appState.dictionaryCorrections) }
+        .onChange(of: draft.rows) { _ in scheduleSave() }
         .onChange(of: focusedField) { _ in commit() }
+        .onChange(of: appState.dictionaryCorrections) { stored in
+            draft.storedDidChange(to: stored)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            persist()
+        }
         .onDisappear { commit() }
     }
 
+    /// Normalizes the rows, then saves: focus loss, Return and disappearing.
     private func commit() {
-        rows = rows.map(\.normalized)
-        let persisted = rows.filter { !$0.isBlank }
-        if appState.dictionaryCorrections != persisted {
+        draft.normalizeRows()
+        persist()
+    }
+
+    private func persist() {
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
+        if let persisted = draft.commit(stored: appState.dictionaryCorrections) {
             appState.dictionaryCorrections = persisted
         }
     }
 
+    private func scheduleSave() {
+        saveWorkItem?.cancel()
+        let workItem = DispatchWorkItem {
+            persist()
+        }
+        saveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + VocabularyDraftMerge.saveDelaySeconds, execute: workItem)
+    }
+
     private func addRow() {
         let row = DictionaryCorrection(from: "", to: "")
-        rows.append(row)
+        draft.rows.append(row)
         focusedField = .heard(row.id)
     }
 
     private func remove(_ id: UUID) {
-        rows.removeAll { $0.id == id }
-        commit()
+        draft.rows.removeAll { $0.id == id }
+        persist()
     }
 }
 
@@ -2412,6 +2466,7 @@ struct RunLogEntryView: View {
     @State private var copiedCleanedTranscriptResetWorkItem: DispatchWorkItem?
     @State private var undidAIEdit = false
     @State private var undidAIEditResetWorkItem: DispatchWorkItem?
+    @State private var showsFix = false
 
     private var isError: Bool {
         item.postProcessingStatus.hasPrefix("Error:")
@@ -2548,6 +2603,24 @@ struct RunLogEntryView: View {
                             .frame(width: actionIconSize, height: actionIconSize)
                     }
 
+                    if RunLogFix.pastedText(for: item) != nil {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                isExpanded = true
+                                showsFix = true
+                            }
+                        } label: {
+                            Label("Fix", systemImage: "character.cursor.ibeam")
+                                .font(.caption)
+                                .foregroundStyle(Color.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!appState.learningEnabled)
+                        .help(appState.learningEnabled
+                            ? "Type what you meant so FreeFlow learns misheard words and names"
+                            : "Turn on Learn automatically in Settings to use Fix")
+                    }
+
                     actionIconButton(systemName: "trash", help: "Delete this run") {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             appState.deleteHistoryEntry(id: item.id)
@@ -2562,6 +2635,12 @@ struct RunLogEntryView: View {
                     .padding(.horizontal, 12)
 
                 VStack(alignment: .leading, spacing: 16) {
+                    if showsFix {
+                        RunLogFixView(item: item) {
+                            showsFix = false
+                        }
+                    }
+
                     // Audio player
                     if let audioFileName = item.audioFileName {
                         let audioURL = AppState.audioStorageDirectory().appendingPathComponent(audioFileName)
