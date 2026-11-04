@@ -33,6 +33,10 @@ struct PipelineDebugContentView: View {
                 debugRow(title: "Stage Timings", value: stageTimings.summaryLine)
             }
 
+            if let stageTimings, !stageTimings.keytermLine.isEmpty {
+                debugRow(title: "Keyterms", value: stageTimings.keytermLine)
+            }
+
             if !postProcessingPrompt.isEmpty {
                 debugRow(title: "Post-Processing Prompt", value: postProcessingPrompt, copyText: postProcessingPrompt)
             }

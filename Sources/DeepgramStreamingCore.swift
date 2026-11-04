@@ -35,8 +35,8 @@ enum DeepgramStreamingError: LocalizedError, Equatable {
 }
 
 /// Pure rules for the Deepgram Nova-3 streaming path: URL building, keyterm
-/// normalization, audio framing, server-message parsing, transcript assembly and
-/// the commit, keep-alive and key-validation decisions. Never logs, and never
+/// normalization and budget, audio framing, server-message parsing, transcript
+/// assembly and the commit, keep-alive and key-validation decisions. Never logs, and never
 /// embeds the key or transcript text in anything it produces.
 enum DeepgramStreamingCore {
     static let listenEndpoint = URL(string: "wss://api.deepgram.com/v1/listen")!
@@ -127,9 +127,9 @@ enum DeepgramStreamingCore {
     /// Trims; collapses internal whitespace runs (spaces, tabs, CR/LF) to one
     /// space; drops empties and terms longer than maxKeytermLength (dropped, not
     /// cut: a truncated phrase boosts a wrong spelling); dedupes
-    /// case-insensitively keeping the first spelling; stops at maxKeyterms or
-    /// when the running character total would exceed maxKeytermTotalCharacters.
-    /// Order is preserved, so vocabulary entries come before correction targets.
+    /// case-insensitively keeping the first spelling; stops at maxKeyterms. A term
+    /// that would take the running character total past maxKeytermTotalCharacters
+    /// is skipped, and later, shorter terms are still tried. Order is preserved.
     static func normalizedKeyterms(_ terms: [String]) -> [String] {
         var seen = Set<String>()
         var result: [String] = []
@@ -139,10 +139,8 @@ enum DeepgramStreamingCore {
             guard !collapsed.isEmpty, collapsed.count <= maxKeytermLength else { continue }
             let key = collapsed.lowercased()
             guard !seen.contains(key) else { continue }
-            guard result.count < maxKeyterms,
-                  totalCharacters + collapsed.count <= maxKeytermTotalCharacters else {
-                break
-            }
+            guard result.count < maxKeyterms else { break }
+            guard totalCharacters + collapsed.count <= maxKeytermTotalCharacters else { continue }
             seen.insert(key)
             result.append(collapsed)
             totalCharacters += collapsed.count
@@ -157,17 +155,121 @@ enum DeepgramStreamingCore {
         normalizedKeyterms(text.components(separatedBy: CharacterSet(charactersIn: "\n\r,;")))
     }
 
-    /// Code identifiers added to one stream's keyterms, at most.
-    static let maxContextKeyterms = 50
+    /// The ranked keyterm budget. The connect URL carries the user's own terms: correction
+    /// targets, then Custom Vocabulary, then the user's name, then a learned slice. One
+    /// Configure then adds on-screen names and IDE identifiers, about targetTotal terms in
+    /// all with at least minimumScreenSlots for the screen. Every tier dedupes
+    /// case-insensitively (the first spelling wins), drops terms over maxKeytermLength and
+    /// stops at maxKeyterms; a term that would pass maxKeytermTotalCharacters is skipped.
+    enum KeytermPlan {
+        /// Deepgram advises focusing on the most important 20-50 terms.
+        static let targetTotal = 50
+        static let minimumScreenSlots = 15
+        static let maxOwnNameTerms = 2
+        static let learnedSlots = 10...25
+        /// Rollback switch for sending the Mac account name.
+        static let sendsOwnName = true
 
-    /// The stream's own keyterms followed by up to maxContextKeyterms identifiers, normalized,
-    /// so the vocabulary terms always survive maxKeyterms and maxKeytermTotalCharacters.
-    /// Dotted member paths are never spoken, so they are left out. nil when nothing new
-    /// would be added: then no update is sent.
-    static func mergedKeyterms(base: [String], adding identifiers: [String]) -> [String]? {
-        let current = normalizedKeyterms(base)
-        let merged = normalizedKeyterms(current + identifiers.filter { !$0.contains(".") }.prefix(maxContextKeyterms))
-        return merged == current ? nil : merged
+        struct Tiers: Equatable {
+            /// The `to` of each usable correction rule, in list order.
+            var correctionTargets: [String] = []
+            /// Custom Vocabulary terms in the user's order.
+            var vocabulary: [String] = []
+            var ownName: [String] = []
+            /// Ranked learned terms; nothing supplies them yet.
+            var learned: [String] = []
+        }
+
+        private struct Fit {
+            var terms: [String] = []
+            var seen = Set<String>()
+            var characters = 0
+        }
+
+        /// Adds up to `limit` new terms in order and returns how many were added.
+        private static func append(_ terms: [String], to fit: inout Fit, limit: Int) -> Int {
+            var added = 0
+            for term in terms {
+                guard fit.terms.count < maxKeyterms, added < limit else { break }
+                let collapsed = term.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                guard !collapsed.isEmpty, collapsed.count <= maxKeytermLength else { continue }
+                let key = collapsed.lowercased()
+                guard !fit.seen.contains(key),
+                      fit.characters + collapsed.count <= maxKeytermTotalCharacters else { continue }
+                fit.seen.insert(key)
+                fit.terms.append(collapsed)
+                fit.characters += collapsed.count
+                added += 1
+            }
+            return added
+        }
+
+        /// The connect URL's list. Correction targets and vocabulary are never cut below the
+        /// hard caps; the own name adds at most maxOwnNameTerms; the learned slice adds up to
+        /// targetTotal minus the manual terms kept, clamped to learnedSlots.
+        static func connectTerms(_ tiers: Tiers) -> [String] {
+            var fit = Fit()
+            let manualAdded = append(tiers.correctionTargets, to: &fit, limit: .max)
+                + append(tiers.vocabulary, to: &fit, limit: .max)
+            _ = append(tiers.ownName, to: &fit, limit: maxOwnNameTerms)
+            let learnedLimit = min(max(targetTotal - manualAdded, learnedSlots.lowerBound), learnedSlots.upperBound)
+            _ = append(tiers.learned, to: &fit, limit: learnedLimit)
+            return fit.terms
+        }
+
+        /// The one Configure's list: the connect list unchanged (a Configure replaces the
+        /// whole list), then screen names, then identifiers, together limited to
+        /// max(minimumScreenSlots, targetTotal - connect count). Dotted member paths are never
+        /// spoken, so no dotted identifier and no screen name with a dot outside a version
+        /// number (a host or domain) is sent; GPT-4.5 is. A secret-like term never leaves the
+        /// Mac. Nil when nothing new fits: then no Configure is sent. `screenCount` counts the
+        /// on-screen names added, `identifierCount` the identifiers.
+        static func configureTerms(
+            connect: [String],
+            screenTerms: [String],
+            identifiers: [String]
+        ) -> (terms: [String], screenCount: Int, identifierCount: Int)? {
+            var fit = Fit()
+            _ = append(connect, to: &fit, limit: .max)
+            let slots = max(minimumScreenSlots, targetTotal - fit.terms.count)
+            let namesAdded = append(
+                screenTerms.filter { !isDottedName($0) && !SecretFilter.isSecretLike($0) },
+                to: &fit,
+                limit: slots
+            )
+            let identifiersAdded = append(
+                identifiers.filter { !$0.contains(".") && !SecretFilter.isSecretLike($0) },
+                to: &fit,
+                limit: slots - namesAdded
+            )
+            return namesAdded + identifiersAdded > 0 ? (fit.terms, namesAdded, identifiersAdded) : nil
+        }
+
+        /// A "." anywhere but between two digits: devbox.example.internal, Next.js.
+        private static func isDottedName(_ term: String) -> Bool {
+            let characters = Array(term)
+            return characters.indices.contains { index in
+                characters[index] == "."
+                    && !(index > 0 && characters[index - 1].isNumber
+                        && index + 1 < characters.count && characters[index + 1].isNumber)
+            }
+        }
+    }
+
+    /// Numbers only, for the Run Log: the connect URL's keyterm count, the on-screen names and
+    /// the code identifiers the one Configure added (nil when none went out) and the audio
+    /// already sent before it (0 when it went out ahead of the buffered audio).
+    struct KeytermReport: Equatable, Sendable {
+        let connectCount: Int
+        let screenCount: Int?
+        let identifierCount: Int?
+        let audioMillisecondsBeforeUpdate: Int?
+    }
+
+    /// Milliseconds of mono PCM16 audio in `bytes`; 0 for a non-positive rate.
+    static func audioMilliseconds(bytes: Int, sampleRate: Int) -> Int {
+        guard sampleRate > 0 else { return 0 }
+        return bytes * 1000 / (sampleRate * MemoryLayout<Int16>.size)
     }
 
     /// `{"keyterms":[...],"type":"Configure"}`, or nil when no keyterm survives

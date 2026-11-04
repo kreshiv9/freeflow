@@ -27,6 +27,12 @@ enum TextContextOmission: String, Equatable, Sendable {
     case sensitiveWebsite
     case secureField
     case browserControls
+    /// The window title shows a secrets file or folder (.env, id_rsa, credentials, .ssh).
+    case secretsFile
+    /// Terminal scrollback can hold unlabeled secrets, so terminals are never read. Cursor
+    /// formatting then has no text to fit, so a terminal paste keeps the cleanup's casing and
+    /// gets no leading space.
+    case terminal
 
     var promptLabel: String {
         switch self {
@@ -34,6 +40,8 @@ enum TextContextOmission: String, Equatable, Sendable {
         case .sensitiveWebsite: "sensitive website"
         case .secureField: "password field"
         case .browserControls: "browser address bar or controls"
+        case .secretsFile: "secrets file"
+        case .terminal: "terminal"
         }
     }
 }
@@ -64,6 +72,10 @@ struct TextContextSnapshot: Equatable, Sendable {
     /// Cursor, Windsurf and VS Code only: file names from the window title, tabs and visible
     /// rows, used only for local @-mention tagging. Not rendered or persisted.
     var fileNames: [String] = []
+    /// The target apps' on-screen names (Claude Code panel, ChatGPT, Google search), sent
+    /// only as keyterms in the stream's one Deepgram Configure. Not rendered by
+    /// `promptSection(for:)` and never persisted.
+    var contextTerms: [String] = []
 }
 
 struct CursorTextSlices: Equatable {
@@ -77,6 +89,15 @@ struct CursorReadRanges: Equatable {
     let before: NSRange
     let selected: NSRange
     let after: NSRange
+}
+
+/// The read slices that stop short of the field's text: the before read starts after the
+/// field's start, the selected read ends before the selection's end, or the after read ends
+/// before the field's end. A cut edge may split a token.
+struct CursorReadCuts: Equatable {
+    var before = false
+    var selected = false
+    var after = false
 }
 
 enum ContextCapturePreferences {
@@ -170,6 +191,10 @@ enum TextContextCore {
         "com.nordsec.nordpass", "in.sinew.enpass-desktop", "org.keepassxc.keepassxc"
     ]
     private static let ownAppPrefix = "com.zachlatta.freeflow"
+    private static let terminalApps: Set<String> = [
+        "com.apple.terminal", "com.googlecode.iterm2", "dev.warp.warp-stable", "com.mitchellh.ghostty",
+        "co.zeit.hyper", "net.kovidgoyal.kitty", "com.github.wez.wezterm", "org.alacritty"
+    ]
     private static let sensitiveDomains = [
         "chase.com", "wellsfargo.com", "capitalone.com", "citi.com", "americanexpress.com",
         "discover.com", "ally.com", "sofi.com", "chime.com", "paypal.com", "venmo.com",
@@ -207,6 +232,46 @@ enum TextContextCore {
         if bundle.hasPrefix(ownAppPrefix) { return true }
         if let own = normalizedBundle(ownBundleIdentifier), bundle == own { return true }
         return sensitiveApps.contains(bundle)
+    }
+
+    /// Terminal scrollback can hold unlabeled secrets, so terminals are never read. Bundle
+    /// only, so it is checked before any element is read.
+    static func isTerminal(bundleIdentifier: String?) -> Bool {
+        guard let bundle = normalizedBundle(bundleIdentifier) else { return false }
+        return terminalApps.contains(bundle)
+    }
+
+    /// A focused field's category and fail-safe omission once its page's domain is known
+    /// (nil outside browsers), in the order `readFieldContext` applies them. The category
+    /// always comes from the domain first, so a page whose title names a secrets file keeps
+    /// its AI chat, email or messaging behaviour. Then a sensitive website, then a window
+    /// title showing a secrets file. `windowTitle` is the title as shown, before redaction,
+    /// which can hide the file name ("client_secret_<id>.apps.googleusercontent.com.json").
+    /// Only coding apps outside browsers (VS Code, Cursor, Windsurf, Xcode, Zed, Sublime Text,
+    /// JetBrains IDEs and the others in the coding category) use the broad check,
+    /// `IdentifierExtractor.titleShowsSecretsFile`: their title names the open file, so any
+    /// piece naming a secrets file or folder counts, bare "credentials", "secrets" and
+    /// "mysecrets.txt" included. It fails safe, so "SecretFilter.swift" stops the read too.
+    /// Browsers and every other app use the narrower `IdentifierExtractor.titleNamesSecretsFile`,
+    /// because their title is often prose (a page, a mail subject, a channel, a chat or a
+    /// document title) such as "Secrets of the Nile - Wikipedia", "Re: Rotating credentials" or
+    /// "Secret Santa ideas": a file-shaped piece counts (".env.local", "id_rsa",
+    /// "client_secret.json"), a bare word or a word inside a longer file name
+    /// ("mysecrets.txt") does not. Redaction still applies to whatever those fields give.
+    static func fieldReadDecision(
+        bundleIdentifier: String?,
+        websiteDomain: String?,
+        windowTitle: String?
+    ) -> (category: DictationAppCategory, omission: TextContextOmission?) {
+        let category = category(bundleIdentifier: bundleIdentifier, websiteDomain: websiteDomain)
+        if isSensitiveDomain(websiteDomain) { return (category, .sensitiveWebsite) }
+        let titleNamesOpenFile = category == .coding && websiteDomain == nil
+            && !isBrowser(bundleIdentifier: bundleIdentifier)
+        let showsSecretsFile = titleNamesOpenFile
+            ? IdentifierExtractor.titleShowsSecretsFile(windowTitle)
+            : IdentifierExtractor.titleNamesSecretsFile(windowTitle)
+        if showsSecretsFile { return (category, .secretsFile) }
+        return (category, nil)
     }
 
     /// Banking, payment, and credential sites: any domain label containing "bank", or a known site.
@@ -253,39 +318,102 @@ enum TextContextCore {
         )
     }
 
+    /// Which of `ranges` stop short of the field's text, so their outer edge may split a token.
+    static func readCuts(of ranges: CursorReadRanges, selection: NSRange, characterCount: Int) -> CursorReadCuts {
+        CursorReadCuts(
+            before: ranges.before.location > 0,
+            selected: ranges.selected.length < selection.length,
+            after: NSMaxRange(ranges.after) < characterCount
+        )
+    }
+
     /// Slices a full field value; used when an app cannot return substrings by range.
-    static func cursorSlices(in text: String, selection: NSRange) -> CursorTextSlices? {
+    static func cursorSlices(
+        in text: String,
+        selection: NSRange,
+        placeholder: String? = nil,
+        composer: ContextTarget? = nil
+    ) -> CursorTextSlices? {
         let nsText = text as NSString
         guard let ranges = cursorReadRanges(selection: selection, characterCount: nsText.length) else { return nil }
         return normalizedSlices(
             before: substring(of: nsText, range: ranges.before),
             selected: substring(of: nsText, range: ranges.selected),
-            after: substring(of: nsText, range: ranges.after)
+            after: substring(of: nsText, range: ranges.after),
+            placeholder: placeholder,
+            composer: composer,
+            cuts: readCuts(of: ranges, selection: selection, characterCount: nsText.length)
         )
     }
 
-    /// Trims to character budgets. Whitespace is kept because spacing at the cursor matters.
+    /// True when a field's whole value is what the field shows while empty, not typed text:
+    /// its `AXPlaceholderValue`, or one of `composer`'s own placeholder texts
+    /// (`ContextTarget.isComposerPlaceholder`), which some web composers draw with CSS so that
+    /// Chromium reports them as the value. Surrounding whitespace is ignored.
+    static func isPlaceholderValue(_ value: String, placeholder: String?, composer: ContextTarget?) -> Bool {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return false }
+        if let placeholder, text == placeholder.trimmingCharacters(in: .whitespacesAndNewlines) { return true }
+        return composer?.isComposerPlaceholder(text) ?? false
+    }
+
+    /// Redacts secrets, then trims to character budgets. The partial token at an edge a read
+    /// cut is dropped first, since no rule can recognize part of a secret. The three slices
+    /// are redacted as one text, so a secret the cursor or selection splits is replaced whole
+    /// on one side, and before the trim, so one on a trim boundary leaves no fragment either.
+    /// A value that is the field's placeholder (`isPlaceholderValue`, on the raw text) gives
+    /// empty slices: the field is empty, so cursor formatting starts a sentence there and the
+    /// placeholder never reaches the CONTEXT block. Whitespace is kept because spacing at the
+    /// cursor matters.
     static func normalizedSlices(
         before: String?,
         selected: String?,
         after: String?,
-        placeholder: String? = nil
+        placeholder: String? = nil,
+        composer: ContextTarget? = nil,
+        cuts: CursorReadCuts = CursorReadCuts()
     ) -> CursorTextSlices {
         let combined = (before ?? "") + (selected ?? "") + (after ?? "")
-        if let placeholder, !placeholder.isEmpty, combined == placeholder {
+        if isPlaceholderValue(combined, placeholder: placeholder, composer: composer) {
             return CursorTextSlices(before: nil, selected: nil, after: nil)
         }
+        let readBefore = cuts.before ? droppingLeadingPartialToken(before ?? "") : before ?? ""
+        let readSelected = cuts.selected ? droppingTrailingPartialToken(selected ?? "") : selected ?? ""
+        let readAfter = cuts.after ? droppingTrailingPartialToken(after ?? "") : after ?? ""
+        let selectionStart = (readBefore as NSString).length
+        var offsets = [selectionStart, selectionStart + (readSelected as NSString).length]
+        let redacted = SecretFilter.redact(readBefore + readSelected + readAfter, mapping: &offsets) as NSString
+        let before = redacted.substring(to: offsets[0])
+        let selected = redacted.substring(with: NSRange(location: offsets[0], length: offsets[1] - offsets[0]))
+        let after = redacted.substring(from: offsets[1])
         let replacement: Character = "\u{FFFD}"
-        var trimmedBefore = before.map { String($0.suffix(maxCharactersBeforeCursor)) }
-        while trimmedBefore?.first == replacement { trimmedBefore?.removeFirst() }
-        var trimmedAfter = after.map { String($0.prefix(maxCharactersAfterCursor)) }
-        while trimmedAfter?.last == replacement { trimmedAfter?.removeLast() }
-        let trimmedSelected = selected.map { String($0.prefix(maxSelectedCharacters)) }
+        var trimmedBefore = String(before.suffix(maxCharactersBeforeCursor))
+        while trimmedBefore.first == replacement { trimmedBefore.removeFirst() }
+        var trimmedAfter = String(after.prefix(maxCharactersAfterCursor))
+        while trimmedAfter.last == replacement { trimmedAfter.removeLast() }
+        let trimmedSelected = String(selected.prefix(maxSelectedCharacters))
         return CursorTextSlices(
             before: nonEmpty(trimmedBefore),
             selected: nonEmpty(trimmedSelected),
             after: nonEmpty(trimmedAfter)
         )
+    }
+
+    /// Drops the token a read cut at the text's start: its leading run of ASCII non-space
+    /// characters. Text in other scripts, which secrets never use, is kept.
+    static func droppingLeadingPartialToken<Text: StringProtocol>(_ text: Text) -> String {
+        String(text.drop(while: { $0.isASCII && !$0.isWhitespace }))
+    }
+
+    /// The mirror of `droppingLeadingPartialToken`, for a read cut at the text's end.
+    static func droppingTrailingPartialToken<Text: StringProtocol>(_ text: Text) -> String {
+        var end = text.endIndex
+        while end > text.startIndex {
+            let previous = text.index(before: end)
+            guard text[previous].isASCII, !text[previous].isWhitespace else { break }
+            end = previous
+        }
+        return String(text[..<end])
     }
 
     private static func substring(of text: NSString, range: NSRange) -> String {
@@ -300,14 +428,15 @@ enum TextContextCore {
 
     // MARK: - Nearby text
 
-    /// Collapses whitespace, drops duplicates and text already captured, and caps the total.
+    /// Redacts secrets, collapses whitespace, drops duplicates and text already captured, and
+    /// caps the total.
     static func nearbyText(from candidates: [String], excluding excluded: [String?] = []) -> String? {
         let excludedKeys = Set(excluded.compactMap { $0.map(comparisonKey) }.filter { !$0.isEmpty })
         var seen = Set<String>()
         var parts: [String] = []
         var total = 0
         for candidate in candidates {
-            let collapsed = candidate.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let collapsed = SecretFilter.redact(candidate).split(whereSeparator: \.isWhitespace).joined(separator: " ")
             guard collapsed.count >= 2 else { continue }
             let item = collapsed.count > maxNearbyItemCharacters
                 ? String(collapsed.prefix(maxNearbyItemCharacters)) + "…"

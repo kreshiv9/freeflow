@@ -1,6 +1,9 @@
 import Foundation
 import ApplicationServices
 import AppKit
+import os.log
+
+private let textContextLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "TextContext")
 
 struct AppSelectionSnapshot {
     let appName: String?
@@ -132,7 +135,8 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         return AppSelectionSnapshot(
             appName: frontmostApp.localizedName,
             bundleIdentifier: frontmostApp.bundleIdentifier,
-            windowTitle: focusedWindowTitle(from: appElement) ?? frontmostApp.localizedName,
+            // Kept only for the Run Log row, so redacted like the text-context title.
+            windowTitle: focusedWindowTitle(from: appElement).map(SecretFilter.redact) ?? frontmostApp.localizedName,
             selectedText: !captureInsertionTarget || textInsertionTarget != nil ? rawSelectedText(from: appElement) : nil,
             textInsertionTarget: textInsertionTarget,
             usesOriginalFieldInsertion: captureInsertionTarget
@@ -156,8 +160,18 @@ Return only two sentences, no labels, no markdown, no extra commentary.
     /// Reads Wispr-style context through Accessibility: app type, text around the cursor,
     /// and nearby labels. No screenshot and no model call; reads stop at a short budget.
     /// In Cursor, Windsurf and VS Code it also collects file names and code identifiers
-    /// on a separate short budget.
-    func collectTextContext(readFieldText: Bool) -> AppContext {
+    /// on a separate short budget. Secret-shaped text is redacted as it is read.
+    ///
+    /// With `wantsSpeechTerms` (a Deepgram stream is live), the Claude Code panel, ChatGPT
+    /// and Google search also give on-screen names (`ContextTermSources`), and
+    /// `onSpeechTerms` runs at most once with those names and the code identifiers: before
+    /// the code walk for the Claude Code panel, whose editors mostly read empty, and after it
+    /// everywhere else.
+    func collectTextContext(
+        readFieldText: Bool,
+        wantsSpeechTerms: Bool = false,
+        onSpeechTerms: (_ screenTerms: [String], _ identifiers: [String]) -> Void = { _, _ in }
+    ) -> AppContext {
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
             return Self.textAppContext(snapshot: nil, appName: nil, bundleIdentifier: nil, windowTitle: nil)
         }
@@ -166,7 +180,11 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         AXUIElementSetMessagingTimeout(appElement, Self.textContextMessagingTimeout)
         let appName = frontmostApp.localizedName
         let bundleIdentifier = frontmostApp.bundleIdentifier
-        let windowTitle = focusedWindowTitle(from: appElement) ?? appName
+        let shownTitle = focusedWindowTitle(from: appElement)
+        let windowTitle = shownTitle.map(SecretFilter.redact) ?? appName
+        // The secrets-file checks read the title as shown, since redaction can hide the file
+        // name they look for; only the redacted title is kept.
+        let titleForChecks = shownTitle ?? appName
         guard readFieldText else {
             return Self.textAppContext(
                 snapshot: nil, appName: appName, bundleIdentifier: bundleIdentifier, windowTitle: windowTitle
@@ -179,18 +197,34 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             category: TextContextCore.category(bundleIdentifier: bundleIdentifier, websiteDomain: nil),
             windowTitle: windowTitle
         )
-        readFieldContext(
+        let readsTerms = wantsSpeechTerms && ContextTermSources.isEnabled
+        let field = readFieldContext(
             into: &snapshot,
             appElement: appElement,
+            shownWindowTitle: titleForChecks,
+            readsSpeechSources: readsTerms,
             deadline: CFAbsoluteTimeGetCurrent() + Self.textContextBudgetSeconds
         )
-        if snapshot.omission == nil,
+        if readsTerms, snapshot.omission == nil, let field, let target = field.target {
+            snapshot.contextTerms = speechTerms(target: target, snapshot: snapshot, field: field)
+        }
+        let termsBeforeCodeWalk = field?.target == .claudeCodePanel
+        if wantsSpeechTerms, termsBeforeCodeWalk {
+            onSpeechTerms(snapshot.contextTerms, [])
+        }
+        // A secrets-file title still reads file-name labels for @-mention tagging, but
+        // readCodeContext reads no editor text under it.
+        if snapshot.omission == nil || snapshot.omission == .secretsFile,
            IdentifierExtractor.collectsCodeContext(bundleIdentifier: bundleIdentifier, category: snapshot.category) {
             readCodeContext(
                 into: &snapshot,
                 appElement: appElement,
+                shownWindowTitle: titleForChecks,
                 deadline: CFAbsoluteTimeGetCurrent() + Self.codeContextBudgetSeconds
             )
+        }
+        if wantsSpeechTerms, !termsBeforeCodeWalk {
+            onSpeechTerms(snapshot.contextTerms, snapshot.codeIdentifiers)
         }
         return Self.textAppContext(
             snapshot: snapshot, appName: appName, bundleIdentifier: bundleIdentifier, windowTitle: windowTitle
@@ -218,65 +252,274 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         )
     }
 
+    /// The focused field, its web area (browsers always; VS Code and ChatGPT.app only when a
+    /// target needs it) and its context target. Local to one collection; never stored.
+    private struct FocusedField {
+        let element: AXUIElement
+        let webArea: AXUIElement?
+        let target: ContextTarget?
+    }
+
+    /// Nil when the field was not read: an omission, or no focused element. The secrets-file
+    /// omission reads `shownWindowTitle`, the title before redaction.
     private func readFieldContext(
         into snapshot: inout TextContextSnapshot,
         appElement: AXUIElement,
+        shownWindowTitle: String?,
+        readsSpeechSources: Bool,
         deadline: CFAbsoluteTime
-    ) {
+    ) -> FocusedField? {
         if TextContextCore.isSensitiveApp(
             bundleIdentifier: snapshot.bundleIdentifier,
             ownBundleIdentifier: Bundle.main.bundleIdentifier
         ) {
             snapshot.omission = .sensitiveApp
-            return
+            return nil
+        }
+        // A deliberate trade-off: terminal scrollback can hold unlabeled secrets that no rule
+        // recognizes, so terminal text is never read. Cursor formatting then has no text to fit
+        // a terminal paste to, so it keeps the cleanup's casing and adds no leading space.
+        if TextContextCore.isTerminal(bundleIdentifier: snapshot.bundleIdentifier) {
+            snapshot.omission = .terminal
+            return nil
         }
 
         guard let focused = accessibilityElement(
             from: appElement, attribute: kAXFocusedUIElementAttribute as CFString
-        ) else { return }
+        ) else { return nil }
         AXUIElementSetMessagingTimeout(focused, Self.textContextMessagingTimeout)
 
         let role = accessibilityRawString(from: focused, attribute: kAXRoleAttribute as CFString)
         let subrole = accessibilityRawString(from: focused, attribute: kAXSubroleAttribute as CFString)
         if subrole == kAXSecureTextFieldSubrole as String {
             snapshot.omission = .secureField
-            return
+            return nil
         }
 
+        var webArea: AXUIElement?
+        var label: String?
+        let isBrowser = TextContextCore.isBrowser(bundleIdentifier: snapshot.bundleIdentifier)
         // In browsers, only page content is read; the address bar and toolbars are skipped.
-        if TextContextCore.isBrowser(bundleIdentifier: snapshot.bundleIdentifier) {
-            guard let webArea = ancestor(of: focused, role: "AXWebArea", deadline: deadline) else {
+        if isBrowser {
+            guard let browserWebArea = ancestor(of: focused, role: "AXWebArea", deadline: deadline) else {
                 snapshot.omission = .browserControls
-                return
+                return nil
             }
-            snapshot.websiteDomain = accessibilityURL(from: webArea).flatMap(TextContextCore.domain(from:))
-            snapshot.category = TextContextCore.category(
-                bundleIdentifier: snapshot.bundleIdentifier, websiteDomain: snapshot.websiteDomain
-            )
-            if TextContextCore.isSensitiveDomain(snapshot.websiteDomain) {
-                snapshot.omission = .sensitiveWebsite
-                return
-            }
+            webArea = browserWebArea
+            snapshot.websiteDomain = accessibilityURL(from: browserWebArea).flatMap(TextContextCore.domain(from:))
         }
+        // The category comes from the page's domain before any omission, so a page whose title
+        // names a secrets file keeps its AI chat, email or messaging behaviour.
+        let decision = TextContextCore.fieldReadDecision(
+            bundleIdentifier: snapshot.bundleIdentifier,
+            websiteDomain: snapshot.websiteDomain,
+            windowTitle: shownWindowTitle
+        )
+        snapshot.category = decision.category
+        if let omission = decision.omission {
+            snapshot.omission = omission
+            return nil
+        }
+        // The label tells the Claude Code composer apart from VS Code's editors, both for its
+        // placeholder below and for the conversation read, so it is read with or without a
+        // Deepgram stream.
+        if !isBrowser, role == kAXTextAreaRole as String,
+           ContextTarget.readsFocusedLabel(bundleIdentifier: snapshot.bundleIdentifier) {
+            label = accessibilityRawString(from: focused, attribute: kAXDescriptionAttribute as CFString)
+                ?? accessibilityRawString(from: focused, attribute: kAXTitleAttribute as CFString)
+        }
+        // The composer the field would be if it sits in a web area; outside browsers that is
+        // only checked when the conversation read needs the web area.
+        let composer = ContextTarget.classify(
+            bundleIdentifier: snapshot.bundleIdentifier, websiteDomain: snapshot.websiteDomain,
+            focusedRole: role, focusedLabel: label, insideWebArea: true
+        )
+        if !isBrowser, readsSpeechSources, composer != nil {
+            // The Claude Code composer and ChatGPT.app's composer sit in a web area that
+            // only the conversation read needs.
+            webArea = ancestor(of: focused, role: "AXWebArea", deadline: deadline)
+        }
+        let target = ContextTarget.classify(
+            bundleIdentifier: snapshot.bundleIdentifier, websiteDomain: snapshot.websiteDomain,
+            focusedRole: role, focusedLabel: label, insideWebArea: webArea != nil
+        )
+        let field = FocusedField(element: focused, webArea: webArea, target: target)
 
+        // An empty composer can report its placeholder as its value; it then reads as empty.
         if AppTextInsertionCore.canCapture(role: role, subrole: subrole),
-           let slices = cursorText(from: focused) {
+           let slices = cursorText(from: focused, composer: composer) {
             snapshot.fieldTextRead = true
             snapshot.textBeforeCursor = slices.before
             snapshot.selectedText = slices.selected
             snapshot.textAfterCursor = slices.after
         }
 
-        guard CFAbsoluteTimeGetCurrent() < deadline else { return }
+        // Google's suggestions list sits next to its search box and can hold past searches.
+        guard target != .googleSearch, CFAbsoluteTimeGetCurrent() < deadline else { return field }
         snapshot.nearbyText = nearbyText(
             around: focused,
             excluding: [snapshot.textBeforeCursor, snapshot.selectedText, snapshot.textAfterCursor, snapshot.windowTitle],
             deadline: deadline
         )
+        return field
     }
 
-    /// Prefers range reads so large documents are never copied whole.
-    private func cursorText(from element: AXUIElement) -> CursorTextSlices? {
+    /// On-screen names for one target's Deepgram Configure: none from an Incognito or Guest
+    /// window. The conversation, title and query text stay inside this function; only the
+    /// extracted terms leave it, and the log line carries counts and the target code only.
+    private func speechTerms(target: ContextTarget, snapshot: TextContextSnapshot, field: FocusedField) -> [String] {
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        guard !ContextTermSources.isPrivateWindow(target: target, windowTitle: snapshot.windowTitle) else { return [] }
+        var conversation: [String] = []
+        var tailMessages = 0
+        if ContextTermSources.readsConversationTail, target != .googleSearch, let webArea = field.webArea {
+            let tail = conversationTail(
+                target: target, webArea: webArea, composer: field.element,
+                deadline: startedAt + ContextTermSources.tailBudgetSeconds
+            )
+            conversation = tail.texts
+            tailMessages = tail.messages
+        }
+        let fieldText = [snapshot.textBeforeCursor, snapshot.selectedText, snapshot.textAfterCursor]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+        let sources = ContextTermSources.sources(
+            for: target, windowTitle: snapshot.windowTitle, fieldText: fieldText, conversation: conversation
+        )
+        let tagger: NameExtractor.NameTagger? = NameExtractor.usesNameTagger ? NameExtractor.nameTagger : nil
+        let terms = NameExtractor.terms(from: sources, everyday: EverydayWords.all, tagger: tagger)
+        os_log(
+            .debug, log: textContextLog,
+            "context terms: target=%{public}@ sources=%d terms=%d tail=%d msgs in %d ms",
+            target.rawValue, sources.count, terms.count, tailMessages,
+            Int(((CFAbsoluteTimeGetCurrent() - startedAt) * 1000).rounded())
+        )
+        return terms
+    }
+
+    /// The newest Claude replies and the user's last message (Claude Code panel), or the
+    /// last "ChatGPT said" and "You said" turns (ChatGPT), found with Chromium's search
+    /// predicate from the composer backwards. Read-only, no child enumeration, at most
+    /// `ContextTermSources.maxTailMessages` messages and stops at `deadline`. Assistant text
+    /// keeps its newest `maxAssistantCharacters`, the user's its last `maxUserCharacters`.
+    private func conversationTail(
+        target: ContextTarget,
+        webArea: AXUIElement,
+        composer: AXUIElement,
+        deadline: CFAbsoluteTime
+    ) -> (texts: [String], messages: Int) {
+        var remainingMessages = ContextTermSources.maxTailMessages
+        var messages = 0
+        AXUIElementSetMessagingTimeout(webArea, ContextTermSources.tailMessagingTimeout)
+
+        func spend() -> Bool {
+            guard remainingMessages > 0, CFAbsoluteTimeGetCurrent() < deadline else { return false }
+            remainingMessages -= 1
+            messages += 1
+            return true
+        }
+        /// Newest first: the search runs backwards from the composer.
+        func search(key: String, text: String, limit: Int) -> [AXUIElement] {
+            guard spend() else { return [] }
+            let parameter: [String: Any] = [
+                "AXSearchKey": key,
+                "AXSearchText": text,
+                "AXResultsLimit": limit,
+                "AXStartElement": composer,
+                "AXDirection": "AXDirectionPrevious",
+            ]
+            var value: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(
+                webArea, "AXUIElementsForSearchPredicate" as CFString, parameter as CFDictionary, &value
+            ) == .success, let results = value as? [AnyObject] else { return [] }
+            return results.compactMap { result in
+                CFGetTypeID(result) == AXUIElementGetTypeID() ? unsafeBitCast(result, to: AXUIElement.self) : nil
+            }
+        }
+        func label(of element: AXUIElement) -> String? {
+            guard spend() else { return nil }
+            AXUIElementSetMessagingTimeout(element, ContextTermSources.tailMessagingTimeout)
+            return accessibilityRawString(from: element, attribute: kAXDescriptionAttribute as CFString)
+        }
+        func parent(of element: AXUIElement) -> AXUIElement? {
+            guard spend() else { return nil }
+            AXUIElementSetMessagingTimeout(element, ContextTermSources.tailMessagingTimeout)
+            return accessibilityElement(from: element, attribute: kAXParentAttribute as CFString)
+        }
+        /// The element's whole text, through the web area's text markers.
+        func turnText(of element: AXUIElement) -> String? {
+            guard spend() else { return nil }
+            var range: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(
+                webArea, "AXTextMarkerRangeForUIElement" as CFString, element, &range
+            ) == .success, let range, spend() else { return nil }
+            var value: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(
+                webArea, "AXStringForTextMarkerRange" as CFString, range, &value
+            ) == .success else { return nil }
+            if let text = value as? String { return text }
+            return (value as? NSAttributedString)?.string
+        }
+        /// A heading's turn: its parent, or one level more when the parent holds little
+        /// more than the label; the label itself is stripped.
+        func headingTurn(_ heading: AXUIElement, label: String) -> String? {
+            guard let turn = parent(of: heading), var text = turnText(of: turn) else { return nil }
+            if ContextTermSources.needsOuterTurn(text: text, label: label),
+               let outer = parent(of: turn), let outerText = turnText(of: outer) {
+                text = outerText
+            }
+            return ContextTermSources.stripTurnLabel(text, label: label)
+        }
+
+        var assistantTexts: [String] = []
+        var userText: String?
+        switch target {
+        case .claudeCodePanel:
+            // The search text also matches the "Claude Code conversation" region; labels
+            // tell the reply articles apart.
+            var assistantArticles: [AXUIElement] = []
+            for article in search(key: "AXLandmarkSearchKey", text: ContextTermSources.claudeAssistantLabel, limit: 3)
+            where assistantArticles.count < 2 && ContextTermSources.isClaudeAssistantLabel(label(of: article)) {
+                assistantArticles.append(article)
+            }
+            let userArticle = search(key: "AXLandmarkSearchKey", text: ContextTermSources.claudeUserLabel, limit: 1)
+                .first { ContextTermSources.isClaudeUserLabel(label(of: $0)) }
+            assistantTexts = assistantArticles.compactMap { turnText(of: $0) }
+            userText = userArticle.flatMap { turnText(of: $0) }
+        case .chatGPTWeb, .chatGPTApp:
+            let assistantHeading = search(
+                key: "AXHeadingSearchKey", text: ContextTermSources.chatGPTAssistantHeading, limit: 1
+            ).first
+            let userHeading = search(key: "AXHeadingSearchKey", text: ContextTermSources.chatGPTUserHeading, limit: 1).first
+            assistantTexts = assistantHeading
+                .flatMap { headingTurn($0, label: ContextTermSources.chatGPTAssistantHeading) }
+                .map { [$0] } ?? []
+            userText = userHeading.flatMap { headingTurn($0, label: ContextTermSources.chatGPTUserHeading) }
+        case .googleSearch:
+            return ([], 0)
+        }
+
+        // Newest first: keep the newest assistant text up to the cap, redacted before each
+        // trim so a secret on the cut leaves no fragment.
+        var keptAssistant: [String] = []
+        var remainingCharacters = ContextTermSources.maxAssistantCharacters
+        for text in assistantTexts where remainingCharacters > 0 {
+            let kept = ContextTermSources.keptTail(text, limit: remainingCharacters)
+            keptAssistant.append(kept)
+            remainingCharacters -= kept.count
+        }
+        var texts = keptAssistant
+        if let userText {
+            texts.append(ContextTermSources.keptTail(userText, limit: ContextTermSources.maxUserCharacters))
+        }
+        return (texts, messages)
+    }
+
+    /// Prefers range reads so large documents are never copied whole. A value that is the
+    /// field's placeholder (`AXPlaceholderValue`, or one of `composer`'s own placeholder texts,
+    /// which the Claude Code panel and ChatGPT draw with CSS) gives empty slices: an empty
+    /// field, not text before the cursor.
+    private func cursorText(from element: AXUIElement, composer: ContextTarget?) -> CursorTextSlices? {
         guard let selection = accessibilitySelectedRange(from: element) else { return nil }
         let placeholder = accessibilityRawString(from: element, attribute: kAXPlaceholderValueAttribute as CFString)
 
@@ -286,15 +529,14 @@ Return only two sentences, no labels, no markdown, no extra commentary.
            let selected = accessibilityString(from: element, range: ranges.selected),
            let after = accessibilityString(from: element, range: ranges.after) {
             return TextContextCore.normalizedSlices(
-                before: before, selected: selected, after: after, placeholder: placeholder
+                before: before, selected: selected, after: after, placeholder: placeholder, composer: composer,
+                cuts: TextContextCore.readCuts(of: ranges, selection: selection, characterCount: count)
             )
         }
 
         guard let value = accessibilityTextValue(from: element),
-              (value as NSString).length <= Self.maxFullValueLength,
-              let slices = TextContextCore.cursorSlices(in: value, selection: selection) else { return nil }
-        if let placeholder, !placeholder.isEmpty, value == placeholder { return nil }
-        return slices
+              (value as NSString).length <= Self.maxFullValueLength else { return nil }
+        return TextContextCore.cursorSlices(in: value, selection: selection, placeholder: placeholder, composer: composer)
     }
 
     /// Collects short labels and values near the focused field (names, recipients, thread
@@ -340,17 +582,18 @@ Return only two sentences, no labels, no markdown, no extra commentary.
     /// Code editors only: walks the focused window breadth-first for file names (window
     /// title, tab and row titles and descriptions) and for identifiers in the visible text of
     /// editors other than the focused field, whose text was already read. Skips secure fields
-    /// and reads no editor text while the window title shows a secrets file or folder, with or
-    /// without an extension (id_rsa, credentials, .ssh). Never writes an attribute and never
-    /// logs; the editor text stays local to this function, and the partial results stand when
-    /// the deadline passes.
+    /// and reads no editor text while the window title, as shown before redaction, shows a
+    /// secrets file or folder, with or without an extension (id_rsa, credentials, .ssh). Never
+    /// writes an attribute and never logs; the editor text stays local to this function, and
+    /// the partial results stand when the deadline passes.
     private func readCodeContext(
         into snapshot: inout TextContextSnapshot,
         appElement: AXUIElement,
+        shownWindowTitle: String?,
         deadline: CFAbsoluteTime
     ) {
         var labels = [snapshot.windowTitle].compactMap { $0 }
-        let readsEditorText = !IdentifierExtractor.titleShowsSecretsFile(snapshot.windowTitle)
+        let readsEditorText = !IdentifierExtractor.titleShowsSecretsFile(shownWindowTitle)
         // Already read, so no extra calls; first, so they survive the identifier cap.
         var editorTexts = readsEditorText
             ? [snapshot.textBeforeCursor, snapshot.selectedText, snapshot.textAfterCursor, snapshot.nearbyText]
@@ -382,7 +625,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
                 let isFocused = focused.map { CFEqual($0, element) } ?? false
                 if readsEditorText, remaining > 0, !isFocused,
                    let text = visibleEditorText(from: element, limit: remaining) {
-                    editorTexts.append(text)
+                    editorTexts.append(SecretFilter.redact(text))
                     remaining -= text.count
                 }
                 continue
@@ -564,12 +807,15 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         let bundleIdentifier = frontmostApp.bundleIdentifier
         let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
 
-        let windowTitle = focusedWindowTitle(from: appElement) ?? appName
+        let shownTitle = focusedWindowTitle(from: appElement)
+        // The model request and the Run Log get the redacted title; only the window match
+        // below compares the title as shown with the window list's names.
+        let windowTitle = shownTitle.map(SecretFilter.redact) ?? appName
         let selectedText = selectedText(from: appElement)
         let screenshot = captureActiveWindowScreenshot(
             processIdentifier: frontmostApp.processIdentifier,
             appElement: appElement,
-            focusedWindowTitle: windowTitle
+            focusedWindowTitle: shownTitle ?? appName
         )
         let currentActivity: String
         let contextPrompt: String?

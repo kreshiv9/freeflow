@@ -226,6 +226,27 @@ enum IdentifierExtractor {
         return namePieces(in: windowTitle).contains(where: isSecretsFileName)
     }
 
+    /// Narrower than `titleShowsSecretsFile`, for the focused field's omission outside code
+    /// editors (browser pages, mail, chat and other apps whose title is often prose): only a
+    /// title piece shaped like a file or folder name (a dotfile, or a "." or "_" inside it)
+    /// counts, and "secret" or "credential" must be a whole part of it, split on ".", "_" and
+    /// "-" ("client_secret.json", "aws-credentials.txt"). Prose titles ("aws secrets manager
+    /// pricing", "Rotating credentials", "Email to my secretary"), hyphenated channel names
+    /// and page slugs ("secrets-rotation") and source files ("SecretFilter.swift") never match.
+    static func titleNamesSecretsFile(_ windowTitle: String?) -> Bool {
+        guard let windowTitle else { return false }
+        return namePieces(in: windowTitle).contains { piece in
+            let name = piece.lowercased()
+            let parts = name.split(whereSeparator: { $0 == "." || $0 == "_" || $0 == "-" })
+            let isFileShaped = name.hasPrefix(".") || (parts.count > 1 && (name.contains(".") || name.contains("_")))
+            guard isFileShaped else { return false }
+            if parts.contains(where: { ["secret", "secrets", "credential", "credentials"].contains($0) }) {
+                return true
+            }
+            return isSecretsFileName(name, matchingWordsInside: false)
+        }
+    }
+
     /// Each whitespace token split on title punctuation ("—", "●", "›", ",", ":"…), with URLs
     /// and emails skipped, a path reduced to its last component and trailing dots dropped.
     private static func namePieces(in label: String) -> [String] {
@@ -270,6 +291,11 @@ enum IdentifierExtractor {
     /// and the folders that hold them: no editor text is read while the window title shows
     /// one of these.
     static func isSecretsFileName(_ name: String?) -> Bool {
+        isSecretsFileName(name, matchingWordsInside: true)
+    }
+
+    /// `matchingWordsInside` also counts "secret" or "credential" anywhere in the name.
+    private static func isSecretsFileName(_ name: String?, matchingWordsInside: Bool) -> Bool {
         guard let name = name?.lowercased(), !name.isEmpty else { return false }
         if name.hasPrefix(".env") || name.hasPrefix("env.") || name.contains(".env.") { return true }
         if [
@@ -279,7 +305,7 @@ enum IdentifierExtractor {
             return true
         }
         if ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].contains(where: name.hasPrefix) { return true }
-        if name.contains("secret") || name.contains("credential") { return true }
+        if matchingWordsInside, name.contains("secret") || name.contains("credential") { return true }
         if let dot = name.lastIndex(of: "."), [
             "env", "pem", "key", "p8", "p12", "pfx", "keystore", "jks", "ppk", "tfvars", "tfstate"
         ].contains(String(name[name.index(after: dot)...])) {

@@ -1,9 +1,10 @@
 import Foundation
 
 /// Wall-clock durations for one dictation's stop path, in milliseconds per
-/// stage. A nil stage did not run (for example no paste after an empty
-/// transcript). Holds numbers and a fixed source label only, never transcript
-/// content, so it is safe to persist and log.
+/// stage, plus the Deepgram keyterm counts. A nil stage did not run (for
+/// example no paste after an empty transcript). Holds numbers and a fixed
+/// source label only, never transcript content or terms, so it is safe to
+/// persist and log.
 struct PipelineStageTimings: Codable, Equatable, Sendable {
     static let realtimeTranscriptionSource = "realtime"
     static let fileTranscriptionSource = "file"
@@ -33,6 +34,16 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
     var pasteDispatchMilliseconds: Int? = nil
     /// Shortcut release until the paste or insertion action fired.
     var totalMilliseconds: Int? = nil
+    /// Keyterms in the Deepgram connect URL; nil for other providers.
+    var keytermsAtConnect: Int? = nil
+    /// On-screen names (Claude Code panel, ChatGPT, Google search) the one Deepgram Configure
+    /// added; nil when none was sent.
+    var screenKeyterms: Int? = nil
+    /// Visible code identifiers (Cursor, Windsurf, VS Code) that Configure added; nil when
+    /// none was sent.
+    var codeKeyterms: Int? = nil
+    /// Audio already streamed when that Configure went out; 0 when it went out first.
+    var screenKeytermsAudioMilliseconds: Int? = nil
 
     /// Raw CFAbsoluteTime marks captured along the stop path. Each mark is nil
     /// until its point in the pipeline is reached.
@@ -47,6 +58,11 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
         var cleanupStarted: CFAbsoluteTime? = nil
         var cleanupFinished: CFAbsoluteTime? = nil
         var pasteFired: CFAbsoluteTime? = nil
+        /// Copied from the Deepgram stream's keytermReport; passed through unchanged.
+        var keytermsAtConnect: Int? = nil
+        var screenKeyterms: Int? = nil
+        var codeKeyterms: Int? = nil
+        var screenKeytermsAudioMilliseconds: Int? = nil
 
         var timings: PipelineStageTimings {
             PipelineStageTimings(marks: self)
@@ -80,6 +96,24 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
             parts.append("total \(Self.formatted(milliseconds: totalMilliseconds))")
         }
         return parts.joined(separator: " · ")
+    }
+
+    /// Deepgram keyterm counts, numbers only; "" for other providers. On-screen names and
+    /// code identifiers are counted apart, and a zero count is left out.
+    /// Examples: "keyterms 14 · screen 18 (from start)",
+    /// "keyterms 14 · screen 18 · code 6 (after 420 ms of audio)",
+    /// "keyterms 14 · code 6 (from start)", "keyterms 14".
+    var keytermLine: String {
+        guard let keytermsAtConnect else { return "" }
+        var parts = ["keyterms \(keytermsAtConnect)"]
+        if let screenKeyterms, screenKeyterms > 0 { parts.append("screen \(screenKeyterms)") }
+        if let codeKeyterms, codeKeyterms > 0 { parts.append("code \(codeKeyterms)") }
+        let line = parts.joined(separator: " · ")
+        guard parts.count > 1 else { return line }
+        if let audioMilliseconds = screenKeytermsAudioMilliseconds, audioMilliseconds > 0 {
+            return line + " (after \(Self.formatted(milliseconds: audioMilliseconds)) of audio)"
+        }
+        return line + " (from start)"
     }
 
     /// Milliseconds below one second, otherwise seconds with one decimal
@@ -118,7 +152,11 @@ extension PipelineStageTimings {
             contextWaitMilliseconds: Self.milliseconds(from: marks.contextStarted, to: marks.contextFinished),
             cleanupMilliseconds: Self.milliseconds(from: marks.cleanupStarted, to: marks.cleanupFinished),
             pasteDispatchMilliseconds: Self.milliseconds(from: marks.cleanupFinished, to: marks.pasteFired),
-            totalMilliseconds: Self.milliseconds(from: marks.stopRequested, to: marks.pasteFired)
+            totalMilliseconds: Self.milliseconds(from: marks.stopRequested, to: marks.pasteFired),
+            keytermsAtConnect: marks.keytermsAtConnect,
+            screenKeyterms: marks.screenKeyterms,
+            codeKeyterms: marks.codeKeyterms,
+            screenKeytermsAudioMilliseconds: marks.screenKeytermsAudioMilliseconds
         )
     }
 

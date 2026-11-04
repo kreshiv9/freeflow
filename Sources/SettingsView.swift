@@ -1302,7 +1302,7 @@ struct GeneralSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Context awareness", isOn: $appState.contextAwarenessEnabled)
 
-            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. In Cursor, Windsurf and VS Code it also reads file names and the variable and function names visible in other editor panes; those names are sent with the cleanup request and, with Deepgram streaming, to Deepgram as key terms. Password fields, browser address bars, password managers, and banking sites are skipped. Reading is skipped if it takes too long, so dictation is never slowed down.")
+            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. In Cursor, Windsurf and VS Code it also reads file names and the variable and function names visible in other editor panes; those names are sent with the cleanup request and, with Deepgram streaming, to Deepgram as key terms. With Deepgram streaming, your Mac account name and names from Chrome (chatgpt.com, google.com), the ChatGPT app and the Claude Code panel in VS Code are also sent to Deepgram as key terms; Chrome Incognito and Guest windows are skipped when Chrome's English title markers are present. Password fields, browser address bars, password managers, banking sites, terminals, and windows whose title names a secrets file such as .env are skipped, and common key and password patterns are redacted. Reading is skipped if it takes too long, so dictation is never slowed down.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -2584,6 +2584,19 @@ struct RunLogEntryView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Text(summaryLine)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+
+                    // Deepgram keyterm counts
+                    if let keytermLine = item.stageTimings?.keytermLine, !keytermLine.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "textformat.abc")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(keytermLine)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)

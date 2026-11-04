@@ -9,7 +9,15 @@ enum TextContextCoreTests {
         testCursorReadRangesStayWithinBudget()
         testCursorSlicesHandleEmojiAndBudgets()
         testPlaceholderAndWhitespace()
+        testComposerPlaceholderReadsAsEmptyField()
+        testSlicesRedactBeforeTrimming()
+        testCutReadsDropPartialTokens()
+        testSecretSplitByCursorIsRedactedWhole()
+        testKeyBodyWithoutBeginOrEndLeavesNoFragment()
         testNearbyTextIsDedupedAndCapped()
+        testNearbyTextRedactsCandidates()
+        testOmissionForSecretsFilesAndTerminals()
+        testFieldReadDecisionKeepsPageCategory()
         testPromptSectionFormatsAndNeutralizes()
         testAppContextChoosesPromptSection()
         await testFirstValueStopsWaitingAtDeadline()
@@ -131,6 +139,255 @@ enum TextContextCoreTests {
         let spaced = TextContextCore.normalizedSlices(before: "Hello ", selected: "", after: "")
         TestSupport.expectEqual(spaced.before, "Hello ")
         TestSupport.expectEqual(spaced.selected, nil)
+
+        // The full-value fallback reads a placeholder as an empty field too, not as unread.
+        TestSupport.expectEqual(
+            TextContextCore.cursorSlices(
+                in: "Write a message…", selection: NSRange(location: 16, length: 0), placeholder: "Write a message…"
+            ),
+            CursorTextSlices(before: nil, selected: nil, after: nil)
+        )
+    }
+
+    /// An empty Claude Code or ChatGPT composer can report its CSS-drawn placeholder as its
+    /// value, with no AXPlaceholderValue. That value reads as an empty field: no text before
+    /// the cursor, so cursor formatting starts a sentence (capital, no leading space) and the
+    /// placeholder never reaches the CONTEXT block. Typed text with the same words is kept.
+    private static func testComposerPlaceholderReadsAsEmptyField() {
+        let transcript = "Fix the synthetic build"
+        func fitted(_ slices: CursorTextSlices?) -> String {
+            CursorFormatting.adjust(transcript, in: TextContextSnapshot(
+                category: .coding,
+                textBeforeCursor: slices?.before,
+                selectedText: slices?.selected,
+                textAfterCursor: slices?.after,
+                fieldTextRead: slices != nil
+            )).text
+        }
+        let claudePlaceholder = "⌘ Esc to focus or unfocus Claude"
+        let empty = CursorTextSlices(before: nil, selected: nil, after: nil)
+
+        // Without the composer the placeholder reads as text before the cursor: the bug.
+        let unrecognized = TextContextCore.normalizedSlices(before: claudePlaceholder, selected: "", after: "")
+        TestSupport.expectEqual(unrecognized.before, claudePlaceholder)
+        TestSupport.expectEqual(fitted(unrecognized), " fix the synthetic build")
+
+        // The caret may sit before or after the placeholder text; both read as empty.
+        for (before, after) in [(claudePlaceholder, ""), ("", claudePlaceholder)] {
+            let slices = TextContextCore.normalizedSlices(
+                before: before, selected: "", after: after, composer: .claudeCodePanel
+            )
+            TestSupport.expectEqual(slices, empty)
+            TestSupport.expectEqual(fitted(slices), "Fix the synthetic build")
+        }
+        let fallback = TextContextCore.cursorSlices(
+            in: claudePlaceholder, selection: NSRange(location: (claudePlaceholder as NSString).length, length: 0),
+            composer: .claudeCodePanel
+        )
+        TestSupport.expectEqual(fallback, empty)
+        TestSupport.expectEqual(fitted(fallback), "Fix the synthetic build")
+
+        let chatGPT = TextContextCore.normalizedSlices(before: "Ask anything", selected: "", after: "", composer: .chatGPTWeb)
+        TestSupport.expectEqual(chatGPT, empty)
+        TestSupport.expectEqual(fitted(chatGPT), "Fix the synthetic build")
+
+        // AXPlaceholderValue still counts on its own, surrounding whitespace aside.
+        TestSupport.expect(
+            TextContextCore.isPlaceholderValue("Reply…\n", placeholder: "Reply…", composer: nil),
+            "A value equal to AXPlaceholderValue is the placeholder"
+        )
+        TestSupport.expect(
+            !TextContextCore.isPlaceholderValue("", placeholder: "", composer: .claudeCodePanel),
+            "An empty value is not a placeholder"
+        )
+
+        // Real text that merely contains the same words stays text before the cursor.
+        let typed = "use ⌘ Esc to focus or unfocus Claude and"
+        let kept = TextContextCore.normalizedSlices(before: typed, selected: "", after: "", composer: .claudeCodePanel)
+        TestSupport.expectEqual(kept.before, typed)
+        TestSupport.expectEqual(fitted(kept), " fix the synthetic build")
+        let askAnything = TextContextCore.normalizedSlices(
+            before: "Ask anything about Supabase and", selected: "", after: "", composer: .chatGPTApp
+        )
+        TestSupport.expectEqual(askAnything.before, "Ask anything about Supabase and")
+        // A short typed sentence shaped like the placeholder, with ordinary words where the
+        // shortcut goes, is the field's text: the paste continues it with a space, lowercase.
+        for typedSentence in ["Make sure to attach selected text", "How to attach selected text"] {
+            let slices = TextContextCore.cursorSlices(
+                in: typedSentence, selection: NSRange(location: (typedSentence as NSString).length, length: 0),
+                composer: .claudeCodePanel
+            )
+            TestSupport.expectEqual(slices?.before, typedSentence)
+            TestSupport.expectEqual(fitted(slices), " fix the synthetic build")
+        }
+        let typedAsk = "Ask ChatGPT anything in Spanish please"
+        TestSupport.expectEqual(
+            TextContextCore.normalizedSlices(before: typedAsk, selected: "", after: "", composer: .chatGPTApp).before,
+            typedAsk
+        )
+        // Another app's field keeps a value that is a Claude or ChatGPT placeholder elsewhere.
+        TestSupport.expectEqual(
+            TextContextCore.normalizedSlices(before: "Ask anything", selected: "", after: "", composer: nil).before,
+            "Ask anything"
+        )
+    }
+
+    /// A synthetic key straddling the 1,000-character trim boundary is replaced whole, so no
+    /// fragment of it survives the trim.
+    private static func testSlicesRedactBeforeTrimming() {
+        let key = "sk-" + "proj-" + "FAKEfake0000FAKEfake0000FAKE"
+        let head = String(repeating: "word ", count: 196)
+        let tail = String(repeating: " tail", count: 197)
+        let before = head + key + tail
+        let boundary = before.count - TextContextCore.maxCharactersBeforeCursor
+        TestSupport.expect(
+            boundary > head.count && boundary < head.count + key.count,
+            "The fixture must put the key across the trim boundary"
+        )
+        // The cut leaves a piece no rule recognizes, so trimming first would keep a fragment:
+        // the fixture tells the two orders apart.
+        let trimmedFirst = SecretFilter.redact(String(before.suffix(TextContextCore.maxCharactersBeforeCursor)))
+        TestSupport.expect(
+            fragments(of: key).contains(where: trimmedFirst.contains),
+            "Trimming before redacting must leave a fragment of the fixture's key"
+        )
+
+        let slices = TextContextCore.normalizedSlices(before: before, selected: nil, after: nil)
+        let kept = slices.before ?? ""
+        for fragment in fragments(of: key) {
+            TestSupport.expect(!kept.contains(fragment), "No 8-character fragment of the key may survive")
+        }
+        TestSupport.expect(kept.hasSuffix(tail), "Text after the key is kept")
+        // The key starts outside the kept window, so only a redaction that ran before the trim
+        // leaves its placeholder inside it; trimming first keeps a bare fragment instead.
+        TestSupport.expect(kept != trimmedFirst, "Redacting must not run on the trimmed text")
+        TestSupport.expect(kept.hasSuffix(SecretFilter.placeholder + tail), "The whole key is replaced before the trim")
+
+        let selectedKey = TextContextCore.normalizedSlices(before: "a ", selected: key, after: " b")
+        TestSupport.expectEqual(selectedKey.selected, SecretFilter.placeholder)
+
+        let placeholder = TextContextCore.normalizedSlices(
+            before: "Ask anything", selected: "", after: "", placeholder: "Ask anything"
+        )
+        TestSupport.expectEqual(placeholder, CursorTextSlices(before: nil, selected: nil, after: nil))
+    }
+
+    /// Every 8-character piece of `secret`.
+    private static func fragments(of secret: String) -> [String] {
+        let characters = Array(secret)
+        guard characters.count >= 8 else { return [secret] }
+        return (0...(characters.count - 8)).map { String(characters[$0..<$0 + 8]) }
+    }
+
+    private static func expectNoFragment(of secret: String, in slices: CursorTextSlices?, _ message: String) {
+        let kept = [slices?.before, slices?.selected, slices?.after].compactMap { $0 }.joined(separator: "\n")
+        for fragment in fragments(of: secret) {
+            TestSupport.expect(!kept.contains(fragment), message)
+        }
+    }
+
+    /// A read that starts inside a token keeps a fragment no rule recognizes; redaction then
+    /// shrinks the text, so the trim no longer discards it. The cut token is dropped instead.
+    private static func testCutReadsDropPartialTokens() {
+        let value = "Kq9/zXwP" + "fake/Rt7s" + "YbNvLm2"
+        let pem = "-----BEGIN " + "PRIVATE KEY-----\n" + syntheticKeyBody(lines: 26) + "\n-----END " + "PRIVATE KEY-----"
+        let filler = String(repeating: "note ", count: 20)
+        let readTail = value + "\n" + pem + "\n" + filler
+        let budget = TextContextCore.maxCharactersBeforeCursor * 2
+        TestSupport.expect((readTail as NSString).length < budget, "The fixture must fit inside the before read")
+        // The before read starts inside the labeled value, so its label is never read.
+        let head = String(repeating: "x ", count: 200) + "API_SECRET=" + String(
+            repeating: "w", count: budget - (readTail as NSString).length + 5
+        )
+        let text = head + readTail
+        let cursor = (text as NSString).length
+        let ranges = TextContextCore.cursorReadRanges(selection: NSRange(location: cursor, length: 0), characterCount: cursor)
+        TestSupport.expect(ranges.map { $0.before.location > 0 } == true, "The before read is cut")
+        let slices = TextContextCore.cursorSlices(in: text, selection: NSRange(location: cursor, length: 0))
+        expectNoFragment(of: value, in: slices, "No fragment of a value cut by the read may survive")
+        TestSupport.expect(slices?.before?.contains(SecretFilter.placeholder) == true, "The key block is redacted")
+        TestSupport.expect(slices?.before?.hasSuffix(filler) == true, "Text near the cursor is kept")
+
+        TestSupport.expectEqual(
+            TextContextCore.readCuts(
+                of: CursorReadRanges(
+                    before: NSRange(location: 5, length: 10),
+                    selected: NSRange(location: 15, length: 4),
+                    after: NSRange(location: 20, length: 10)
+                ),
+                selection: NSRange(location: 15, length: 5),
+                characterCount: 40
+            ),
+            CursorReadCuts(before: true, selected: true, after: true)
+        )
+        TestSupport.expectEqual(
+            TextContextCore.normalizedSlices(
+                before: "abc12 def", selected: "ghi jk", after: "lmn op9", cuts: CursorReadCuts(before: true, selected: true, after: true)
+            ),
+            CursorTextSlices(before: " def", selected: "ghi ", after: "lmn ")
+        )
+        // Other scripts have no secrets, so a cut there keeps the text.
+        TestSupport.expectEqual(TextContextCore.droppingLeadingPartialToken("日本語のテキスト"), "日本語のテキスト")
+        TestSupport.expectEqual(TextContextCore.droppingTrailingPartialToken("abc def"), "abc ")
+    }
+
+    /// A secret the cursor splits is redacted as one text, so neither side keeps a piece.
+    private static func testSecretSplitByCursorIsRedactedWhole() {
+        let key = "sk-" + "proj-" + "AbCdEf0123456789" + "GhIjKlMnOpQrSt"
+        let line = "export OPENAI_API_KEY=" + key + "\nnext line"
+        let cursor = ("export OPENAI_API_KEY=sk-proj-AbCdEf0123456789" as NSString).length
+        let slices = TextContextCore.cursorSlices(in: line, selection: NSRange(location: cursor, length: 0))
+        expectNoFragment(of: key, in: slices, "No fragment of a key the cursor splits may survive")
+        TestSupport.expectEqual(slices?.before, "export OPENAI_API_KEY=[secret]")
+        TestSupport.expectEqual(slices?.after, "\nnext line")
+
+        let selectedPart = TextContextCore.cursorSlices(
+            in: line, selection: NSRange(location: cursor - 4, length: 8)
+        )
+        expectNoFragment(of: key, in: selectedPart, "A selection inside a key keeps no fragment")
+        TestSupport.expectEqual(selectedPart?.after, "\nnext line")
+
+        let unlabeled = "before " + "Xk9mPqR2vLwT" + " " + "8nZaB4cDqW3e" + " after"
+        let joined = "before " + "Xk9mPqR2vLwT8nZaB4cDqW3e" + " after"
+        let split = TextContextCore.cursorSlices(
+            in: joined, selection: NSRange(location: ("before Xk9mPqR2vLwT" as NSString).length, length: 0)
+        )
+        TestSupport.expectEqual(split, CursorTextSlices(before: "before [secret]", selected: nil, after: " after"))
+        TestSupport.expect(SecretFilter.redact(unlabeled) == unlabeled, "Short halves alone are not secrets")
+    }
+
+    /// A cursor inside a private key body, or after one longer than the read window, never
+    /// reads the BEGIN line, and the long-token rule splits base64 at every "/".
+    private static func testKeyBodyWithoutBeginOrEndLeavesNoFragment() {
+        let body = syntheticKeyBody(lines: 60)
+        let pem = "-----BEGIN " + "PRIVATE KEY-----\n" + body + "\n-----END " + "PRIVATE KEY-----"
+        let text = "notes\n" + pem + "\nafter the key"
+        let lines = body.components(separatedBy: "\n")
+        let insideOffset = ("notes\n-----BEGIN PRIVATE KEY-----\n" as NSString).length
+            + (lines.prefix(40).joined(separator: "\n") as NSString).length + 20
+        let inside = TextContextCore.cursorSlices(in: text, selection: NSRange(location: insideOffset, length: 0))
+        for line in lines {
+            expectNoFragment(of: line, in: inside, "A cursor inside a key body keeps no body fragment")
+        }
+
+        let afterOffset = (("notes\n" + pem) as NSString).length
+        let after = TextContextCore.cursorSlices(in: text, selection: NSRange(location: afterOffset, length: 0))
+        for line in lines {
+            expectNoFragment(of: line, in: after, "A cursor after a long key keeps no body fragment")
+        }
+        TestSupport.expectEqual(after?.after, "\nafter the key")
+    }
+
+    /// Invented base64-looking lines of 64 characters from a fixed generator: no real key.
+    private static func syntheticKeyBody(lines: Int) -> String {
+        let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+        var state: UInt64 = 0x5EED_F00D
+        return (0..<lines).map { _ in
+            String((0..<64).map { _ -> Character in
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                return alphabet[Int((state >> 33) % UInt64(alphabet.count))]
+            })
+        }.joined(separator: "\n")
     }
 
     private static func testNearbyTextIsDedupedAndCapped() {
@@ -148,6 +405,170 @@ enum TextContextCoreTests {
         let capped = TextContextCore.nearbyText(from: many) ?? ""
         TestSupport.expect(capped.count <= TextContextCore.maxNearbyCharacters, "Nearby text must respect its budget")
         TestSupport.expectEqual(TextContextCore.nearbyText(from: []), nil)
+    }
+
+    private static func testNearbyTextRedactsCandidates() {
+        let value = "FAKEhorse" + "BatteryValue"
+        let text = TextContextCore.nearbyText(from: ["To: Avery Quinn", "DB_PASSWORD=" + value]) ?? ""
+        TestSupport.expect(text.contains(SecretFilter.placeholder), "Secret values in nearby labels are redacted")
+        TestSupport.expect(!text.contains(value), "The secret value never reaches nearby text")
+        TestSupport.expect(text.contains("To: Avery Quinn"), "Ordinary labels are kept")
+    }
+
+    private static func testOmissionForSecretsFilesAndTerminals() {
+        func omission(_ bundle: String?, _ title: String?) -> TextContextOmission? {
+            TextContextCore.fieldReadDecision(bundleIdentifier: bundle, websiteDomain: nil, windowTitle: title).omission
+        }
+        TestSupport.expectEqual(omission("com.microsoft.VSCode", ".env.local — app — Visual Studio Code"), .secretsFile)
+        TestSupport.expectEqual(omission("com.microsoft.VSCode", "id_rsa — .ssh"), .secretsFile)
+        TestSupport.expectEqual(omission("com.apple.TextEdit", "client_secret.json"), .secretsFile)
+        TestSupport.expectEqual(omission("com.microsoft.VSCode", "credentials — .aws — Visual Studio Code"), .secretsFile)
+        TestSupport.expectEqual(omission("com.microsoft.VSCode", "useAuth.ts — app"), nil)
+        TestSupport.expectEqual(omission(nil, nil), nil)
+
+        // A code editor's title names the open file, so a bare secrets-file name counts (an
+        // editor showing only ~/.aws/credentials' last component), and a source file named
+        // like one fails safe.
+        for (bundle, title) in [
+            ("com.sublimetext.4", "credentials"),
+            ("com.microsoft.VSCode", "credentials — synthetic-project — Visual Studio Code"),
+            ("com.microsoft.VSCode", "secrets — synthetic — Visual Studio Code"),
+            ("com.sublimetext.4", "mysecrets.txt"),
+            ("com.microsoft.VSCode", "SecretFilter.swift — synthetic-project — Visual Studio Code"),
+        ] {
+            TestSupport.expectEqual(omission(bundle, title), .secretsFile)
+        }
+
+        // Other apps' titles are often prose (a mail subject, a channel, a chat or document
+        // title), so they use the narrow check like browsers: prose is read, with redaction.
+        for (bundle, title) in [
+            ("com.openai.codex", "Secretary job cover letter"),
+            ("com.openai.codex", "Secret Santa gift ideas"),
+            ("com.openai.codex", "Rotating AWS credentials"),
+            ("com.apple.mail", "Re: Rotating credentials for staging"),
+            ("com.tinyspeck.slackmacgap", "secrets-rotation (Channel) - Synthetic Co - Slack"),
+            ("com.anthropic.claudefordesktop", "Kubernetes secrets question"),
+            ("com.apple.TextEdit", "Secret Santa list"),
+            // A bare name is not file-shaped, so a plain editor showing ~/.aws/credentials is
+            // read; SecretFilter still redacts its key values.
+            ("com.apple.TextEdit", "credentials"),
+            ("com.apple.TextEdit", "mysecrets.txt"),
+        ] {
+            TestSupport.expectEqual(omission(bundle, title), nil)
+        }
+        // A file-shaped secrets name in those titles still counts.
+        for (bundle, title) in [
+            ("com.apple.mail", "Fwd: aws-credentials.txt"),
+            ("com.openai.codex", "Explain my .env.local"),
+            ("com.tinyspeck.slackmacgap", "id_rsa - Synthetic Co - Slack"),
+            ("com.apple.TextEdit", ".env"),
+        ] {
+            TestSupport.expectEqual(omission(bundle, title), .secretsFile)
+        }
+
+        // The decision reads the title as shown: redaction hides this downloaded OAuth client
+        // file's name, so the redacted title no longer names a secrets file.
+        let clientSecretFile = "client" + "_secret_" + "123456789012" + "-" + "abcdefghij0123456789klmnopqr"
+            + ".apps.googleusercontent.com.json"
+        let redactedFile = SecretFilter.redact(clientSecretFile)
+        TestSupport.expect(!redactedFile.contains("secret_"), "Redaction must hide the fixture's file name")
+        TestSupport.expect(
+            !IdentifierExtractor.titleNamesSecretsFile(redactedFile + " - Google Chrome"),
+            "The redacted page title no longer names a secrets file"
+        )
+        TestSupport.expectEqual(omission("com.apple.TextEdit", clientSecretFile), .secretsFile)
+        TestSupport.expectEqual(omission("com.google.Chrome", clientSecretFile + " - Google Chrome"), .secretsFile)
+
+        // Code editors use the broad check: each bare or file-shaped secrets name in an editor
+        // title stops the read, in every editor's title format.
+        let editorTitles: [(bundle: String, format: (String) -> String)] = [
+            ("com.microsoft.VSCode", { "\($0) — synthetic-project — Visual Studio Code" }),
+            ("com.todesktop.230313mzl4w4u92", { "\($0) — synthetic-project — Cursor" }),
+            ("com.exafunction.windsurf", { "\($0) — synthetic-project — Windsurf" }),
+            ("com.apple.dt.Xcode", { "synthetic-project — \($0)" }),
+            ("dev.zed.Zed", { "synthetic-project — \($0)" }),
+        ]
+        for editor in editorTitles {
+            for name in ["credentials", "secrets", ".env.local", "id_rsa", "mysecrets.txt"] {
+                TestSupport.expectEqual(omission(editor.bundle, editor.format(name)), .secretsFile)
+            }
+            TestSupport.expectEqual(omission(editor.bundle, editor.format("useAuth.ts")), nil)
+        }
+
+        // In browsers only file and folder names count, because a page title is often prose:
+        // prose page titles and ordinary source files are read.
+        for title in [
+            "aws secrets manager pricing - Google Search - Google Chrome",
+            "Re: Rotating credentials for staging - Gmail - Google Chrome",
+            "Email to my secretary",
+            "SecretFilter.swift at main · example/synthetic-project - Google Chrome",
+            "Secrets of the Nile - Wikipedia - Google Chrome",
+            "secrets-rotation (Channel) - Synthetic Co - Slack - Google Chrome",
+        ] {
+            TestSupport.expectEqual(omission("com.google.Chrome", title), nil)
+        }
+        TestSupport.expectEqual(
+            TextContextCore.fieldReadDecision(
+                bundleIdentifier: "com.google.Chrome",
+                websiteDomain: "en.wikipedia.org",
+                windowTitle: "Secrets of the Nile - Wikipedia - Google Chrome"
+            ).omission,
+            nil
+        )
+        // A coding website is still a browser page: the narrow check applies.
+        let codingPage = TextContextCore.fieldReadDecision(
+            bundleIdentifier: "com.google.Chrome",
+            websiteDomain: "github.com",
+            windowTitle: "Secret Santa bot · synthetic/credentials - Google Chrome"
+        )
+        TestSupport.expectEqual(codingPage.category, .coding)
+        TestSupport.expectEqual(codingPage.omission, nil)
+        // A secrets file's own name in a browser title still counts.
+        for title in [".env.local - Google Chrome", "id_rsa - Google Chrome", "client_secret.json - Google Chrome"] {
+            TestSupport.expectEqual(omission("com.google.Chrome", title), .secretsFile)
+        }
+
+        let terminals = [
+            "com.apple.Terminal", "com.googlecode.iTerm2", "dev.warp.Warp-Stable", "com.mitchellh.ghostty",
+            "co.zeit.hyper", "net.kovidgoyal.kitty", "com.github.wez.wezterm", "org.alacritty"
+        ]
+        for bundle in terminals {
+            TestSupport.expect(TextContextCore.isTerminal(bundleIdentifier: bundle), "\(bundle) is a terminal")
+        }
+        for bundle in ["com.microsoft.VSCode", "com.google.Chrome", nil] as [String?] {
+            TestSupport.expect(!TextContextCore.isTerminal(bundleIdentifier: bundle), "Not a terminal")
+        }
+    }
+
+    /// The category comes from the page's domain before any omission, so a chat page whose
+    /// title names a secrets file still pastes as an AI chat.
+    private static func testFieldReadDecisionKeepsPageCategory() {
+        let chat = TextContextCore.fieldReadDecision(
+            bundleIdentifier: "com.google.Chrome",
+            websiteDomain: "claude.ai",
+            windowTitle: "Explain id_ed25519.pub - Claude - Google Chrome"
+        )
+        TestSupport.expectEqual(chat.category, .aiChat)
+        TestSupport.expectEqual(chat.omission, .secretsFile)
+
+        let mail = TextContextCore.fieldReadDecision(
+            bundleIdentifier: "com.google.Chrome",
+            websiteDomain: "mail.google.com",
+            windowTitle: "Re: Rotating credentials - Gmail - Google Chrome"
+        )
+        TestSupport.expectEqual(mail.category, .email)
+        TestSupport.expectEqual(mail.omission, nil)
+
+        let bank = TextContextCore.fieldReadDecision(
+            bundleIdentifier: "com.google.Chrome", websiteDomain: "chase.com", windowTitle: ".env - Google Chrome"
+        )
+        TestSupport.expectEqual(bank.omission, .sensitiveWebsite)
+
+        let editor = TextContextCore.fieldReadDecision(
+            bundleIdentifier: "com.microsoft.VSCode", websiteDomain: nil, windowTitle: "useAuth.ts — app"
+        )
+        TestSupport.expectEqual(editor.category, TextContextCore.category(bundleIdentifier: "com.microsoft.VSCode", websiteDomain: nil))
+        TestSupport.expectEqual(editor.omission, nil)
     }
 
     private static func testPromptSectionFormatsAndNeutralizes() {
@@ -180,6 +601,15 @@ enum TextContextCoreTests {
         ))
         TestSupport.expect(omitted.contains("Field text: not read (browser address bar or controls)"), "Omissions are labeled")
         TestSupport.expect(!omitted.contains("Window:"), "A window title equal to the app name is omitted")
+
+        let secretsFile = TextContextCore.promptSection(for: TextContextSnapshot(
+            appName: "Synthetic Editor", category: .coding, omission: .secretsFile
+        ))
+        TestSupport.expect(secretsFile.contains("Field text: not read (secrets file)"), "Secrets-file omission is labeled")
+        let terminal = TextContextCore.promptSection(for: TextContextSnapshot(
+            appName: "Synthetic Terminal", category: .coding, omission: .terminal
+        ))
+        TestSupport.expect(terminal.contains("Field text: not read (terminal)"), "Terminal omission is labeled")
     }
 
     private static func testAppContextChoosesPromptSection() {

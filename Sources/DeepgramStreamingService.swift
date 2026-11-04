@@ -45,6 +45,8 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
 
     private let config: Configuration
     private let maxPendingAudioBytes: Int
+    /// The connect URL's keyterm count, for the Run Log.
+    private let connectKeytermCount: Int
 
     // Every property below is guarded by stateQueue.
     private let stateQueue = DispatchQueue(label: "com.zachlatta.freeflow.deepgram.state")
@@ -75,10 +77,19 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     private var keytermUpdateRequested = false
     /// A Configure message waiting for the socket to open.
     private var pendingKeytermUpdate: String?
+    /// Audio bytes handed to the socket, for the Run Log's keyterm timing.
+    private var audioBytesSent = 0
+    /// On-screen names and code identifiers the one Configure added; nil until it is
+    /// requested, and again if it never went out.
+    private var screenKeytermCount: Int?
+    private var identifierKeytermCount: Int?
+    /// Audio already sent when the Configure went out; 0 when it was held for the socket.
+    private var keytermUpdateAudioMilliseconds: Int?
 
     init(config: Configuration) {
         self.config = config
         maxPendingAudioBytes = DeepgramStreamingCore.maxPendingAudioBytes(sampleRate: config.sampleRate)
+        connectKeytermCount = DeepgramStreamingCore.normalizedKeyterms(config.keyterms).count
         frameAggregator = DeepgramStreamingCore.FrameAggregator(
             frameBytes: DeepgramStreamingCore.frameBytes(sampleRate: config.sampleRate)
         )
@@ -246,22 +257,43 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
 
     // MARK: Keyterms
 
-    /// Adds code identifiers from the text context to this stream's keyterms with one
-    /// mid-stream Configure message; the stream's vocabulary keyterms come first. Sent at
-    /// most once per stream, because Deepgram refuses a second Configure while one is
-    /// pending, and never after the commit. A refused update keeps the starting keyterms.
-    func updateKeyterms(_ additionalKeyterms: [String]) {
-        guard let keyterms = DeepgramStreamingCore.mergedKeyterms(base: config.keyterms, adding: additionalKeyterms),
-              let message = DeepgramStreamingCore.configureMessage(keyterms: keyterms) else { return }
+    /// Adds on-screen names, then code identifiers, to this stream's keyterms with one
+    /// Configure message planned by KeytermPlan; the connect keyterms come first, unchanged.
+    /// Sent at most once per stream, because Deepgram refuses a second Configure while one is
+    /// pending, and never after the commit. Before the socket opens it is held and sent ahead
+    /// of the buffered audio. A refused update keeps the starting keyterms. Records only
+    /// counts for keytermReport.
+    func updateKeyterms(screenTerms: [String], identifiers: [String]) {
+        guard let plan = DeepgramStreamingCore.KeytermPlan.configureTerms(
+            connect: config.keyterms, screenTerms: screenTerms, identifiers: identifiers
+        ), let message = DeepgramStreamingCore.configureMessage(keyterms: plan.terms) else { return }
         stateQueue.async { [self] in
             guard !closed, terminalError == nil, commitStartedAt == nil, socketState == .open,
                   !keytermUpdateRequested else { return }
             keytermUpdateRequested = true
+            screenKeytermCount = plan.screenCount
+            identifierKeytermCount = plan.identifierCount
             if isOpen, let task {
+                keytermUpdateAudioMilliseconds = DeepgramStreamingCore.audioMilliseconds(
+                    bytes: audioBytesSent, sampleRate: config.sampleRate
+                )
                 sendKeytermUpdateLocked(message, over: task)
             } else {
+                keytermUpdateAudioMilliseconds = 0
                 pendingKeytermUpdate = message
             }
+        }
+    }
+
+    /// Numbers only, for the Run Log.
+    var keytermReport: DeepgramStreamingCore.KeytermReport {
+        stateQueue.sync {
+            DeepgramStreamingCore.KeytermReport(
+                connectCount: connectKeytermCount,
+                screenCount: screenKeytermCount,
+                identifierCount: identifierKeytermCount,
+                audioMillisecondsBeforeUpdate: keytermUpdateAudioMilliseconds
+            )
         }
     }
 
@@ -347,6 +379,7 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
     // MARK: Locked helpers (stateQueue only)
 
     private func sendAudioLocked(_ data: Data, over task: URLSessionWebSocketTask) {
+        audioBytesSent += data.count
         task.send(.data(data)) { [weak self] error in
             guard let error, let self else { return }
             self.stateQueue.async {
@@ -377,7 +410,12 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
                 os_log(.error, log: deepgramLog, "keyterm update send failed: %{public}@", error.localizedDescription)
             }
         }
-        os_log(.info, log: deepgramLog, "sent keyterm update")
+        os_log(
+            .info, log: deepgramLog,
+            "sent keyterm update: %d terms (%d screen, %d code), %d ms audio before",
+            connectKeytermCount + (screenKeytermCount ?? 0) + (identifierKeytermCount ?? 0),
+            screenKeytermCount ?? 0, identifierKeytermCount ?? 0, keytermUpdateAudioMilliseconds ?? 0
+        )
     }
 
     /// Called once, from the receive loop's exit. The close is normal only when
@@ -444,6 +482,12 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         pendingAudio = []
         pendingAudioBytes = 0
         _ = frameAggregator.flush()
+        // A held Configure that never went out must not show in the Run Log.
+        if pendingKeytermUpdate != nil {
+            screenKeytermCount = nil
+            identifierKeytermCount = nil
+            keytermUpdateAudioMilliseconds = nil
+        }
         pendingKeytermUpdate = nil
     }
 }
