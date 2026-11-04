@@ -98,6 +98,7 @@ enum AIAppRawTranscriptPreferenceTests {
         let bundleFallbacks: [(bundleIdentifier: String, category: DictationAppCategory)] = [
             ("com.anthropic.claudefordesktop", .aiChat),
             ("com.openai.chat", .aiChat),
+            ("com.openai.codex", .aiChat),
             ("com.apple.Terminal", .coding),
             ("com.googlecode.iterm2", .coding),
             ("com.apple.Safari", .other)
@@ -108,6 +109,17 @@ enum AIAppRawTranscriptPreferenceTests {
                 fallback.category
             )
         }
+
+        // The current ChatGPT Mac app is pasted raw like chatgpt.com.
+        TestSupport.expectEqual(TextContextCore.category(bundleIdentifier: "COM.OPENAI.CODEX", websiteDomain: nil), .aiChat)
+        TestSupport.expect(
+            AIAppRawTranscriptPreference.shouldPasteRawTranscript(
+                enabled: true,
+                category: AIAppRawTranscriptPreference.resolvedCategory(textContext: nil, bundleIdentifier: "com.openai.codex"),
+                isCommandMode: false
+            ),
+            "A plain dictation into the ChatGPT app is pasted raw when the setting is on"
+        )
 
         let unknown = AIAppRawTranscriptPreference.resolvedCategory(textContext: nil, bundleIdentifier: nil)
         TestSupport.expectEqual(unknown, .other)

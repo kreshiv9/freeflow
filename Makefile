@@ -23,6 +23,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AudioLevelMeter.swift \
 	Sources/CaptureBackendPreference.swift \
 	Sources/CaptureFormatPreference.swift \
+	Sources/CleanupFastPath.swift \
 	Sources/CleanupLevel.swift \
 	Sources/CommandModeIntent.swift \
 	Sources/ContextInferenceFailure.swift \

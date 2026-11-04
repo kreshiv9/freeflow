@@ -42,6 +42,15 @@ public struct ModelConfiguration {
         "qwen/qwen3.8-27b"
     ]
 
+    /// Cleanup defaults. Qwen 3.8 is the only Groq model that turns reasoning fully off
+    /// ("none"); gpt-oss always reasons first, so it is the fallback, which keeps the
+    /// primary and fallback distinct.
+    static let defaultCleanupModel = "qwen/qwen3.8-27b"
+    static let defaultCleanupFallbackModel = "openai/gpt-oss-20b"
+    static let previousDefaultCleanupModel = "openai/gpt-oss-20b"
+    static let previousDefaultCleanupFallbackModel = "qwen/qwen3.8-27b"
+    static let cleanupDefaultMigrationKey = "post_processing_default_qwen_migrated"
+
     // MARK: - Vision-capable models
 
     /// Models that accept image input. The context model must support vision for screenshot analysis to work.
@@ -54,18 +63,90 @@ public struct ModelConfiguration {
         "whisper-large-v3-turbo"
     ]
 
+    static func isGroqEndpoint(_ baseURL: String) -> Bool {
+        guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+        return url.scheme?.lowercased() == "https"
+            && url.host?.lowercased() == "api.groq.com"
+            && url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == "openai/v1"
+    }
+
     /// Only migrate retired IDs on Groq's own endpoint. Other providers can
     /// still serve Qwen 3.6 under the same model name.
     static func migrateGroqSelection(key: String, baseURL: String, defaults: UserDefaults) {
-        guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
-              url.scheme?.lowercased() == "https",
-              url.host?.lowercased() == "api.groq.com",
-              url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == "openai/v1",
+        guard isGroqEndpoint(baseURL),
               let stored = defaults.string(forKey: key) else { return }
         let model = stored.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if model == "qwen/qwen3.6-27b" || model == "qwen3.6-27b" {
             defaults.set("qwen/qwen3.8-27b", forKey: key)
         }
+    }
+
+    /// One-time move of the cleanup default from gpt-oss-20b to Qwen 3.8. A stored value
+    /// equal to the old default cannot be told apart from an explicit choice, so the flag
+    /// is set first and the move never repeats: switching back in Settings sticks. Any
+    /// other stored model is kept. Off Groq, unset keys are pinned to the old pair so
+    /// another provider is never sent Groq's Qwen ID.
+    static func migrateCleanupDefault(modelKey: String, fallbackKey: String, baseURL: String, defaults: UserDefaults) {
+        guard !defaults.bool(forKey: cleanupDefaultMigrationKey) else { return }
+        defaults.set(true, forKey: cleanupDefaultMigrationKey)
+
+        // A blank value (Settings can store one) loads as the default, so it counts as unset.
+        func storedModel(_ key: String) -> String? {
+            guard let stored = defaults.string(forKey: key)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !stored.isEmpty else { return nil }
+            return stored
+        }
+        let stored = storedModel(modelKey)
+        guard stored == nil || stored == previousDefaultCleanupModel else { return }
+
+        guard isGroqEndpoint(baseURL) else {
+            if stored == nil {
+                defaults.set(previousDefaultCleanupModel, forKey: modelKey)
+            }
+            if storedModel(fallbackKey) == nil {
+                defaults.set(previousDefaultCleanupFallbackModel, forKey: fallbackKey)
+            }
+            return
+        }
+
+        if stored != nil {
+            defaults.set(defaultCleanupModel, forKey: modelKey)
+        }
+        // The primary is now Qwen; a fallback still on the old default would equal it and
+        // remove the retry.
+        if storedModel(fallbackKey) == previousDefaultCleanupFallbackModel {
+            defaults.set(defaultCleanupFallbackModel, forKey: fallbackKey)
+        }
+    }
+
+    /// The fallback to store after the cleanup primary changes, or nil to keep it. A fallback
+    /// equal to the primary means no retry, so on Groq a primary that lands on the fallback's
+    /// built-in model (switching back to gpt-oss-20b, the default fallback) moves the fallback
+    /// to the other built-in model: the retry stays and Settings shows the model retried.
+    /// Other providers are never sent a model the user did not pick.
+    static func cleanupFallback(afterSelectingPrimary primary: String, fallback: String, baseURL: String) -> String? {
+        guard isGroqEndpoint(baseURL) else { return nil }
+        let trimmedPrimary = primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A blank primary loads as the default.
+        let resolvedPrimary = trimmedPrimary.isEmpty ? defaultCleanupModel : trimmedPrimary
+        guard fallback.trimmingCharacters(in: .whitespacesAndNewlines) == resolvedPrimary else { return nil }
+        switch resolvedPrimary {
+        case defaultCleanupModel: return defaultCleanupFallbackModel
+        case defaultCleanupFallbackModel: return defaultCleanupModel
+        default: return nil
+        }
+    }
+
+    /// The fallback that replaces a stored retired Llama 4 Scout fallback: the endpoint's
+    /// default fallback (gpt-oss-20b on Groq, Qwen 3.8 elsewhere, as before), or the other
+    /// built-in model when the primary already is that one, so the retry stays.
+    static func replacementForRetiredCleanupFallback(primary: String, baseURL: String) -> String {
+        let trimmedPrimary = primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A blank primary loads as the default.
+        let resolvedPrimary = trimmedPrimary.isEmpty ? defaultCleanupModel : trimmedPrimary
+        let preferred = isGroqEndpoint(baseURL) ? defaultCleanupFallbackModel : previousDefaultCleanupFallbackModel
+        guard resolvedPrimary == preferred else { return preferred }
+        return preferred == defaultCleanupModel ? defaultCleanupFallbackModel : defaultCleanupModel
     }
 
     public static func config(for model: String) -> ModelConfig {

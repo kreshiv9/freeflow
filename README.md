@@ -86,7 +86,7 @@ Local models are often slower than hosted providers, especially on cold start, l
 <details>
   <summary>Configure longer timeouts for local models</summary>
 
-  FreeFlow keeps the default network timeout at 20 seconds, but you can extend it with macOS defaults:
+  FreeFlow keeps the default network timeout at 20 seconds, but you can extend it with macOS defaults. One exception applies only to Groq's own endpoint (`https://api.groq.com/openai/v1`): cleanup of a new dictation waits at most 2.5 seconds. If cleanup misses that, FreeFlow pastes your transcript with local formatting and the Run Log shows "Cleanup timed out, using raw transcript". Any other API base URL, including local models, keeps 20 seconds, and so do Edit Mode, dictations with an Output Language, and Run Log retries.
 
 ```bash
 defaults write com.zachlatta.freeflow transcription_timeout_seconds -float 120
@@ -97,10 +97,10 @@ defaults write com.zachlatta.freeflow context_request_timeout_seconds -float 120
 The timeout keys are:
 
 - `transcription_timeout_seconds`: audio transcription requests
-- `post_processing_timeout_seconds`: transcript cleanup and edit mode requests
+- `post_processing_timeout_seconds`: transcript cleanup and edit mode requests; a positive value also replaces the 2.5-second Groq dictation cleanup budget
 - `context_request_timeout_seconds`: nearby app context requests
 
-Only positive values are used. Remove a custom timeout to return to the 20-second default:
+Only positive values are used. Remove a custom timeout to return to the defaults:
 
 ```bash
 defaults delete com.zachlatta.freeflow transcription_timeout_seconds

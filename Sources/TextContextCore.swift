@@ -136,8 +136,9 @@ enum TextContextCore {
     private static let personalMessagingDomains = [
         "web.whatsapp.com", "web.telegram.org", "discord.com", "messenger.com"
     ]
+    /// The current ChatGPT Mac app ships as com.openai.codex; com.openai.chat is ChatGPT Classic.
     private static let aiChatApps: Set<String> = [
-        "com.openai.chat", "com.anthropic.claudefordesktop", "ai.perplexity.mac"
+        "com.openai.chat", "com.openai.codex", "com.anthropic.claudefordesktop", "ai.perplexity.mac"
     ]
     private static let aiChatDomains = [
         "chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com", "perplexity.ai",
