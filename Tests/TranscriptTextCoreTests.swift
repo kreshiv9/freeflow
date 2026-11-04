@@ -24,6 +24,8 @@ enum TranscriptTextCoreTests {
         testEchoedPromptScaffoldingIsStripped()
         testContentLossGuardCatchesDroppedSentence()
         testContentLossGuardAllowsNormalCleanup()
+        testMeaningGuardCatchesNegationAndNumberChanges()
+        testMeaningGuardAllowsEquivalentRewrites()
     }
 
     private static func testEchoedPromptScaffoldingIsStripped() {
@@ -101,6 +103,66 @@ enum TranscriptTextCoreTests {
         TestSupport.expect(
             !TranscriptOutputSanitizer.appearsToHaveDroppedContent(
                 rawTranscript: translated, cleanedTranscript: "Deberíamos mover la revisión al jueves.", allowsRewording: false, outputLanguage: "Spanish"
+            ),
+            "Translation is exempt"
+        )
+    }
+
+    private static func testMeaningGuardCatchesNegationAndNumberChanges() {
+        let cases: [(raw: String, cleaned: String)] = [
+            ("please do not merge the release branch until friday", "Please merge the release branch until Friday."),
+            ("we can\u{2019}t ship the synthetic build today", "We can ship the synthetic build today."),
+            ("we can't ship the synthetic build today", "We can ship the synthetic build today."),
+            ("never push straight to main", "Push straight to main."),
+            // A dropped number, then a changed one.
+            ("set the retry limit to 15 and the timeout to 30 seconds", "Set the retry limit to 15 and the timeout to seconds."),
+            ("set the retry limit to 15 and the timeout to 30 seconds", "Set the retry limit to 50 and the timeout to 30 seconds."),
+            // EMPTY output for a dictation that was not filler.
+            ("not now", "")
+        ]
+        for (raw, cleaned) in cases {
+            TestSupport.expect(
+                TranscriptOutputSanitizer.appearsToHaveChangedNegationOrNumber(
+                    rawTranscript: raw, cleanedTranscript: cleaned, outputLanguage: ""
+                ),
+                "The meaning guard must trip: \(raw) -> \(cleaned)"
+            )
+        }
+    }
+
+    private static func testMeaningGuardAllowsEquivalentRewrites() {
+        let cases: [(raw: String, cleaned: String)] = [
+            ("please do not merge it yet", "Please don't merge it yet."),
+            ("please do not merge it yet", "Please don\u{2019}t merge it yet."),
+            ("we cannot ship it", "We can't ship it."),
+            ("we can not ship it", "We cannot ship it."),
+            ("set the retry limit to five", "Set the retry limit to 5."),
+            ("the budget is 1,000 dollars", "The budget is $1000."),
+            ("the budget is 1000 dollars", "The budget is $1,000."),
+            ("meet at 3:30 tomorrow", "Meet at 3:30 tomorrow."),
+            ("version 2.5 is out", "Version 2.5 is out."),
+            // An added negation is not checked.
+            ("dont merge it", "Don't merge it."),
+            // An explicit self-correction skips the check.
+            ("send it at 2 actually 3", "Send it at 3."),
+            ("do not ship it, scratch that, ship it", "Ship it."),
+            // "no" is not counted: it is also a correction marker.
+            ("send it monday no tuesday", "Send it Tuesday."),
+            ("add notes about nothing new", "Add notes about nothing new."),
+            // Snippet placeholders are checked by the snippet plan.
+            ("look at \u{27E6}S1\u{27E7} now", "Look at now.")
+        ]
+        for (raw, cleaned) in cases {
+            TestSupport.expect(
+                !TranscriptOutputSanitizer.appearsToHaveChangedNegationOrNumber(
+                    rawTranscript: raw, cleanedTranscript: cleaned, outputLanguage: ""
+                ),
+                "The meaning guard must not trip: \(raw) -> \(cleaned)"
+            )
+        }
+        TestSupport.expect(
+            !TranscriptOutputSanitizer.appearsToHaveChangedNegationOrNumber(
+                rawTranscript: "we did not approve it", cleanedTranscript: "Lo aprobamos.", outputLanguage: "Spanish"
             ),
             "Translation is exempt"
         )

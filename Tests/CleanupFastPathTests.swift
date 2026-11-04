@@ -9,6 +9,7 @@ enum CleanupFastPathTests {
         testCustomSystemPrompt()
         testSearchBox()
         testSearchBoxNeedsQueryShape()
+        testSearchBoxIgnoresPausePunctuation()
         testPastedText()
         testPlanText()
         testTimedOutText()
@@ -49,7 +50,11 @@ enum CleanupFastPathTests {
             "Yes.",
             "Open the settings page!",
             "Sounds good. See you then.",
-            "Please send the synthetic quarterly report to the whole team by Friday."
+            "Please send the synthetic quarterly report to the whole team by Friday.",
+            // "just" usually carries meaning, a comma the grammar needs, and a three-word sentence.
+            "Just ship it.",
+            "Run the linter, then push.",
+            "Done. See you tomorrow."
         ] {
             TestSupport.expectEqual(reason(transcript), .alreadyClean)
         }
@@ -118,7 +123,23 @@ enum CleanupFastPathTests {
             "?!",
             ". . .",
             "(...)",
-            "- ."
+            "- .",
+            // Discourse fillers the prompt removes.
+            "It was like really fast.",
+            "So the build passed.",
+            "Okay so the build passed.",
+            "Ok, so run it again.",
+            "We ship Friday, right?",
+            "The build passed. So we can ship.",
+            // Pause punctuation: a fragment split off by a period, a comma beside a function word.
+            "Move the button. To the left side.",
+            "Run the tests. And then deploy.",
+            "Ship the fix. Tonight.",
+            "I fixed the bug. Last night.",
+            "Open the, settings page.",
+            "Send it to the. Design team.",
+            "Check, the logs again.",
+            "Add a test, for the parser."
         ] {
             TestSupport.expect(reason(transcript) == nil, "Must reach cleanup: \(transcript)")
             TestSupport.expect(!CleanupFastPath.isAlreadyClean(transcript), "Must not be clean: \(transcript)")
@@ -262,7 +283,12 @@ enum CleanupFastPathTests {
             "weather in tokyo - in tokyo",
             "Weather in Tokyo, um, tomorrow?",
             "Weather in Tokyo. No wait, Osaka.",
-            "weather in tokyo comma japan"
+            "weather in tokyo comma japan",
+            "so cheap flights to boston",
+            "okay so pizza near me",
+            "cheap flights to boston right?",
+            // Over-inclusive: any "like" goes to the model.
+            "pizza places like this one"
         ] {
             TestSupport.expect(reason(messy, websiteDomain: "google.com") == nil, "Messy search reaches cleanup: \(messy)")
             TestSupport.expect(
@@ -289,6 +315,19 @@ enum CleanupFastPathTests {
         TestSupport.expect(
             reason(query, websiteDomain: "google.com", hasCustomSystemPrompt: true) == nil,
             "A custom prompt runs in the search box"
+        )
+    }
+
+    /// The pause-punctuation rule is the already-clean rule's alone: a pause comma in a search
+    /// query is harmless, so the search box changes only for fillers.
+    private static func testSearchBoxIgnoresPausePunctuation() {
+        for query in ["flights to boston, for the weekend", "Weather in Tokyo. Tomorrow."] {
+            TestSupport.expectEqual(reason(query, websiteDomain: "google.com"), .searchBox)
+            TestSupport.expect(reason(query) == nil, "Pause punctuation outside the search box reaches cleanup: \(query)")
+        }
+        TestSupport.expect(
+            !CleanupFastPath.isAlreadyClean("Flights to Boston, for the weekend."),
+            "A comma before a function word is a pause"
         )
     }
 

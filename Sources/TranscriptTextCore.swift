@@ -410,4 +410,40 @@ enum TranscriptOutputSanitizer {
     private static func contentWords(in text: String) -> Set<String> {
         Set(words(in: text).filter { $0.count > 1 && !stopWords.contains($0) && !rewrittenWords.contains($0) })
     }
+
+    // MARK: - Negation and number guard
+
+    /// "not", "never", "cannot" and every n't contraction, straight or curly. "no" is left out
+    /// because it is also a backtrack marker ("Monday, no, Tuesday").
+    private static let negationPattern = try! NSRegularExpression(pattern: #"(?i)\b(?:not|never|cannot)\b|n['’]t\b"#)
+
+    /// True when cleanup removed a negation or lost a number the speaker never retracted. "do not"
+    /// -> "don't" and "five" -> "5" pass; an added negation or digit is not checked. Skipped for
+    /// translation and whenever the speaker used an explicit backtrack marker, like
+    /// appearsToHaveDroppedContent.
+    static func appearsToHaveChangedNegationOrNumber(
+        rawTranscript: String,
+        cleanedTranscript: String,
+        outputLanguage: String
+    ) -> Bool {
+        guard outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              rawTranscript.range(of: backtrackMarkerPattern, options: .regularExpression) == nil else {
+            return false
+        }
+        if negationCount(in: cleanedTranscript) < negationCount(in: rawTranscript) { return true }
+        return !digitRuns(in: rawTranscript).isSubset(of: digitRuns(in: cleanedTranscript))
+    }
+
+    private static func negationCount(in text: String) -> Int {
+        negationPattern.numberOfMatches(in: text, range: NSRange(text.startIndex..., in: text))
+    }
+
+    /// ASCII digit runs. A thousands comma between digits is removed so "1,000" and "1000" match,
+    /// and snippet placeholders (⟦S1⟧) are skipped because SnippetExpansionPlan.resolve reports a
+    /// dropped one.
+    private static func digitRuns(in text: String) -> Set<String> {
+        let withoutPlaceholders = text.replacingOccurrences(of: "\u{27E6}[^\u{27E7}]*\u{27E7}", with: " ", options: .regularExpression)
+        let joined = withoutPlaceholders.replacingOccurrences(of: #"(?<=[0-9]),(?=[0-9])"#, with: "", options: .regularExpression)
+        return Set(joined.split { !($0.isASCII && $0.isNumber) }.map(String.init))
+    }
 }
