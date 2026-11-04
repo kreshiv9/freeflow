@@ -31,7 +31,7 @@ enum StreamingTranscriptionProvider: String, CaseIterable, Identifiable {
         case .openAIRealtime:
             "Streams audio through the provider's OpenAI-compatible /v1/realtime WebSocket so transcription runs while you speak."
         case .deepgram:
-            "Deepgram Nova-3 transcribes while you talk, so the text is ready when you release the key. Your custom vocabulary, corrections and, in Cursor, Windsurf and VS Code, visible code names are sent as key terms."
+            "Deepgram Nova-3 transcribes while you talk, so the text is ready when you release the key. Your custom vocabulary and corrections are sent as key terms. With Context Awareness on, so are your Mac account name, visible code names in Cursor, Windsurf and VS Code, and names on screen in the Claude Code panel, ChatGPT in Chrome or the ChatGPT app, and Google search in Chrome."
         }
     }
 
@@ -78,7 +78,9 @@ enum StreamingTranscriptionProvider: String, CaseIterable, Identifiable {
 /// from the commit makes resolveRawTranscript fall back to the file upload.
 /// Class-bound so AppState's `[weak service]` capture keeps working.
 protocol StreamingTranscriptionSession: AnyObject {
-    /// PipelineStageTimings source label recorded by resolveRawTranscript.
+    /// PipelineStageTimings source label, read by resolveRawTranscript after a
+    /// successful commit; a session may refine it to the path that produced the
+    /// text (Deepgram does).
     var transcriptionSource: String { get }
     func start() throws
     func appendPCM16(_ data: Data)

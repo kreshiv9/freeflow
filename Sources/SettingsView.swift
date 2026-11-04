@@ -605,20 +605,6 @@ struct DebugSettingsView: View {
                         }
                     }
                 }
-
-                SettingsCard("Update Overlay", icon: "arrow.down.circle") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Display the update available overlay after dictation finishes.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        Toggle("Show after dictation", isOn: $appState.debugShowsUpdateReminderAfterDictation)
-
-                        Button("Show Update Overlay Now") {
-                            appState.showDebugUpdateAvailableOverlay()
-                        }
-                    }
-                }
             }
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -647,9 +633,7 @@ struct GeneralSettingsView: View {
     @State private var showMutedHint = false
     @State private var copiedBuildInfo = false
     @State private var copiedBuildInfoResetWorkItem: DispatchWorkItem?
-    @StateObject private var githubCache = GitHubMetadataCache.shared
-    @ObservedObject private var updateManager = UpdateManager.shared
-    private let freeflowRepoURL = URL(string: "https://github.com/zachlatta/freeflow")!
+    private let freeflowRepoURL = UpdateManager.sourceRepositoryURL
 
     private var appDisplayName: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
@@ -704,93 +688,19 @@ struct GeneralSettingsView: View {
                         .foregroundStyle(.secondary)
 
                     // GitHub card
-                    VStack(spacing: 10) {
-                        HStack(spacing: 8) {
-                            AsyncImage(url: URL(string: "https://avatars.githubusercontent.com/u/992248")) { phase in
-                                switch phase {
-                                case .success(let image):
-                                    image.resizable().aspectRatio(contentMode: .fill)
-                                default:
-                                    Color.gray.opacity(0.2)
-                                }
-                            }
-                            .frame(width: 22, height: 22)
-                            .clipShape(Circle())
-
-                            Button {
-                                openURL(freeflowRepoURL)
-                            } label: {
-                                Text("zachlatta/freeflow")
-                                    .font(.system(.caption, design: .monospaced).weight(.medium))
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.blue)
-
-                            Spacer()
-
-                            HStack(spacing: 4) {
-                                Image(systemName: "star.fill")
-                                    .foregroundStyle(.yellow)
-                                    .font(.caption2)
-                                if githubCache.isLoading {
-                                    ProgressView().scaleEffect(0.5)
-                                } else if let count = githubCache.starCount {
-                                    Text("\(count.formatted()) \(count == 1 ? "star" : "stars")")
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Capsule().fill(Color.yellow.opacity(0.14)))
-
-                            Button {
-                                openURL(freeflowRepoURL)
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "star")
-                                    Text("Star")
-                                }
-                                .font(.caption.weight(.semibold))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Capsule().fill(Color.yellow.opacity(0.18)))
-                            }
-                            .buttonStyle(.plain)
+                    VStack(spacing: 6) {
+                        Button {
+                            openURL(freeflowRepoURL)
+                        } label: {
+                            Text(UpdateManager.sourceRepositoryName)
+                                .font(.system(.caption, design: .monospaced).weight(.medium))
                         }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.blue)
 
-                        if !githubCache.recentStargazers.isEmpty {
-                            Divider()
-                            HStack(spacing: 8) {
-                                HStack(spacing: -6) {
-                                    ForEach(githubCache.recentStargazers) { star in
-                                        Button {
-                                            openURL(star.user.htmlUrl)
-                                        } label: {
-                                            AsyncImage(url: star.user.avatarThumbnailUrl) { phase in
-                                                switch phase {
-                                                case .success(let image):
-                                                    image.resizable().aspectRatio(contentMode: .fill)
-                                                default:
-                                                    Color.gray.opacity(0.2)
-                                                }
-                                            }
-                                            .frame(width: 22, height: 22)
-                                            .clipShape(Circle())
-                                            .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                                .clipped()
-                                Text("recently starred")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .fixedSize()
-                                Spacer()
-                            }
-                            .clipped()
-                        }
+                        Text("Based on FreeFlow by Zach Latta")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
                     }
                     .padding(12)
                     .background(
@@ -880,7 +790,6 @@ struct GeneralSettingsView: View {
             customVocabularyInput = appState.customVocabulary
             checkMicPermission()
             appState.refreshLaunchAtLoginStatus()
-            Task { await githubCache.fetchIfNeeded() }
         }
         .onDisappear {
             apiDraft.dismiss()
@@ -928,122 +837,10 @@ struct GeneralSettingsView: View {
     // MARK: Updates
 
     private var updatesSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Toggle("Automatically check for updates", isOn: Binding(
-                get: { updateManager.autoCheckEnabled },
-                set: { updateManager.autoCheckEnabled = $0 }
-            ))
-
-            HStack(spacing: 10) {
-                Button {
-                    Task {
-                        await updateManager.checkForUpdates(userInitiated: true)
-                    }
-                } label: {
-                    if updateManager.isChecking {
-                        HStack(spacing: 6) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Checking...")
-                        }
-                    } else {
-                        Text("Check for Updates Now")
-                    }
-                }
-                .disabled(updateManager.isChecking || updateManager.updateStatus != .idle)
-
-                if let lastCheck = updateManager.lastCheckDate {
-                    Text("Last checked: \(lastCheck.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            if updateManager.updateAvailable {
-                VStack(alignment: .leading, spacing: 8) {
-                    switch updateManager.updateStatus {
-                    case .downloading:
-                        HStack(spacing: 8) {
-                            Image(systemName: "arrow.down.circle.fill")
-                                .foregroundStyle(.blue)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Downloading update...")
-                                    .font(.caption.weight(.semibold))
-                                ProgressView(value: updateManager.downloadProgress ?? 0)
-                                    .progressViewStyle(.linear)
-                                if let progress = updateManager.downloadProgress {
-                                    Text("\(Int(progress * 100))%")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            Spacer()
-                            Button("Cancel") {
-                                updateManager.cancelDownload()
-                            }
-                            .font(.caption)
-                        }
-
-                    case .installing:
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Installing update...")
-                                .font(.caption.weight(.semibold))
-                        }
-
-                    case .readyToRelaunch:
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Relaunching...")
-                                .font(.caption.weight(.semibold))
-                        }
-
-                    case .error(let message):
-                        HStack(spacing: 8) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.red)
-                            Text(message)
-                                .font(.caption)
-                                .foregroundStyle(.red)
-                            Spacer()
-                            Button("Retry") {
-                                updateManager.updateStatus = .idle
-                                if let release = updateManager.latestRelease {
-                                    updateManager.downloadAndInstall(release: release)
-                                }
-                            }
-                            .font(.caption)
-                        }
-
-                    case .idle:
-                        HStack(spacing: 8) {
-                            Image(systemName: "arrow.down.circle.fill")
-                                .foregroundStyle(.blue)
-                            Text(updateManager.latestReleaseVersion.isEmpty
-                                ? "A new version of \(AppName.displayName) is available!"
-                                : "\(AppName.displayName) v\(updateManager.latestReleaseVersion) is available!")
-                                .font(.caption.weight(.semibold))
-                            Spacer()
-                            Button("What's New") {
-                                updateManager.showReleaseNotes()
-                            }
-                            .font(.caption)
-                            Button("Update Now") {
-                                if let release = updateManager.latestRelease {
-                                    updateManager.downloadAndInstall(release: release)
-                                }
-                            }
-                            .font(.caption)
-                        }
-                    }
-                }
-                .padding(10)
-                .background(Color.blue.opacity(0.1))
-                .cornerRadius(6)
-            }
-        }
+        Text("\(AppName.displayName) never checks for updates. To update, pull the latest \(UpdateManager.sourceRepositoryName) and rebuild.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: Build
@@ -1098,6 +895,10 @@ struct GeneralSettingsView: View {
     private var apiKeySection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("\(AppName.displayName) uses the configured transcription model with your selected OpenAI-compatible provider.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text("API keys are stored in your macOS Keychain when it is available, otherwise in a private settings file on this Mac.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -1501,7 +1302,7 @@ struct GeneralSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Context awareness", isOn: $appState.contextAwarenessEnabled)
 
-            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. In Cursor, Windsurf and VS Code it also reads file names and the variable and function names visible in other editor panes; those names are sent with the cleanup request and, with Deepgram streaming, to Deepgram as key terms. Password fields, browser address bars, password managers, and banking sites are skipped. Reading is skipped if it takes too long, so dictation is never slowed down.")
+            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. In Cursor, Windsurf and VS Code it also reads file names and the variable and function names visible in other editor panes; those names are sent with the cleanup request and, with Deepgram streaming, to Deepgram as key terms. With Deepgram streaming, your Mac account name and names from Chrome (chatgpt.com, google.com), the ChatGPT app and the Claude Code panel in VS Code are also sent to Deepgram as key terms; Chrome Incognito and Guest windows are skipped when Chrome's English title markers are present. Password fields, browser address bars, password managers, banking sites, terminals, and windows whose title names a secrets file such as .env are skipped, and common key and password patterns are redacted. Reading is skipped if it takes too long, so dictation is never slowed down.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -2783,6 +2584,19 @@ struct RunLogEntryView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Text(summaryLine)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+
+                    // Deepgram keyterm counts
+                    if let keytermLine = item.stageTimings?.keytermLine, !keytermLine.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "textformat.abc")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(keytermLine)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)

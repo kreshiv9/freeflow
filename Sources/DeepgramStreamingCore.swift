@@ -11,14 +11,15 @@ enum DeepgramStreamingError: LocalizedError, Equatable {
     case socketClosedBeforeCommit
     /// Deepgram sent `{"type":"Error"}`; the message is kept for tests, not described.
     case serverError(String)
-    /// The socket closed abnormally after the commit, before Metadata arrived.
+    /// The socket closed abnormally after the commit, before the from_finalize
+    /// final or Metadata arrived.
     case socketClosedBeforeFinal
-    /// CommitPolicy.timeout elapsed without Metadata or a close.
+    /// CommitPolicy.timeout elapsed without the from_finalize final, Metadata or a close.
     case commitTimedOut
     /// The stream ended without a single Results frame: no audio was processed.
     case noResults
-    /// Deepgram reported speech in an interim result that it never finalized.
-    case incompleteTranscript
+    /// Deepgram returned no words although the recorder counted speech.
+    case emptyTranscriptForSpeech
 
     var errorDescription: String? {
         switch self {
@@ -28,14 +29,14 @@ enum DeepgramStreamingError: LocalizedError, Equatable {
         case .socketClosedBeforeFinal: "Deepgram socket closed before the final transcript arrived"
         case .commitTimedOut: "Deepgram did not finish the transcript in time"
         case .noResults: "Deepgram processed no audio"
-        case .incompleteTranscript: "Deepgram did not finalize the whole transcript"
+        case .emptyTranscriptForSpeech: "Deepgram returned no words for recorded speech"
         }
     }
 }
 
 /// Pure rules for the Deepgram Nova-3 streaming path: URL building, keyterm
-/// normalization, audio framing, server-message parsing, transcript assembly and
-/// the commit, keep-alive and key-validation decisions. Never logs, and never
+/// normalization and budget, audio framing, server-message parsing, transcript
+/// assembly and the commit, keep-alive and key-validation decisions. Never logs, and never
 /// embeds the key or transcript text in anything it produces.
 enum DeepgramStreamingCore {
     static let listenEndpoint = URL(string: "wss://api.deepgram.com/v1/listen")!
@@ -126,9 +127,9 @@ enum DeepgramStreamingCore {
     /// Trims; collapses internal whitespace runs (spaces, tabs, CR/LF) to one
     /// space; drops empties and terms longer than maxKeytermLength (dropped, not
     /// cut: a truncated phrase boosts a wrong spelling); dedupes
-    /// case-insensitively keeping the first spelling; stops at maxKeyterms or
-    /// when the running character total would exceed maxKeytermTotalCharacters.
-    /// Order is preserved, so vocabulary entries come before correction targets.
+    /// case-insensitively keeping the first spelling; stops at maxKeyterms. A term
+    /// that would take the running character total past maxKeytermTotalCharacters
+    /// is skipped, and later, shorter terms are still tried. Order is preserved.
     static func normalizedKeyterms(_ terms: [String]) -> [String] {
         var seen = Set<String>()
         var result: [String] = []
@@ -138,10 +139,8 @@ enum DeepgramStreamingCore {
             guard !collapsed.isEmpty, collapsed.count <= maxKeytermLength else { continue }
             let key = collapsed.lowercased()
             guard !seen.contains(key) else { continue }
-            guard result.count < maxKeyterms,
-                  totalCharacters + collapsed.count <= maxKeytermTotalCharacters else {
-                break
-            }
+            guard result.count < maxKeyterms else { break }
+            guard totalCharacters + collapsed.count <= maxKeytermTotalCharacters else { continue }
             seen.insert(key)
             result.append(collapsed)
             totalCharacters += collapsed.count
@@ -156,17 +155,121 @@ enum DeepgramStreamingCore {
         normalizedKeyterms(text.components(separatedBy: CharacterSet(charactersIn: "\n\r,;")))
     }
 
-    /// Code identifiers added to one stream's keyterms, at most.
-    static let maxContextKeyterms = 50
+    /// The ranked keyterm budget. The connect URL carries the user's own terms: correction
+    /// targets, then Custom Vocabulary, then the user's name, then a learned slice. One
+    /// Configure then adds on-screen names and IDE identifiers, about targetTotal terms in
+    /// all with at least minimumScreenSlots for the screen. Every tier dedupes
+    /// case-insensitively (the first spelling wins), drops terms over maxKeytermLength and
+    /// stops at maxKeyterms; a term that would pass maxKeytermTotalCharacters is skipped.
+    enum KeytermPlan {
+        /// Deepgram advises focusing on the most important 20-50 terms.
+        static let targetTotal = 50
+        static let minimumScreenSlots = 15
+        static let maxOwnNameTerms = 2
+        static let learnedSlots = 10...25
+        /// Rollback switch for sending the Mac account name.
+        static let sendsOwnName = true
 
-    /// The stream's own keyterms followed by up to maxContextKeyterms identifiers, normalized,
-    /// so the vocabulary terms always survive maxKeyterms and maxKeytermTotalCharacters.
-    /// Dotted member paths are never spoken, so they are left out. nil when nothing new
-    /// would be added: then no update is sent.
-    static func mergedKeyterms(base: [String], adding identifiers: [String]) -> [String]? {
-        let current = normalizedKeyterms(base)
-        let merged = normalizedKeyterms(current + identifiers.filter { !$0.contains(".") }.prefix(maxContextKeyterms))
-        return merged == current ? nil : merged
+        struct Tiers: Equatable {
+            /// The `to` of each usable correction rule, in list order.
+            var correctionTargets: [String] = []
+            /// Custom Vocabulary terms in the user's order.
+            var vocabulary: [String] = []
+            var ownName: [String] = []
+            /// Ranked learned terms; nothing supplies them yet.
+            var learned: [String] = []
+        }
+
+        private struct Fit {
+            var terms: [String] = []
+            var seen = Set<String>()
+            var characters = 0
+        }
+
+        /// Adds up to `limit` new terms in order and returns how many were added.
+        private static func append(_ terms: [String], to fit: inout Fit, limit: Int) -> Int {
+            var added = 0
+            for term in terms {
+                guard fit.terms.count < maxKeyterms, added < limit else { break }
+                let collapsed = term.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                guard !collapsed.isEmpty, collapsed.count <= maxKeytermLength else { continue }
+                let key = collapsed.lowercased()
+                guard !fit.seen.contains(key),
+                      fit.characters + collapsed.count <= maxKeytermTotalCharacters else { continue }
+                fit.seen.insert(key)
+                fit.terms.append(collapsed)
+                fit.characters += collapsed.count
+                added += 1
+            }
+            return added
+        }
+
+        /// The connect URL's list. Correction targets and vocabulary are never cut below the
+        /// hard caps; the own name adds at most maxOwnNameTerms; the learned slice adds up to
+        /// targetTotal minus the manual terms kept, clamped to learnedSlots.
+        static func connectTerms(_ tiers: Tiers) -> [String] {
+            var fit = Fit()
+            let manualAdded = append(tiers.correctionTargets, to: &fit, limit: .max)
+                + append(tiers.vocabulary, to: &fit, limit: .max)
+            _ = append(tiers.ownName, to: &fit, limit: maxOwnNameTerms)
+            let learnedLimit = min(max(targetTotal - manualAdded, learnedSlots.lowerBound), learnedSlots.upperBound)
+            _ = append(tiers.learned, to: &fit, limit: learnedLimit)
+            return fit.terms
+        }
+
+        /// The one Configure's list: the connect list unchanged (a Configure replaces the
+        /// whole list), then screen names, then identifiers, together limited to
+        /// max(minimumScreenSlots, targetTotal - connect count). Dotted member paths are never
+        /// spoken, so no dotted identifier and no screen name with a dot outside a version
+        /// number (a host or domain) is sent; GPT-4.5 is. A secret-like term never leaves the
+        /// Mac. Nil when nothing new fits: then no Configure is sent. `screenCount` counts the
+        /// on-screen names added, `identifierCount` the identifiers.
+        static func configureTerms(
+            connect: [String],
+            screenTerms: [String],
+            identifiers: [String]
+        ) -> (terms: [String], screenCount: Int, identifierCount: Int)? {
+            var fit = Fit()
+            _ = append(connect, to: &fit, limit: .max)
+            let slots = max(minimumScreenSlots, targetTotal - fit.terms.count)
+            let namesAdded = append(
+                screenTerms.filter { !isDottedName($0) && !SecretFilter.isSecretLike($0) },
+                to: &fit,
+                limit: slots
+            )
+            let identifiersAdded = append(
+                identifiers.filter { !$0.contains(".") && !SecretFilter.isSecretLike($0) },
+                to: &fit,
+                limit: slots - namesAdded
+            )
+            return namesAdded + identifiersAdded > 0 ? (fit.terms, namesAdded, identifiersAdded) : nil
+        }
+
+        /// A "." anywhere but between two digits: devbox.example.internal, Next.js.
+        private static func isDottedName(_ term: String) -> Bool {
+            let characters = Array(term)
+            return characters.indices.contains { index in
+                characters[index] == "."
+                    && !(index > 0 && characters[index - 1].isNumber
+                        && index + 1 < characters.count && characters[index + 1].isNumber)
+            }
+        }
+    }
+
+    /// Numbers only, for the Run Log: the connect URL's keyterm count, the on-screen names and
+    /// the code identifiers the one Configure added (nil when none went out) and the audio
+    /// already sent before it (0 when it went out ahead of the buffered audio).
+    struct KeytermReport: Equatable, Sendable {
+        let connectCount: Int
+        let screenCount: Int?
+        let identifierCount: Int?
+        let audioMillisecondsBeforeUpdate: Int?
+    }
+
+    /// Milliseconds of mono PCM16 audio in `bytes`; 0 for a non-positive rate.
+    static func audioMilliseconds(bytes: Int, sampleRate: Int) -> Int {
+        guard sampleRate > 0 else { return 0 }
+        return bytes * 1000 / (sampleRate * MemoryLayout<Int16>.size)
     }
 
     /// `{"keyterms":[...],"type":"Configure"}`, or nil when no keyterm survives
@@ -231,7 +334,10 @@ enum DeepgramStreamingCore {
     }
 
     enum ServerMessage: Equatable {
-        case results(transcript: String, isFinal: Bool, speechFinal: Bool, fromFinalize: Bool)
+        case results(
+            transcript: String, isFinal: Bool, speechFinal: Bool, fromFinalize: Bool,
+            start: Double? = nil, duration: Double? = nil
+        )
         case metadata
         case utteranceEnd
         case speechStarted
@@ -241,7 +347,8 @@ enum DeepgramStreamingCore {
         /// Malformed JSON, a non-object root, a missing or unknown `type` ->
         /// .unknown. Results: channel.alternatives[0].transcript ?? "";
         /// is_final / speech_final / from_finalize default false and tolerate
-        /// wrong types. Error: description ?? message ?? a fixed fallback.
+        /// wrong types; start and duration are seconds into the stream, nil when
+        /// missing or not a number. Error: description ?? message ?? a fixed fallback.
         init(data: Data) {
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let type = object["type"] as? String else {
@@ -256,7 +363,9 @@ enum DeepgramStreamingCore {
                     transcript: alternatives?.first?["transcript"] as? String ?? "",
                     isFinal: object["is_final"] as? Bool ?? false,
                     speechFinal: object["speech_final"] as? Bool ?? false,
-                    fromFinalize: object["from_finalize"] as? Bool ?? false
+                    fromFinalize: object["from_finalize"] as? Bool ?? false,
+                    start: object["start"] as? Double,
+                    duration: object["duration"] as? Double
                 )
             case "Metadata":
                 self = .metadata
@@ -276,54 +385,128 @@ enum DeepgramStreamingCore {
     }
 
     /// Appends is_final transcripts in arrival order (trimmed, single-space
-    /// joins, empties skipped); interim results only count toward resultCount
-    /// and hasUnfinalizedSpeech. Metadata marks completion.
+    /// joins, empties skipped), dropping finals Deepgram re-sends for audio it
+    /// already finalized; interim results only count toward resultCount and
+    /// set the interim tail. Metadata marks completion.
     struct TranscriptAssembler: Equatable {
-        private(set) var finalTranscript = ""
+        /// Slack, in seconds, when comparing Results start and end times.
+        static let timingToleranceSeconds = 0.01
+
+        /// One kept final; start and end are nil when its frame carried no usable timing.
+        private struct FinalSegment: Equatable {
+            let text: String
+            let start: Double?
+            let end: Double?
+        }
+
+        private var finals: [FinalSegment] = []
         /// Every .results, interim or final.
         private(set) var resultCount = 0
         private(set) var hasReceivedMetadata = false
-        /// True once a non-empty interim transcript has arrived with no
-        /// is_final frame after it: Deepgram heard words it has not yet
-        /// finalized, so finalTranscript is missing them. Any final frame,
-        /// even an empty one (the server revised the guess away), clears it.
-        private(set) var hasUnfinalizedSpeech = false
+        /// The latest interim transcript with no final for its audio after it:
+        /// words Deepgram heard but has not yet finalized, so finalTranscript
+        /// is missing them. Deepgram's interims cover the audio from the last
+        /// final to the current tip, so the latest one is the whole tail, and a
+        /// blank one (the server revised the guess away) empties it. A final
+        /// that adds or replaces text clears it, and so does an empty one; a
+        /// final dropped as a re-send of finalized audio leaves it.
+        private(set) var interimTail = ""
+        /// True once a Results frame with is_final and from_finalize arrived:
+        /// Deepgram's answer to Finalize, sent once it processed every audio
+        /// frame received before it.
+        private(set) var hasReceivedFinalizeResponse = false
 
+        var finalTranscript: String { finals.map(\.text).joined(separator: " ") }
         var hasReceivedResults: Bool { resultCount > 0 }
         var isComplete: Bool { hasReceivedMetadata }
+        /// Deepgram heard words it has not finalized.
+        var hasUnfinalizedSpeech: Bool { !interimTail.isEmpty }
+        /// The finals followed by the interim tail, single-space joined, empties skipped.
+        var transcriptWithInterimTail: String {
+            [finalTranscript, interimTail].filter { !$0.isEmpty }.joined(separator: " ")
+        }
 
         /// utteranceEnd, speechStarted, error and unknown are no-ops.
         mutating func apply(_ message: ServerMessage) {
             switch message {
-            case .results(let transcript, let isFinal, _, _):
+            case .results(let transcript, let isFinal, _, let fromFinalize, let start, let duration):
                 resultCount += 1
                 let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard isFinal else {
-                    if !trimmed.isEmpty { hasUnfinalizedSpeech = true }
+                    interimTail = trimmed
                     return
                 }
-                hasUnfinalizedSpeech = false
-                guard !trimmed.isEmpty else { return }
-                if !finalTranscript.isEmpty { finalTranscript += " " }
-                finalTranscript += trimmed
+                if fromFinalize { hasReceivedFinalizeResponse = true }
+                guard !trimmed.isEmpty else {
+                    interimTail = ""
+                    return
+                }
+                if appendFinal(trimmed, start: start, duration: duration) {
+                    interimTail = ""
+                }
             case .metadata:
                 hasReceivedMetadata = true
             case .utteranceEnd, .speechStarted, .error, .unknown:
                 break
             }
         }
+
+        /// A final without usable timing (missing, non-finite or negative) is
+        /// appended as before. A timed final ending within audio an earlier
+        /// timed final already covered is a re-send and is dropped. Any other
+        /// timed final first removes every trailing timed final starting where
+        /// it starts or later, whose audio it covers again (a cumulative
+        /// re-emit, which can span several finals), and is then appended with
+        /// the earliest of those starts. Known limitation: a final starting
+        /// inside a kept one and ending after it repeats the overlapping words,
+        /// since splitting text needs word timings. Returns false only for a
+        /// dropped re-send, which carries no new audio.
+        private mutating func appendFinal(_ text: String, start: Double?, duration: Double?) -> Bool {
+            guard let start, let duration, start.isFinite, duration.isFinite, start >= 0, duration >= 0 else {
+                finals.append(FinalSegment(text: text, start: nil, end: nil))
+                return true
+            }
+            let end = start + duration
+            let tolerance = Self.timingToleranceSeconds
+            if let finalizedEnd = finals.compactMap(\.end).max(), end <= finalizedEnd + tolerance {
+                return false
+            }
+            var keptStart = start
+            while let last = finals.last, let lastStart = last.start, lastStart >= start - tolerance {
+                keptStart = min(keptStart, lastStart)
+                finals.removeLast()
+            }
+            finals.append(FinalSegment(text: text, start: keptStart, end: end))
+            return true
+        }
     }
 
     enum CommitPolicy {
-        static let timeout: TimeInterval = 5
+        /// Deepgram documents 200-500 ms of transcript latency, and CloseStream
+        /// right behind Finalize always ends in Metadata, so 3 s is at least six
+        /// times the documented worst case while still leaving room for a
+        /// late-opened socket draining its buffered audio. A stalled stream
+        /// reaches the file upload 2 s sooner than with the former 5 s.
+        static let timeout: TimeInterval = 3
         static let finalizeMessage = #"{"type":"Finalize"}"#
         static let closeStreamMessage = #"{"type":"CloseStream"}"#
         /// Text frames sent back to back, in this order, on shortcut release.
+        /// Finalize asks for the from_finalize final; CloseStream right behind
+        /// it guarantees Metadata as the safety net when that final never comes.
         static let commitMessages = [finalizeMessage, closeStreamMessage]
+
+        /// Which stream text resolved the commit. The raw value is the Run Log
+        /// source label.
+        enum TranscriptPath: String, Equatable {
+            /// Every word came from a final.
+            case finals = "deepgram-final"
+            /// The stream ended with interim words Deepgram never finalized; they follow the finals.
+            case finalsWithInterimTail = "deepgram-final+interim-tail"
+        }
 
         enum Decision: Equatable {
             case wait
-            case resolve(String)
+            case resolve(String, TranscriptPath)
             case fallBack(DeepgramStreamingError)
         }
 
@@ -338,31 +521,37 @@ enum DeepgramStreamingCore {
         }
 
         /// Pure decision over a state snapshot, evaluated after every event and
-        /// on the timeout. A server error always falls back. Metadata or a
-        /// normal close means Deepgram processed all the audio: interim words
-        /// it never finalized fall back (the finals would be truncated or
-        /// empty), otherwise the assembled finals resolve; when they are empty,
-        /// "" if Deepgram sent any Results frame (it heard no words, which the
-        /// stop path handles like an empty Realtime result) and .noResults
-        /// otherwise. An abnormal close without Metadata falls back whatever
-        /// arrived, since the tail may be missing. Only then does the clock matter.
+        /// on the timeout, in this order. A server error always falls back, even
+        /// after text arrived. The from_finalize final means Deepgram flushed all
+        /// the audio sent before Finalize, and frames are applied in socket order,
+        /// so the stream text resolves at once, whatever the close or the clock
+        /// says afterwards. Metadata or a normal close means Deepgram processed
+        /// all the audio. Either way the finals resolve, followed by the latest
+        /// interim words it never finalized (none after the from_finalize final,
+        /// unless that final was dropped as a re-send). An abnormal close without
+        /// either falls back whatever arrived, since the tail may be missing.
+        /// Only then does the clock matter. Stream text that is empty falls back
+        /// with .noResults when no Results frame arrived at all, and with
+        /// .emptyTranscriptForSpeech when the recorder counted speech; otherwise
+        /// "" resolves (Deepgram heard no words, which the stop path handles
+        /// like an empty Realtime result).
         static func decision(
             assembler: TranscriptAssembler,
             socketState: SocketState,
             serverErrorMessage: String?,
-            elapsedSinceCommit: TimeInterval
+            elapsedSinceCommit: TimeInterval,
+            recorderHeardSpeech: Bool
         ) -> Decision {
             if let serverErrorMessage {
                 return .fallBack(.serverError(serverErrorMessage))
             }
-            if assembler.hasReceivedMetadata || socketState == .closedNormally {
-                if assembler.hasUnfinalizedSpeech {
-                    return .fallBack(.incompleteTranscript)
-                }
-                if !assembler.finalTranscript.isEmpty {
-                    return .resolve(assembler.finalTranscript)
-                }
-                return assembler.hasReceivedResults ? .resolve("") : .fallBack(.noResults)
+            if assembler.hasReceivedFinalizeResponse || assembler.hasReceivedMetadata
+                || socketState == .closedNormally {
+                return streamText(
+                    assembler.transcriptWithInterimTail,
+                    path: assembler.hasUnfinalizedSpeech ? .finalsWithInterimTail : .finals,
+                    assembler: assembler, recorderHeardSpeech: recorderHeardSpeech
+                )
             }
             if socketState == .closedAbnormally {
                 return .fallBack(.socketClosedBeforeFinal)
@@ -371,6 +560,19 @@ enum DeepgramStreamingCore {
                 return .fallBack(.commitTimedOut)
             }
             return .wait
+        }
+
+        private static func streamText(
+            _ text: String,
+            path: TranscriptPath,
+            assembler: TranscriptAssembler,
+            recorderHeardSpeech: Bool
+        ) -> Decision {
+            if !text.isEmpty {
+                return .resolve(text, path)
+            }
+            guard assembler.hasReceivedResults else { return .fallBack(.noResults) }
+            return recorderHeardSpeech ? .fallBack(.emptyTranscriptForSpeech) : .resolve("", .finals)
         }
     }
 

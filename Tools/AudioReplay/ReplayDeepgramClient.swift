@@ -90,7 +90,7 @@ enum ReplayDeepgramClient {
                 let parsed = DeepgramStreamingCore.ServerMessage(data: data)
                 state.assembler.apply(parsed)
                 switch parsed {
-                case .results(let transcript, let isFinal, _, let fromFinalize):
+                case .results(let transcript, let isFinal, _, let fromFinalize, _, _):
                     if isFinal, !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         state.finals.append(ReplayEvalCore.wordTimings(fromResultsJSON: data))
                     }

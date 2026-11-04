@@ -9,6 +9,8 @@ enum PipelineStageTimingsTests {
         testSummaryLineFormatsMillisecondsAndSeconds()
         testSummaryLineOmitsMissingStages()
         testJSONRoundTrip()
+        testKeytermLine()
+        testOldJSONDecodesWithoutKeytermFields()
         testHistoryItemRoundTripsWithAndWithoutTimings()
         testPasteGateSamplesMarkBeforeActionAndReportsAfter()
         testPasteGateReportsSkippedPasteOnce()
@@ -97,6 +99,16 @@ enum PipelineStageTimingsTests {
             "audio 40 ms · transcription 820 ms (deepgram) · context 0 ms · cleanup 610 ms · paste 35 ms · total 1.5 s"
         )
 
+        TestSupport.expectEqual(PipelineStageTimings.fileFallbackTranscriptionSource, "file-fallback")
+        // A stream abandoned before its commit is a fallback too, not streaming Off.
+        TestSupport.expectEqual(PipelineStageTimings.fileUploadSource(streamAbandoned: true), "file-fallback")
+        TestSupport.expectEqual(PipelineStageTimings.fileUploadSource(streamAbandoned: false), "file")
+        sourced.transcriptionSource = "deepgram-final+interim-tail"
+        TestSupport.expect(
+            sourced.summaryLine.contains("transcription 820 ms (deepgram-final+interim-tail)"),
+            "The Run Log line must name the stream path that produced the text"
+        )
+
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 0), "0 ms")
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 999), "999 ms")
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 1000), "1.0 s")
@@ -130,6 +142,19 @@ enum PipelineStageTimingsTests {
         TestSupport.expect(json.contains("\"transcriptionMilliseconds\":820"), "JSON must carry the stage value")
         TestSupport.expect(json.contains("\"transcriptionSource\":\"file\""), "JSON must carry the source")
         TestSupport.expectEqual(PipelineStageTimings(jsonString: json), timings)
+        TestSupport.expect(!json.contains("keyterms"), "Unset keyterm counts are not written")
+
+        var withKeyterms = timings
+        withKeyterms.keytermsAtConnect = 14
+        withKeyterms.screenKeyterms = 18
+        withKeyterms.codeKeyterms = 6
+        withKeyterms.screenKeytermsAudioMilliseconds = 420
+        guard let keytermJSON = withKeyterms.jsonString else {
+            fatalError("Expected stage timings with keyterm counts to encode as JSON")
+        }
+        TestSupport.expect(keytermJSON.contains("\"screenKeyterms\":18"), "JSON must carry the keyterm counts")
+        TestSupport.expect(keytermJSON.contains("\"codeKeyterms\":6"), "JSON must carry the code keyterm count")
+        TestSupport.expectEqual(PipelineStageTimings(jsonString: keytermJSON), withKeyterms)
 
         TestSupport.expectEqual(PipelineStageTimings(jsonString: "{}"), PipelineStageTimings())
         TestSupport.expectEqual(
@@ -137,6 +162,52 @@ enum PipelineStageTimingsTests {
             PipelineStageTimings(transcriptionMilliseconds: 820)
         )
         TestSupport.expectEqual(PipelineStageTimings(jsonString: "not json"), nil)
+    }
+
+    private static func testKeytermLine() {
+        func line(_ connect: Int?, _ screen: Int?, _ audio: Int?, code: Int? = nil) -> String {
+            PipelineStageTimings(
+                keytermsAtConnect: connect, screenKeyterms: screen, codeKeyterms: code,
+                screenKeytermsAudioMilliseconds: audio
+            ).keytermLine
+        }
+        TestSupport.expectEqual(line(14, 18, 0), "keyterms 14 · screen 18 (from start)")
+        TestSupport.expectEqual(line(14, 18, nil), "keyterms 14 · screen 18 (from start)")
+        TestSupport.expectEqual(line(14, 18, 420), "keyterms 14 · screen 18 (after 420 ms of audio)")
+        TestSupport.expectEqual(line(14, 18, 1500), "keyterms 14 · screen 18 (after 1.5 s of audio)")
+        TestSupport.expectEqual(line(14, nil, nil), "keyterms 14")
+        TestSupport.expectEqual(line(nil, nil, nil), "")
+        // IDE identifiers are counted apart from on-screen names, so an editor's Configure
+        // shows no screen part.
+        TestSupport.expectEqual(line(14, 18, 420, code: 6), "keyterms 14 · screen 18 · code 6 (after 420 ms of audio)")
+        TestSupport.expectEqual(line(14, 0, 0, code: 6), "keyterms 14 · code 6 (from start)")
+        TestSupport.expectEqual(line(14, 18, 0, code: 0), "keyterms 14 · screen 18 (from start)")
+
+        let marks = PipelineStageTimings.Marks(
+            stopRequested: base,
+            audioReady: base + 0.040,
+            keytermsAtConnect: 14,
+            screenKeyterms: 18,
+            codeKeyterms: 6,
+            screenKeytermsAudioMilliseconds: 420
+        )
+        let timings = marks.timings
+        TestSupport.expectEqual(timings.keytermsAtConnect, 14)
+        TestSupport.expectEqual(timings.screenKeyterms, 18)
+        TestSupport.expectEqual(timings.codeKeyterms, 6)
+        TestSupport.expectEqual(timings.screenKeytermsAudioMilliseconds, 420)
+        TestSupport.expectEqual(timings.summaryLine, "audio 40 ms")
+    }
+
+    /// Rows written before the keyterm fields existed decode with all of them nil.
+    private static func testOldJSONDecodesWithoutKeytermFields() {
+        let decoded = PipelineStageTimings(jsonString: "{\"audioFinalizeMilliseconds\":40,\"totalMilliseconds\":1515}")
+        TestSupport.expectEqual(decoded, PipelineStageTimings(audioFinalizeMilliseconds: 40, totalMilliseconds: 1515))
+        TestSupport.expectEqual(decoded?.keytermsAtConnect, nil)
+        TestSupport.expectEqual(decoded?.screenKeyterms, nil)
+        TestSupport.expectEqual(decoded?.codeKeyterms, nil)
+        TestSupport.expectEqual(decoded?.screenKeytermsAudioMilliseconds, nil)
+        TestSupport.expectEqual(decoded?.keytermLine, "")
     }
 
     private static func testHistoryItemRoundTripsWithAndWithoutTimings() {

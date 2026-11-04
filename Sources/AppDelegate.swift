@@ -26,9 +26,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             appState.startHotkeyMonitoring()
             appState.startAccessibilityPolling()
-            Task { @MainActor in
-                UpdateManager.shared.startPeriodicChecks()
-            }
 
             if !AXIsProcessTrusted() {
                 appState.showAccessibilityAlert()
@@ -169,9 +166,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         appState.startHotkeyMonitoring()
         appState.startAccessibilityPolling()
-        Task { @MainActor in
-            UpdateManager.shared.startPeriodicChecks()
-        }
 
         if !AXIsProcessTrusted() {
             appState.showAccessibilityAlert()
