@@ -109,6 +109,22 @@ enum PipelineStageTimingsTests {
             "The Run Log line must name the stream path that produced the text"
         )
 
+        // AssemblyAI's fallback names a fixed, text-free reason; every other stream keeps the plain label.
+        TestSupport.expectEqual(PipelineStageTimings.assemblyAITranscriptionSource, "assemblyai")
+        TestSupport.expectEqual(PipelineStageTimings.fileFallbackSource(reason: nil), "file-fallback")
+        TestSupport.expectEqual(PipelineStageTimings.fileFallbackSource(reason: ""), "file-fallback")
+        TestSupport.expectEqual(
+            PipelineStageTimings.fileFallbackSource(reason: AssemblyAIStreamingError.unauthorized.errorDescription),
+            "file-fallback: AssemblyAI rejected the API key"
+        )
+        sourced.transcriptionSource = PipelineStageTimings.fileFallbackSource(
+            reason: AssemblyAIStreamingError.unauthorized.errorDescription
+        )
+        TestSupport.expect(
+            sourced.summaryLine.contains("transcription 820 ms (file-fallback: AssemblyAI rejected the API key)"),
+            "The Run Log line must show the AssemblyAI fallback reason"
+        )
+
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 0), "0 ms")
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 999), "999 ms")
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 1000), "1.0 s")

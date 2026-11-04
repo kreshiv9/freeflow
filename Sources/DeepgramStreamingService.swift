@@ -518,3 +518,10 @@ final class DeepgramStreamingService: StreamingTranscriptionSession {
         pendingKeytermUpdate = nil
     }
 }
+
+// The existing setRecorderHeardSpeech, updateKeyterms and keytermReport satisfy it unchanged,
+// so the shared AppState seam leaves Deepgram's requests as they were.
+extension DeepgramStreamingService: KeytermStreamingSession {
+    /// Deepgram always takes the one Configure, as before the shared seam.
+    var acceptsKeytermUpdates: Bool { true }
+}

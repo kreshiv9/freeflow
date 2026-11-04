@@ -56,6 +56,7 @@ struct FreeFlowTests {
         await TextContextCoreTests.run()
         await TranscriptionServiceTests.run()
         await DeepgramStreamingCoreTests.run()
+        await AssemblyAIStreamingCoreTests.run()
         await APIConfigurationDraftTests.run()
         print("FreeFlowTests passed")
     }

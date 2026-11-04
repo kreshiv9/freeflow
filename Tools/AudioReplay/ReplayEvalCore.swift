@@ -178,7 +178,7 @@ enum ReplayEvalCore {
         return count
     }
 
-    // MARK: Deepgram results
+    // MARK: Deepgram and AssemblyAI results
 
     struct WordTiming: Equatable {
         var start: Double
@@ -198,8 +198,19 @@ enum ReplayEvalCore {
         }
     }
 
+    /// words[].start/end of an AssemblyAI Turn, from milliseconds to seconds. Words
+    /// without numeric times are skipped; anything else malformed gives [].
+    static func wordTimings(fromTurnJSON data: Data) -> [WordTiming] {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let words = object["words"] as? [[String: Any]] else { return [] }
+        return words.compactMap { word in
+            guard let start = word["start"] as? Double, let end = word["end"] as? Double else { return nil }
+            return WordTiming(start: start / 1000, end: end / 1000)
+        }
+    }
+
     /// Finals whose first word starts strictly before the previous non-empty
-    /// final's last word ends: words Deepgram may have emitted twice.
+    /// final's last word ends: words the provider may have emitted twice.
     static func overlapCount(finals: [[WordTiming]]) -> Int {
         var count = 0
         var previousEnd: Double?
@@ -212,6 +223,21 @@ enum ReplayEvalCore {
     }
 
     // MARK: Variants
+
+    /// The service a variant streams to, with the app's request for it.
+    enum Provider: String, CaseIterable {
+        /// Nova-3 (DeepgramStreamingCore.listenURL), with the variant's query items on top.
+        case deepgram
+        /// Universal-3.6 Pro (AssemblyAIStreamingCore.listenURL), English as in the app.
+        case assemblyAI = "assemblyai"
+
+        var displayName: String {
+            switch self {
+            case .deepgram: "Deepgram"
+            case .assemblyAI: "AssemblyAI"
+            }
+        }
+    }
 
     enum Resampler: String, CaseIterable {
         /// MinimumPhase at max quality (PR 1's converter).
@@ -286,21 +312,38 @@ enum ReplayEvalCore {
 
     struct Variant: Equatable {
         var name: String
+        var provider = Provider.deepgram
         var sampleRate = 16000
         var resampler = Resampler.minimumPhase
+        /// Deepgram's query items; an AssemblyAI variant never sends them.
         var query = ReplayEvalCore.defaultQuery
         var keyterms = KeytermSelection.none
         var frameMilliseconds = 50
         var pacing = Pacing.realtime
         var isolation = Isolation.off
         var gainDecibels = 0.0
+        /// AssemblyAI only: the fixed scenario prompt, nil for none. An AssemblyAI variant
+        /// without a prompt key gets defaultAssemblyAIPrompt, since the app always sends one.
+        var prompt: AssemblyAIStreamingCore.PromptScenario?
+        /// AssemblyAI only: nil sends no mode, so the server applies its own, as in the app.
+        var mode: AssemblyAIStreamingCore.Mode?
 
-        /// Cache key for prepared audio: variants that differ only in Deepgram
+        /// Cache key for prepared audio: variants that differ only in provider, request
         /// parameters, frames or pacing share the same samples.
         var audioKey: String {
             "\(sampleRate)|\(resampler.rawValue)|\(isolation.spec)|\(gainDecibels)"
         }
     }
+
+    /// The app's fallback scenario, for destinations without a more specific one.
+    static let defaultAssemblyAIPrompt = AssemblyAIStreamingCore.PromptScenario.dictation
+    /// AssemblyAI closes the session with 3007 for a chunk outside this range (ms).
+    static let assemblyAIChunkMilliseconds = 50...1000
+    /// Deepgram query keys, which an AssemblyAI variant must not set.
+    private static let deepgramQueryKeys = [
+        "endpointing", "language", "mip_opt_out", "smart_format", "punctuate", "interim_results",
+    ]
+    private static let assemblyAIKeys = ["prompt", "mode"]
 
     enum ParseError: Error, Equatable, CustomStringConvertible {
         case noVariants
@@ -347,6 +390,7 @@ enum ReplayEvalCore {
     private static let knownKeys: Set<String> = [
         "rate", "src", "endpointing", "language", "mip_opt_out", "smart_format", "punctuate",
         "interim_results", "keyterms", "frame_ms", "pacing", "isolation", "gain_db",
+        "provider", "prompt", "mode",
     ]
 
     /// Human-readable allowed values per key, for error messages.
@@ -364,6 +408,9 @@ enum ReplayEvalCore {
         "pacing": Pacing.allCases.map(\.rawValue).joined(separator: ", "),
         "isolation": "off, hqN, voiceN (N 0-100)",
         "gain_db": "-40 to 40",
+        "provider": Provider.allCases.map(\.rawValue).joined(separator: ", "),
+        "prompt": (["off"] + AssemblyAIStreamingCore.PromptScenario.allCases.map(\.rawValue)).joined(separator: ", "),
+        "mode": (["default"] + AssemblyAIStreamingCore.Mode.allCases.map(\.rawValue)).joined(separator: ", "),
     ]
 
     /// `name key=value ...`, split on whitespace. Unset keys keep the defaults.
@@ -390,6 +437,25 @@ enum ReplayEvalCore {
         }
         if variant.resampler == .legacyChain, variant.sampleRate != 24000 {
             throw ParseError.inconsistent(line: lineNumber, reason: "src=legacy-chain requires rate=24000")
+        }
+        switch variant.provider {
+        case .deepgram:
+            if let key = assemblyAIKeys.first(where: seenKeys.contains) {
+                throw ParseError.inconsistent(line: lineNumber, reason: "\(key) requires provider=assemblyai")
+            }
+        case .assemblyAI:
+            if let key = deepgramQueryKeys.first(where: seenKeys.contains) {
+                throw ParseError.inconsistent(line: lineNumber, reason: "\(key) is a Deepgram setting; remove it with provider=assemblyai")
+            }
+            guard assemblyAIChunkMilliseconds.contains(variant.frameMilliseconds) else {
+                throw ParseError.inconsistent(line: lineNumber, reason: "provider=assemblyai requires frame_ms 50-1000")
+            }
+            // AssemblyAI processes at most about 1.25x real time; a burst only queues
+            // behind that and inflates the release-to-final times.
+            guard variant.pacing != .burst else {
+                throw ParseError.inconsistent(line: lineNumber, reason: "provider=assemblyai requires pacing=realtime or 1.25x")
+            }
+            if !seenKeys.contains("prompt") { variant.prompt = defaultAssemblyAIPrompt }
         }
         return variant
     }
@@ -470,6 +536,23 @@ enum ReplayEvalCore {
             guard !value.isEmpty, value.allSatisfy({ "0123456789.+-".contains($0) }),
                   let decibels = Double(value), decibels.isFinite, (-40...40).contains(decibels) else { return false }
             variant.gainDecibels = decibels
+        case "provider":
+            guard let provider = Provider(rawValue: value) else { return false }
+            variant.provider = provider
+        case "prompt":
+            if value == "off" {
+                variant.prompt = nil
+            } else {
+                guard let scenario = AssemblyAIStreamingCore.PromptScenario(rawValue: value) else { return false }
+                variant.prompt = scenario
+            }
+        case "mode":
+            switch value {
+            case "default", "omit": variant.mode = nil
+            default:
+                guard let mode = AssemblyAIStreamingCore.Mode(rawValue: value) else { return false }
+                variant.mode = mode
+            }
         default:
             return false
         }
@@ -509,9 +592,11 @@ enum ReplayEvalCore {
 
     // MARK: Presets
 
-    /// Each preset isolates one variable; its first variant is the paired baseline
-    /// (today's app behavior where known).
-    static let presetNames = ["rate", "src", "endpointing", "keyterms", "language", "isolation", "frames", "determinism"]
+    /// Each preset isolates one variable (providers: the provider and its request); its
+    /// first variant is the paired baseline (today's app behavior where known).
+    static let presetNames = [
+        "rate", "src", "endpointing", "keyterms", "language", "isolation", "frames", "determinism", "providers",
+    ]
 
     private static let presets: [String: String] = [
         "rate": """
@@ -542,6 +627,10 @@ enum ReplayEvalCore {
             lang-en language=en
             lang-en-US language=en-US
             lang-multi language=multi
+            lang-en-GB language=en-GB
+            lang-en-IN language=en-IN
+            lang-en-AU language=en-AU
+            lang-en-NZ language=en-NZ
             """,
         "isolation": """
             iso-off isolation=off
@@ -560,6 +649,14 @@ enum ReplayEvalCore {
             same-1
             same-2
             same-3
+            """,
+        // The app's two requests at connect: vocabulary keyterms on both, and AssemblyAI's
+        // fixed prompt for a destination without a more specific scenario.
+        "providers": """
+            dg-nova3 keyterms=all
+            aai-u36 provider=assemblyai prompt=dictation keyterms=all
+            aai-u36-noprompt provider=assemblyai prompt=off keyterms=all
+            aai-u36-nokt provider=assemblyai prompt=dictation keyterms=none
             """,
     ]
 
@@ -629,8 +726,72 @@ enum ReplayEvalCore {
         return result
     }
 
+    /// The app's AssemblyAI request for the variant: English, the variant's rate, the
+    /// keyterms it sends (AssemblyAIStreamingCore applies its caps), its prompt and mode.
+    /// The key goes in the Authorization header only, never here.
+    static func assemblyAIConfiguration(for variant: Variant, keyterms: [String]) -> AssemblyAIStreamingCore.Configuration {
+        AssemblyAIStreamingCore.Configuration(
+            apiKey: "",
+            languageCode: AssemblyAIStreamingCore.defaultLanguage,
+            sampleRate: variant.sampleRate,
+            keyterms: keyterms,
+            keytermsEnabled: true,
+            promptScenario: variant.prompt,
+            mode: variant.mode
+        )
+    }
+
+    /// AssemblyAI chunks of ceil(rate·ms/1000) samples, so none is shorter than asked
+    /// (rounding down would cut 50 ms at 22.05 kHz to 49.98 ms). A last chunk under 50 ms
+    /// is zero-padded (silence) to 50 ms, as the app pads its final frame. frame_ms is
+    /// 50-1000 for AssemblyAI variants, so every chunk is within assemblyAIChunkMilliseconds.
+    static func assemblyAIChunks(of pcm: Data, sampleRate: Int, frameMilliseconds: Int) -> [Data] {
+        func bytes(_ milliseconds: Int) -> Int {
+            max(1, (sampleRate * milliseconds + 999) / 1000) * MemoryLayout<Int16>.size
+        }
+        let chunkBytes = bytes(frameMilliseconds)
+        var chunks: [Data] = []
+        var start = pcm.startIndex
+        while start < pcm.endIndex {
+            let end = min(start + chunkBytes, pcm.endIndex)
+            chunks.append(pcm.subdata(in: start..<end))
+            start = end
+        }
+        if let last = chunks.last {
+            chunks[chunks.count - 1] = AssemblyAIStreamingCore.paddedFinalChunk(
+                last, frameBytes: bytes(assemblyAIChunkMilliseconds.lowerBound)
+            )
+        }
+        return chunks
+    }
+
+    /// Send time of each chunk relative to the first, from the audio before it: real time
+    /// for realtime, /1.25 for 1.25x, 0 for burst. Equals sendOffsetsMilliseconds(frameCount:)
+    /// for whole-sample frames; also right for rounded-up and padded chunks.
+    static func sendOffsetsMilliseconds(chunkByteCounts: [Int], sampleRate: Int, pacing: Pacing) -> [Double] {
+        let bytesPerMillisecond = Double(sampleRate * MemoryLayout<Int16>.size) / 1000
+        var offsets: [Double] = []
+        var bytesBefore = 0
+        for count in chunkByteCounts {
+            let realtime = Double(bytesBefore) / bytesPerMillisecond
+            switch pacing {
+            case .realtime: offsets.append(realtime)
+            case .faster: offsets.append(realtime / 1.25)
+            case .burst: offsets.append(0)
+            }
+            bytesBefore += count
+        }
+        return offsets
+    }
+
     /// Nova-3 streaming pay-as-you-go list price per minute; an estimate that may be stale.
     static let defaultPricePerMinuteUSD = 0.0077
+    /// Universal-3.6 Pro streaming list price per minute ($0.45/hr), charged on the time each
+    /// socket is open rather than on the audio; an estimate that may be stale.
+    static let defaultAssemblyAIPricePerMinuteUSD = 0.0075
+    /// Open-socket time an AssemblyAI stream adds to its audio: the handshake and Begin
+    /// before the first chunk, the last turn and Termination after the last one.
+    static let assemblyAISessionOverheadSeconds = 1.0
 
     static func estimatedCostUSD(
         audioSeconds: Double,
@@ -639,6 +800,26 @@ enum ReplayEvalCore {
         pricePerMinute: Double = defaultPricePerMinuteUSD
     ) -> Double {
         audioSeconds / 60 * Double(variants * repeats) * pricePerMinute
+    }
+
+    /// Billed minutes per provider over every item, variant and repeat. Deepgram bills the
+    /// audio sent. AssemblyAI bills the open socket: the audio at the variant's pace (never
+    /// faster than the server's ~1.25x processing) plus assemblyAISessionOverheadSeconds.
+    static func billedMinutes(itemAudioSeconds: [Double], variants: [Variant], repeats: Int) -> [Provider: Double] {
+        let audioSeconds = itemAudioSeconds.reduce(0, +)
+        var minutes: [Provider: Double] = [:]
+        for variant in variants {
+            let seconds: Double
+            switch variant.provider {
+            case .deepgram:
+                seconds = audioSeconds
+            case .assemblyAI:
+                let factor = max(variant.pacing.wallTimeFactor, 1 / AssemblyAIStreamingCore.throttleRealTimeFactor)
+                seconds = audioSeconds * factor + Double(itemAudioSeconds.count) * assemblyAISessionOverheadSeconds
+            }
+            minutes[variant.provider, default: 0] += seconds / 60 * Double(repeats)
+        }
+        return minutes
     }
 
     // MARK: Level statistics
@@ -902,6 +1083,20 @@ enum ReplayEvalCore {
         case sendFailed
         case closedEarly
         case timedOut
+        /// AssemblyAI refused the key in the session (code 1008).
+        case keyRefused
+        /// AssemblyAI refused the session for its new-sessions-per-minute limit or the
+        /// account balance (code 1008).
+        case accountLimit
+
+        /// The status for a classified AssemblyAI failure; the server's text is already gone.
+        init(assemblyAIFailure failure: AssemblyAIStreamingError) {
+            switch failure {
+            case .unauthorized: self = .keyRefused
+            case .accountLimit: self = .accountLimit
+            default: self = .serverError
+            }
+        }
 
         var csvValue: String {
             switch self {
@@ -912,13 +1107,40 @@ enum ReplayEvalCore {
             case .sendFailed: "send_failed"
             case .closedEarly: "closed_early"
             case .timedOut: "timeout"
+            case .keyRefused: "key_refused"
+            case .accountLimit: "account_limit"
             }
         }
 
-        /// 401 or 403: the key was refused, so later runs would fail the same way.
+        /// 401, 403 or AssemblyAI's key refusal: later runs would fail the same way.
         var isAuthenticationFailure: Bool {
-            self == .httpError(401) || self == .httpError(403)
+            self == .httpError(401) || self == .httpError(403) || self == .keyRefused
         }
+    }
+
+    /// An AssemblyAI replay's status, in this order: an Error frame; a documented error
+    /// close code; before Begin, a refused handshake (any HTTP status but 101) or else
+    /// connect_failed; a failed send; Termination, which means every turn was flushed (ok);
+    /// the timeout; otherwise the session closed early. Server texts were reduced to cases.
+    static func assemblyAIRunStatus(
+        failure: AssemblyAIStreamingError?,
+        closeFailure: AssemblyAIStreamingError?,
+        httpStatus: Int?,
+        began: Bool,
+        sendFailed: Bool,
+        terminated: Bool,
+        timedOut: Bool
+    ) -> RunStatus {
+        if let failure = failure ?? closeFailure {
+            return RunStatus(assemblyAIFailure: failure)
+        }
+        guard began else {
+            if let httpStatus, httpStatus != 101 { return .httpError(httpStatus) }
+            return .connectFailed
+        }
+        if sendFailed { return .sendFailed }
+        if terminated { return .ok }
+        return timedOut ? .timedOut : .closedEarly
     }
 
     /// One replay's numbers. Holds no transcript, reference or keyterm text.
@@ -936,7 +1158,10 @@ enum ReplayEvalCore {
         var finals: Int
         var overlaps: Int
         var unfinalizedAtEnd: Bool
+        /// From the last audio frame to Deepgram's first from_finalize result, or to
+        /// AssemblyAI's first end_of_turn Turn after ForceEndpoint (release to final).
         var millisecondsToFromFinalize: Double?
+        /// From the last audio frame to Deepgram's Metadata or AssemblyAI's Termination.
         var millisecondsToMetadata: Double?
     }
 
@@ -1098,7 +1323,7 @@ enum ReplayEvalCore {
 
     // MARK: Safety and manifest
 
-    /// Holds the Deepgram key. Prints, interpolates, dumps and mirrors as
+    /// Holds a provider key. Prints, interpolates, dumps and mirrors as
     /// <redacted>; `revealed` is read only for the Authorization header.
     struct Secret: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
         private let value: String

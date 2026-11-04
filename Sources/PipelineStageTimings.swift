@@ -9,6 +9,7 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
     static let realtimeTranscriptionSource = "realtime"
     static let fileTranscriptionSource = "file"
     static let deepgramTranscriptionSource = "deepgram"
+    static let assemblyAITranscriptionSource = "assemblyai"
     /// A streaming session failed, at its commit or earlier when its audio
     /// conversion failed, and the recording's file upload produced the
     /// transcript. A stream that never started leaves the label file.
@@ -18,6 +19,14 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
     /// file-fallback when this recording's stream was abandoned, file otherwise.
     static func fileUploadSource(streamAbandoned: Bool) -> String {
         streamAbandoned ? fileFallbackTranscriptionSource : fileTranscriptionSource
+    }
+
+    /// The label after a failed streaming commit: file-fallback, followed by a short reason
+    /// when the stream gave one. Reasons are fixed, text-free strings (AssemblyAI's error
+    /// descriptions), never server text. Example: "file-fallback: AssemblyAI rejected the API key".
+    static func fileFallbackSource(reason: String?) -> String {
+        guard let reason, !reason.isEmpty else { return fileFallbackTranscriptionSource }
+        return "\(fileFallbackTranscriptionSource): \(reason)"
     }
 
     /// Shortcut release until the audio file is ready for transcription.
@@ -34,10 +43,10 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
     var pasteDispatchMilliseconds: Int? = nil
     /// Shortcut release until the paste or insertion action fired.
     var totalMilliseconds: Int? = nil
-    /// Keyterms in the Deepgram connect URL; nil for other providers.
+    /// Keyterms in the Deepgram or AssemblyAI connect URL; nil for other providers.
     var keytermsAtConnect: Int? = nil
     /// On-screen names (Claude Code panel, ChatGPT, Google search) the one Deepgram Configure
-    /// added; nil when none was sent.
+    /// or AssemblyAI UpdateConfiguration added; nil when none was sent.
     var screenKeyterms: Int? = nil
     /// Visible code identifiers (Cursor, Windsurf, VS Code) that Configure added; nil when
     /// none was sent.
@@ -58,7 +67,7 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
         var cleanupStarted: CFAbsoluteTime? = nil
         var cleanupFinished: CFAbsoluteTime? = nil
         var pasteFired: CFAbsoluteTime? = nil
-        /// Copied from the Deepgram stream's keytermReport; passed through unchanged.
+        /// Copied from the Deepgram or AssemblyAI stream's keytermReport; passed through unchanged.
         var keytermsAtConnect: Int? = nil
         var screenKeyterms: Int? = nil
         var codeKeyterms: Int? = nil
@@ -98,7 +107,7 @@ struct PipelineStageTimings: Codable, Equatable, Sendable {
         return parts.joined(separator: " · ")
     }
 
-    /// Deepgram keyterm counts, numbers only; "" for other providers. On-screen names and
+    /// Deepgram or AssemblyAI keyterm counts, numbers only; "" for other providers. On-screen names and
     /// code identifiers are counted apart, and a zero count is left out.
     /// Examples: "keyterms 14 · screen 18 (from start)",
     /// "keyterms 14 · screen 18 · code 6 (after 420 ms of audio)",

@@ -52,11 +52,15 @@ struct ProviderSettingsFields: View {
     @FocusState private var transcriptionAPIURLFocused: Bool
     @FocusState private var transcriptionAPIKeyFocused: Bool
     @FocusState private var isEditingDeepgramAPIKey: Bool
+    @FocusState private var isEditingAssemblyAIAPIKey: Bool
     @State private var transcriptionModelDraft: String = ""
     @State private var realtimeStreamingModelDraft: String = ""
     @State private var deepgramAPIKeyDraft: String = ""
     @State private var isValidatingDeepgramKey = false
     @State private var deepgramKeyValidation: DeepgramStreamingCore.KeyValidation?
+    @State private var assemblyAIAPIKeyDraft: String = ""
+    @State private var isValidatingAssemblyAIKey = false
+    @State private var assemblyAIKeyValidation: AssemblyAIStreamingCore.KeyValidation?
     @State private var postProcessingModelDraft: String = ""
     @State private var postProcessingFallbackModelDraft: String = ""
     @State private var contextModelDraft: String = ""
@@ -126,6 +130,47 @@ struct ProviderSettingsFields: View {
             Text("The key works but cannot list projects; streaming should still work.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        case .invalid, .unreachable:
+            Label(validation.statusText, systemImage: "xmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+
+    private func commitAssemblyAIAPIKey() {
+        let trimmed = assemblyAIAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        assemblyAIAPIKeyDraft = trimmed
+        guard appState.assemblyAIAPIKey != trimmed else { return }
+        appState.assemblyAIAPIKey = trimmed
+    }
+
+    /// Stores the draft first so the validated key is the stored key; the result
+    /// is shown only while the draft is still that key. Mints a short-lived token,
+    /// which opens no billed streaming session and is discarded.
+    private func validateAssemblyAIAPIKey() {
+        guard !isValidatingAssemblyAIKey else { return }
+        commitAssemblyAIAPIKey()
+        let key = assemblyAIAPIKeyDraft
+        guard !key.isEmpty else { return }
+        isValidatingAssemblyAIKey = true
+        assemblyAIKeyValidation = nil
+
+        Task { @MainActor in
+            let result = await AssemblyAIStreamingCore.validateAPIKey(key)
+            isValidatingAssemblyAIKey = false
+            if assemblyAIAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines) == key {
+                assemblyAIKeyValidation = result
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func assemblyAIKeyValidationLabel(_ validation: AssemblyAIStreamingCore.KeyValidation) -> some View {
+        switch validation {
+        case .valid:
+            Label(validation.statusText, systemImage: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
         case .invalid, .unreachable:
             Label(validation.statusText, systemImage: "xmark.circle.fill")
                 .font(.caption)
@@ -316,7 +361,7 @@ struct ProviderSettingsFields: View {
                 }
                 .accessibilityLabel("Transcription Language")
                 .labelsHidden()
-                Text("Hint to the transcription model. Auto-detect works for most users. Pick a specific language if you see wrong-script characters (for example Chinese) appear in your output. With Deepgram streaming, Auto-detect uses English; pick a language to stream in another one.")
+                Text("Hint to the transcription model. Auto-detect works for most users. Pick a specific language if you see wrong-script characters (for example Chinese) appear in your output. With Deepgram or AssemblyAI streaming, Auto-detect uses English; pick a language to stream in another one. AssemblyAI streams only the languages it supports; others are uploaded after you release the shortcut.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -460,11 +505,55 @@ struct ProviderSettingsFields: View {
                     }
                 }
             }
+
+            if appState.streamingProvider == .assemblyAI {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("AssemblyAI API Key")
+                        .font(.caption.weight(.semibold))
+                    HStack(spacing: 8) {
+                        SecureField("Enter your AssemblyAI API key", text: $assemblyAIAPIKeyDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                            .focused($isEditingAssemblyAIAPIKey)
+                            .onSubmit {
+                                commitAssemblyAIAPIKey()
+                            }
+                            .onChange(of: isEditingAssemblyAIAPIKey) { isEditing in
+                                if !isEditing {
+                                    commitAssemblyAIAPIKey()
+                                }
+                            }
+                            .onChange(of: assemblyAIAPIKeyDraft) { _ in
+                                assemblyAIKeyValidation = nil
+                            }
+                            .disabled(isValidatingAssemblyAIKey)
+                        Button(isValidatingAssemblyAIKey ? "Validating..." : "Validate") {
+                            validateAssemblyAIAPIKey()
+                        }
+                        .disabled(assemblyAIAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isValidatingAssemblyAIKey)
+                        if !assemblyAIAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Button("Clear") {
+                                assemblyAIAPIKeyDraft = ""
+                                appState.assemblyAIAPIKey = ""
+                            }
+                            .font(.caption)
+                        }
+                    }
+                    if let assemblyAIKeyValidation {
+                        assemblyAIKeyValidationLabel(assemblyAIKeyValidation)
+                    } else if appState.assemblyAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Label(StreamingTranscriptionProvider.assemblyAIMissingKeyWarning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
         }
         .onAppear {
             transcriptionModelDraft = appState.transcriptionModel
             realtimeStreamingModelDraft = appState.realtimeStreamingModel
             deepgramAPIKeyDraft = appState.deepgramAPIKey
+            assemblyAIAPIKeyDraft = appState.assemblyAIAPIKey
             postProcessingModelDraft = appState.postProcessingModel
             postProcessingFallbackModelDraft = appState.postProcessingFallbackModel
             contextModelDraft = appState.contextModel
@@ -482,6 +571,11 @@ struct ProviderSettingsFields: View {
         .onChange(of: appState.deepgramAPIKey) { value in
             if !isEditingDeepgramAPIKey {
                 deepgramAPIKeyDraft = value
+            }
+        }
+        .onChange(of: appState.assemblyAIAPIKey) { value in
+            if !isEditingAssemblyAIAPIKey {
+                assemblyAIAPIKeyDraft = value
             }
         }
         .onChange(of: appState.postProcessingModel) { value in
@@ -1312,7 +1406,7 @@ struct GeneralSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Context awareness", isOn: $appState.contextAwarenessEnabled)
 
-            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. In Cursor, Windsurf and VS Code it also reads file names and the variable and function names visible in other editor panes; those names are sent with the cleanup request and, with Deepgram streaming, to Deepgram as key terms. With Deepgram streaming, your Mac account name and names from Chrome (chatgpt.com, google.com), the ChatGPT app and the Claude Code panel in VS Code are also sent to Deepgram as key terms; Chrome Incognito and Guest windows are skipped when Chrome's English title markers are present. Password fields, browser address bars, password managers, banking sites, terminals, and windows whose title names a secrets file such as .env are skipped, and common key and password patterns are redacted. Reading is skipped if it takes too long, so dictation is never slowed down.")
+            Text("When you start dictating, \(AppName.displayName) reads the app type, the text around your cursor, any selected text, and nearby names, then sends them with the cleanup request so names are spelled right and the result fits the conversation. In Cursor, Windsurf and VS Code it also reads file names and the variable and function names visible in other editor panes; those names are sent with the cleanup request and, with Deepgram or AssemblyAI streaming, to that service as key terms. With Deepgram or AssemblyAI streaming, your Mac account name and names from Chrome (chatgpt.com, google.com), the ChatGPT app and the Claude Code panel in VS Code are also sent to that service as key terms, and AssemblyAI also gets a short fixed description of the kind of app (never field text, titles or URLs); Chrome Incognito and Guest windows are skipped when Chrome's English title markers are present. Password fields, browser address bars, password managers, banking sites, terminals, and windows whose title names a secrets file such as .env are skipped, and common key and password patterns are redacted. Reading is skipped if it takes too long, so dictation is never slowed down.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

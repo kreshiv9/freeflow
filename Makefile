@@ -20,6 +20,9 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AppName.swift \
 	Sources/AppTextInsertionCore.swift \
 	Sources/AppTextInsertionTarget.swift \
+	Sources/AssemblyAIPromptScenario.swift \
+	Sources/AssemblyAIStreamingCore.swift \
+	Sources/AssemblyAIStreamingService.swift \
 	Sources/AudioLevelMeter.swift \
 	Sources/CaptureBackendPreference.swift \
 	Sources/CaptureFormatPreference.swift \
@@ -234,6 +237,7 @@ AUDIO_REPLAY = $(BUILD_DIR)/audio-replay
 AUDIO_REPLAY_SOURCES = $(shell find Tools/AudioReplay -name '*.swift' -type f | LC_ALL=C sort)
 # Production files the replay tool compiles in. The tool is never part of the app bundle.
 AUDIO_REPLAY_PRODUCTION_SOURCES = \
+	Sources/AssemblyAIStreamingCore.swift \
 	Sources/DeepgramStreamingCore.swift \
 	Sources/LLMAPITransport.swift \
 	Sources/SecretFilter.swift \
