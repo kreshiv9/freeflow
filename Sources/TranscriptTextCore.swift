@@ -377,6 +377,16 @@ enum TranscriptOutputSanitizer {
     static let backtrackMarkerPattern =
         #"(?i)\b(actually|scratch that|strike that|delete that|cancel that|never ?mind|i mean|sorry|wait|or rather|rather|instead|correction|let me rephrase|make that|de fapt|perd[oó]n)\b"#
 
+    /// "no" after punctuation ("Monday. No, Tuesday."), "no no", "I meant" and "oops", which
+    /// backtrackMarkerPattern lacks, with the common non-English negations an unaccented
+    /// Auto-detect dictation can still carry.
+    private static let punctuatedBacktrackMarkerPattern =
+        #"(?i)[,.;:!?]\s*(?:no|nu|non|nein|não)\b|\bno,?\s+no\b|\bi meant\b|\b(?:wh)?oops\b"#
+    /// The markers above plus "no" anywhere but the start ("tokyo no osaka"). The cleanup fast
+    /// path sends any of them to the model; the number guard steps aside for them.
+    static let extraBacktrackMarkerPattern =
+        punctuatedBacktrackMarkerPattern + #"|(?i)\S\s+(?:no|nu|non|nein|não)\b"#
+
     /// True when cleanup dropped meaning the speaker never retracted: content-word recall fell below
     /// the level's bar, or, at Light, a whole raw sentence with three or more content words lost most
     /// of them. Skipped for translation and whenever the speaker used an explicit backtrack marker.
@@ -409,5 +419,125 @@ enum TranscriptOutputSanitizer {
 
     private static func contentWords(in text: String) -> Set<String> {
         Set(words(in: text).filter { $0.count > 1 && !stopWords.contains($0) && !rewrittenWords.contains($0) })
+    }
+
+    // MARK: - Negation and number guard
+
+    /// "not", "never", "cannot" and every n't contraction, straight or curly. "no" is left out
+    /// because it is also a backtrack marker ("Monday, no, Tuesday").
+    private static let negationPattern = try! NSRegularExpression(pattern: #"(?i)\b(?:not|never|cannot)\b|n['’]t\b"#)
+
+    /// A marker word right after a negation is not a self-correction: "can't wait", "don't actually".
+    private static let unnegatedBacktrackMarkerPattern =
+        #"(?i)(?<!n['’]t\s)(?<!\bnot\s)(?<!\bnever\s)(?<!\bcannot\s)(?:"# + backtrackMarkerPattern + ")"
+    /// The negation check skips a bare mid-sentence "no", which is usually a determiner ("there's
+    /// no time"); the number check counts it ("room 5 no room 6").
+    private static let negationCorrectionMarkers = try! NSRegularExpression(
+        pattern: unnegatedBacktrackMarkerPattern + "|" + punctuatedBacktrackMarkerPattern
+    )
+    private static let numberCorrectionMarkers = try! NSRegularExpression(
+        pattern: unnegatedBacktrackMarkerPattern + "|" + extraBacktrackMarkerPattern
+    )
+
+    /// True when cleanup removed a negation or lost a number the speaker never retracted. "do not"
+    /// -> "don't", "five" -> "5", "2 thousand" -> "2,000" and "is not empty" -> "isNotEmpty" pass;
+    /// an added negation or digit is not checked. A stutter ("we can't, we can't") counts once,
+    /// and after a self-correction marker only the wording after the last one is the speaker's
+    /// final version. Skipped for translation.
+    static func appearsToHaveChangedNegationOrNumber(
+        rawTranscript: String,
+        cleanedTranscript: String,
+        outputLanguage: String
+    ) -> Bool {
+        guard outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        let spoken = withoutRepeatedPhrases(splittingIdentifiers(rawTranscript).lowercased())
+        let cleaned = splittingIdentifiers(cleanedTranscript)
+        if negationCount(in: cleaned) < negationCount(in: finalVersion(of: spoken, after: negationCorrectionMarkers)) {
+            return true
+        }
+        let spokenDigits = digits(in: withoutRestatedNumbers(finalVersion(of: spoken, after: numberCorrectionMarkers)))
+        return !isSubsequence(spokenDigits, of: digits(in: withNumberWordsAsDigits(cleaned)))
+    }
+
+    private static func negationCount(in text: String) -> Int {
+        negationPattern.numberOfMatches(in: text, range: NSRange(text.startIndex..., in: text))
+    }
+
+    /// "is_not_empty" and "isNotEmpty" read as the words the Developer syntax rule joined.
+    private static func splittingIdentifiers(_ text: String) -> String {
+        text.replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: #"(?<=\p{Ll})(?=\p{Lu})"#, with: " ", options: .regularExpression)
+    }
+
+    /// A stutter or duplicate start of one to four words, which cleanup removes, counts once:
+    /// "i don't, i don't think" -> "i don't think". Lowercased input: backreferences are case-sensitive.
+    private static func withoutRepeatedPhrases(_ text: String) -> String {
+        text.replacingOccurrences(
+            of: #"\b([\w'’]+(?:\s+[\w'’]+){0,3})(?:[\s,;:.\-–—]+\1\b)+"#,
+            with: "$1",
+            options: .regularExpression
+        )
+    }
+
+    /// Marker words that are often filler: with no wording after them they correct nothing ("we
+    /// can't ship it actually"), unlike a final "scratch that", which retracts everything.
+    private static let fillerMarkers: Set<String> = ["actually", "i mean", "sorry", "wait", "rather", "instead"]
+
+    /// The wording after the last self-correction marker, or all of it when there is none.
+    private static func finalVersion(of text: String, after markers: NSRegularExpression) -> String {
+        let nsText = text as NSString
+        for match in markers.matches(in: text, range: NSRange(location: 0, length: nsText.length)).reversed() {
+            let rest = nsText.substring(from: NSMaxRange(match.range))
+            if rest.contains(where: { $0.isLetter || $0.isNumber })
+                || !fillerMarkers.contains(nsText.substring(with: match.range)) {
+                return rest
+            }
+        }
+        return text
+    }
+
+    /// A number restated in the same slot without a marker ("at 2, 3", "2 or 3", "at 2, at 3")
+    /// is the abandoned one, as the prompt's restatement rule says.
+    private static func withoutRestatedNumbers(_ text: String) -> String {
+        text.replacingOccurrences(
+            of: #"[0-9]+(?=(?:\s*,\s+|(?:\s*,)?\s+(?:no|or),?\s+)(?:[a-z]+\s+)?[0-9])"#,
+            with: " ",
+            options: .regularExpression
+        )
+    }
+
+    private static let numberWords = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+        "nineteen", "twenty"
+    ]
+
+    /// A digit the cleanup wrote as a word ("use two spaces") still counts.
+    private static func withNumberWordsAsDigits(_ text: String) -> String {
+        numberWords.enumerated().reduce(text) { text, entry in
+            text.replacingOccurrences(
+                of: "\\b\(entry.element)\\b",
+                with: String(entry.offset),
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
+    }
+
+    /// ASCII digits in order, so regrouping ("5 5 5 1 2 3 4" -> "555-1234", "230" -> "2:30",
+    /// "1,000" -> "1000") keeps them. Snippet placeholders (⟦S1⟧) are skipped because
+    /// SnippetExpansionPlan.resolve reports a dropped one.
+    private static func digits(in text: String) -> String {
+        text.replacingOccurrences(of: "\u{27E6}[^\u{27E7}]*\u{27E7}", with: " ", options: .regularExpression)
+            .filter { $0.isASCII && $0.isNumber }
+    }
+
+    /// Every raw digit appears in the cleaned text in the same order; extra cleaned digits
+    /// ("2 thousand" -> "2,000", a numbered list) are allowed.
+    private static func isSubsequence(_ needle: String, of haystack: String) -> Bool {
+        var remaining = needle[...]
+        for character in haystack where character == remaining.first {
+            remaining = remaining.dropFirst()
+        }
+        return remaining.isEmpty
     }
 }

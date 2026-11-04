@@ -19,8 +19,11 @@ enum PostProcessingServiceTests {
         testDirectiveOrdering()
         testDefaultPromptKeepsSafetyRules()
         testDefaultPromptHasSmartFormattingRules()
+        testDefaultPromptHasCleanupQualityRules()
+        testDefaultPromptExamples()
         testEchoedDelimiterIsStrippedFromCleanup()
         testDroppedSentenceFallsBackWithoutRetry()
+        testChangedNegationOrNumberFallsBackWithoutRetry()
         testCleanupDeadlineThrowsTimedOut()
         testDeadlineLeavesEditModeAndTranslationAlone()
         testURLTimeoutMapsToDeadline()
@@ -47,6 +50,71 @@ enum PostProcessingServiceTests {
         }
         TestSupport.expect(run.result == nil, "A cleanup that drops a sentence must throw so the caller pastes the raw transcript")
         TestSupport.expectEqual(run.requests.count, 1)
+    }
+
+    private static func testChangedNegationOrNumberFallsBackWithoutRetry() {
+        let raw = "please do not merge the synthetic release branch before friday"
+
+        let droppedNot = RequestRecorder()
+        let droppedNotOutcome = cleanupOutcome(
+            service: makeService(recorder: droppedNot) { _ in "Please merge the synthetic release branch before Friday." },
+            transcript: raw
+        )
+        TestSupport.expect(droppedNotOutcome.result == nil, "A cleanup that drops a \"not\" must throw")
+        TestSupport.expect(isMeaningChange(droppedNotOutcome.error), "A dropped \"not\" is a meaning change")
+        TestSupport.expectEqual(droppedNot.captured.count, 1)
+
+        let contracted = RequestRecorder()
+        TestSupport.expectEqual(
+            cleanupOutcome(
+                service: makeService(recorder: contracted) { _ in "Please don't merge the synthetic release branch before Friday." },
+                transcript: raw
+            ).result?.transcript,
+            "Please don't merge the synthetic release branch before Friday."
+        )
+
+        let droppedDigits = RequestRecorder()
+        TestSupport.expect(
+            isMeaningChange(cleanupOutcome(
+                service: makeService(recorder: droppedDigits) { _ in "Set the synthetic retry limit." },
+                transcript: "set the synthetic retry limit to 15"
+            ).error),
+            "A dropped number is a meaning change"
+        )
+
+        let medium = RequestRecorder()
+        TestSupport.expect(
+            isMeaningChange(cleanupOutcome(
+                service: makeService(recorder: medium) { _ in "Push straight to the synthetic main branch." },
+                transcript: "never push straight to the synthetic main branch",
+                cleanupLevel: .medium
+            ).error),
+            "Medium may reword but never drops a negation"
+        )
+
+        let translation = RequestRecorder()
+        TestSupport.expect(
+            cleanupOutcome(
+                service: makeService(recorder: translation) { _ in "Bitte synthetisch zusammenführen." },
+                outputLanguage: "German",
+                transcript: "please do not merge it"
+            ).result != nil,
+            "Translation output is not checked word for word"
+        )
+
+        let backtrack = RequestRecorder()
+        TestSupport.expectEqual(
+            cleanupOutcome(
+                service: makeService(recorder: backtrack) { _ in "Set the synthetic limit to 20." },
+                transcript: "set the synthetic limit to 15 actually 20"
+            ).result?.transcript,
+            "Set the synthetic limit to 20."
+        )
+
+        TestSupport.expect(
+            PostProcessingError.suspectedMeaningChange.localizedDescription.contains("negation or number"),
+            "The Settings prompt test shows the meaning-change error text"
+        )
     }
 
     private static let directive = "The dictation is primarily in Russian"
@@ -439,7 +507,7 @@ Synthetic term
         ] {
             TestSupport.expect(prompt.contains(rule), "The default prompt must keep: \(rule)")
         }
-        TestSupport.expectEqual(PostProcessingService.defaultSystemPromptDate, "2026-11-03")
+        TestSupport.expectEqual(PostProcessingService.defaultSystemPromptDate, "2026-11-04")
         TestSupport.expect(
             PostProcessingService.defaultSystemPromptDate > "2026-10-10",
             "The bumped date must show the newer-default banner to custom-prompt users"
@@ -475,6 +543,93 @@ Synthetic term
             "simply restating a word or phrase"
         ] {
             TestSupport.expect(!prompt.contains(removed), "The default prompt must drop: \(removed)")
+        }
+    }
+
+    private static func testDefaultPromptHasCleanupQualityRules() {
+        let prompt = PostProcessingService.defaultSystemPrompt
+        for rule in [
+            "Meaning is fixed: outside a self-correction, never add or remove a negation (not, never, no, n't, cannot), a number, a name, or the action a request asks for",
+            // A false start is not a content word to keep, or Light would keep it.
+            "keep every content word that is not filler or a false start",
+            "\"you know\"",
+            "\"I mean\" with no correction after it",
+            "\"actually\" that corrects nothing",
+            "\"so\" or \"okay so\" opening a sentence",
+            // A confirmation tag stays: only a filler "right?" goes.
+            "\"right?\" mid-sentence",
+            "Keep them when they carry meaning (\"I like it\", \"we ship Friday, right?\")",
+            "Commas and periods often mark pauses, not grammar",
+            "join a fragment split off by a period",
+            "This is punctuation, not rewording.",
+            "fix a misheard word only when the intended word is certain",
+            "when unsure, keep the transcript's word",
+            "\"actually\" or \"I mean\" followed by a replacement",
+            "never copy text from CONTEXT or the examples into the output"
+        ] {
+            TestSupport.expect(prompt.contains(rule), "The default prompt must contain: \(rule)")
+        }
+        for removed in ["obvious ASR mistakes", "Markers include \"actually\"", "a tag \"right?\""] {
+            TestSupport.expect(!prompt.contains(removed), "The default prompt must drop: \(removed)")
+        }
+    }
+
+    /// Every example is invented. Together they teach fillers, pause punctuation, a kept
+    /// negation and number, a self-correction, and restraint on an already-clean prompt.
+    private static func testDefaultPromptExamples() {
+        let prompt = PostProcessingService.defaultSystemPrompt
+        guard let start = prompt.range(of: "Examples:\n") else {
+            TestSupport.expect(false, "The default prompt must have an Examples block")
+            return
+        }
+        let block = prompt[start.upperBound...].components(separatedBy: "\n\n").first ?? ""
+        let lines = block.components(separatedBy: "\n")
+        TestSupport.expect((4...6).contains(lines.count), "The prompt must have 4 to 6 examples")
+        var pairs: [(raw: String, cleaned: String)] = []
+        for line in lines {
+            let parts = line.components(separatedBy: "\" -> \"")
+            TestSupport.expect(
+                line.hasPrefix("- \"") && line.hasSuffix("\"") && parts.count == 2,
+                "Each example must read - \"RAW\" -> \"CLEANED\": \(line)"
+            )
+            guard parts.count == 2 else { continue }
+            pairs.append((String(parts[0].dropFirst(3)), String(parts[1].dropLast())))
+        }
+        for pair in pairs {
+            TestSupport.expect(
+                !TranscriptOutputSanitizer.appearsToHaveChangedNegationOrNumber(
+                    rawTranscript: pair.raw, cleanedTranscript: pair.cleaned, outputLanguage: ""
+                ),
+                "An example must pass the meaning guard: \(pair.raw)"
+            )
+            for marker in ["RAW_TRANSCRIPTION", "CONTEXT"] {
+                TestSupport.expect(
+                    !pair.raw.contains(marker) && !pair.cleaned.contains(marker),
+                    "An example must not contain \(marker)"
+                )
+            }
+        }
+        TestSupport.expect(pairs.contains { $0.cleaned == $0.raw + "." }, "One example leaves a clean prompt unchanged")
+        TestSupport.expect(
+            pairs.contains { $0.raw.contains("you know") && !$0.cleaned.contains("you know") },
+            "One example removes discourse fillers"
+        )
+        TestSupport.expect(
+            pairs.contains {
+                $0.raw.contains("n't") && $0.cleaned.contains("n't") && $0.raw.contains("2") && $0.cleaned.contains("2")
+            },
+            "One example keeps a negation and a number"
+        )
+        for (raw, cleaned) in [
+            // A pause comma and a fragment split off by a period.
+            ("okay so how long do you, boil an egg. For a soft yolk", "How long do you boil an egg for a soft yolk?"),
+            // A self-correction.
+            ("open the user model, I mean the account model, and add an email field", "Open the account model and add an email field.")
+        ] {
+            TestSupport.expect(
+                pairs.contains { $0.raw == raw && $0.cleaned == cleaned },
+                "The prompt must keep the example: \(raw)"
+            )
         }
     }
 
@@ -568,12 +723,12 @@ Synthetic term
         TestSupport.expectEqual(requests[0].systemPrompt, requests[1].systemPrompt)
     }
 
-    /// About 1,000 tokens (1,026 with o200k_base when trimmed); the character count is the
-    /// dependency-free proxy.
+    /// About 1,400 tokens (1,401 with o200k_base when trimmed, up from 1,026 before the cleanup
+    /// quality rules and examples); the character count is the dependency-free proxy.
     private static func testDefaultPromptStaysShort() {
         TestSupport.expect(
-            PostProcessingService.defaultSystemPrompt.count <= 4_500,
-            "The default prompt must stay under about 1,000 tokens"
+            PostProcessingService.defaultSystemPrompt.count <= 6_000,
+            "The default prompt must stay under about 1,400 tokens"
         )
     }
 
@@ -759,6 +914,11 @@ Synthetic term
 
     private static func isTimedOut(_ error: Error?) -> Bool {
         guard let error = error as? PostProcessingError, case .requestTimedOut(_) = error else { return false }
+        return true
+    }
+
+    private static func isMeaningChange(_ error: Error?) -> Bool {
+        guard let error = error as? PostProcessingError, case .suspectedMeaningChange = error else { return false }
         return true
     }
 
@@ -949,17 +1109,20 @@ Synthetic term
     /// One default cleanup through `service`: the result, or the error it threw.
     private static func cleanupOutcome(
         service: PostProcessingService,
-        outputLanguage: String = ""
+        outputLanguage: String = "",
+        transcript: String = "synthetic transcript",
+        cleanupLevel: CleanupLevel = .light
     ) -> (result: PostProcessingResult?, error: Error?) {
         let box = ResultBox()
         let done = DispatchSemaphore(value: 0)
         Task {
             do {
                 box.result = try await service.postProcess(
-                    transcript: "synthetic transcript",
+                    transcript: transcript,
                     context: syntheticContext,
                     customVocabulary: "",
-                    outputLanguage: outputLanguage
+                    outputLanguage: outputLanguage,
+                    cleanupLevel: cleanupLevel
                 )
             } catch {
                 box.error = error

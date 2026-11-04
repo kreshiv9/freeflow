@@ -24,6 +24,8 @@ enum TranscriptTextCoreTests {
         testEchoedPromptScaffoldingIsStripped()
         testContentLossGuardCatchesDroppedSentence()
         testContentLossGuardAllowsNormalCleanup()
+        testMeaningGuardCatchesNegationAndNumberChanges()
+        testMeaningGuardAllowsEquivalentRewrites()
     }
 
     private static func testEchoedPromptScaffoldingIsStripped() {
@@ -101,6 +103,115 @@ enum TranscriptTextCoreTests {
         TestSupport.expect(
             !TranscriptOutputSanitizer.appearsToHaveDroppedContent(
                 rawTranscript: translated, cleanedTranscript: "Deberíamos mover la revisión al jueves.", allowsRewording: false, outputLanguage: "Spanish"
+            ),
+            "Translation is exempt"
+        )
+    }
+
+    private static func testMeaningGuardCatchesNegationAndNumberChanges() {
+        let cases: [(raw: String, cleaned: String)] = [
+            ("please do not merge the release branch until friday", "Please merge the release branch until Friday."),
+            ("we can\u{2019}t ship the synthetic build today", "We can ship the synthetic build today."),
+            ("we can't ship the synthetic build today", "We can ship the synthetic build today."),
+            ("never push straight to main", "Push straight to main."),
+            // A dropped number, then a changed one.
+            ("set the retry limit to 15 and the timeout to 30 seconds", "Set the retry limit to 15 and the timeout to seconds."),
+            ("set the retry limit to 15 and the timeout to 30 seconds", "Set the retry limit to 50 and the timeout to 30 seconds."),
+            // EMPTY output for a dictation that was not filler.
+            ("not now", ""),
+            // A stutter counts once, so dropping the one negation it repeats still trips.
+            ("we can't, we can't ship it", "We can ship it."),
+            // A filler or non-correction marker word keeps the check on for what follows it.
+            ("I'd rather not change the schema", "I'd rather change the schema."),
+            ("we actually don't need it", "We need it."),
+            ("actually let's not change the config", "Let's change the config."),
+            ("I mean we should not deploy today", "We should deploy today."),
+            ("sorry I can't make it at 3", "Sorry, I can make it at 3."),
+            ("sorry I can't make it at 3", "Sorry, I can't make it."),
+            // A marker word right after a negation is not a correction.
+            ("don't wait for the build", "Wait for the build."),
+            ("I can't wait to ship it", "I can wait to ship it."),
+            // A determiner "no" is not a correction for the negation check.
+            ("we can't ship it, there's no time", "We can ship it. There's no time."),
+            // A trailing marker word with nothing after it corrects nothing.
+            ("we can't ship it actually", "We can ship it."),
+            // The final version after a correction must keep its number.
+            ("send it at 2 actually 3", "Send it."),
+            ("meet at 2, 3", "Meet at 2.")
+        ]
+        for (raw, cleaned) in cases {
+            TestSupport.expect(
+                TranscriptOutputSanitizer.appearsToHaveChangedNegationOrNumber(
+                    rawTranscript: raw, cleanedTranscript: cleaned, outputLanguage: ""
+                ),
+                "The meaning guard must trip: \(raw) -> \(cleaned)"
+            )
+        }
+    }
+
+    private static func testMeaningGuardAllowsEquivalentRewrites() {
+        let cases: [(raw: String, cleaned: String)] = [
+            ("please do not merge it yet", "Please don't merge it yet."),
+            ("please do not merge it yet", "Please don\u{2019}t merge it yet."),
+            ("we cannot ship it", "We can't ship it."),
+            ("we can not ship it", "We cannot ship it."),
+            ("set the retry limit to five", "Set the retry limit to 5."),
+            ("the budget is 1,000 dollars", "The budget is $1000."),
+            ("the budget is 1000 dollars", "The budget is $1,000."),
+            ("meet at 3:30 tomorrow", "Meet at 3:30 tomorrow."),
+            ("version 2.5 is out", "Version 2.5 is out."),
+            // An added negation is not checked.
+            ("dont merge it", "Don't merge it."),
+            // After an explicit self-correction only the final version is checked.
+            ("send it at 2 actually 3", "Send it at 3."),
+            ("do not ship it, scratch that, ship it", "Ship it."),
+            // A final "scratch that" or "never mind" retracts everything before it.
+            ("do not ship it, scratch that", ""),
+            ("set the limit to 15 never mind", ""),
+            // "no" is not counted: it is also a correction marker.
+            ("send it monday no tuesday", "Send it Tuesday."),
+            ("add notes about nothing new", "Add notes about nothing new."),
+            // Snippet placeholders are checked by the snippet plan.
+            ("look at \u{27E6}S1\u{27E7} now", "Look at now."),
+            // A stutter or duplicate start the prompt removes.
+            ("we can't we can't ship it today", "We can't ship it today."),
+            ("I don't, I don't think we should merge it", "I don't think we should merge it."),
+            ("it's not, it's not working", "It's not working."),
+            ("I cannot cannot do it", "I cannot do it."),
+            ("never, never push to main", "Never push to main."),
+            // A number corrected with "no", "I meant" or "oops", or restated in the same slot.
+            ("meet at 2 no 3", "Meet at 3."),
+            ("set the timeout to 30, no, 60 seconds", "Set the timeout to 60 seconds."),
+            ("meet at 2 pm no 3 pm", "Meet at 3 PM."),
+            ("send 5 copies, I meant 6", "Send 6 copies."),
+            ("set the limit to 15 oops 16", "Set the limit to 16."),
+            ("send it at 2, 3", "Send it at 3."),
+            ("send it at 2, at 3", "Send it at 3."),
+            // A negation retracted with a punctuated "no" or with "wait" after a comma.
+            ("don't merge it, no, merge it", "Merge it."),
+            ("we can't, wait, we can ship it", "We can ship it."),
+            // A "not" folded into an identifier by the Developer syntax rule.
+            ("rename it to is underscore not underscore empty", "Rename it to is_not_empty."),
+            ("call it is not empty in camel case", "Call it isNotEmpty."),
+            // Digits regrouped, joined to a magnitude, or written as a small number word.
+            ("call 5 5 5 1 2 3 4", "Call 555-1234."),
+            ("it costs 10 000 dollars", "It costs $10,000."),
+            ("we need 2 thousand units", "We need 2,000 units."),
+            ("the code is 4 5 6 7", "The code is 4567."),
+            ("meet at 230", "Meet at 2:30."),
+            ("use 2 spaces", "Use two spaces.")
+        ]
+        for (raw, cleaned) in cases {
+            TestSupport.expect(
+                !TranscriptOutputSanitizer.appearsToHaveChangedNegationOrNumber(
+                    rawTranscript: raw, cleanedTranscript: cleaned, outputLanguage: ""
+                ),
+                "The meaning guard must not trip: \(raw) -> \(cleaned)"
+            )
+        }
+        TestSupport.expect(
+            !TranscriptOutputSanitizer.appearsToHaveChangedNegationOrNumber(
+                rawTranscript: "we did not approve it", cleanedTranscript: "Lo aprobamos.", outputLanguage: "Spanish"
             ),
             "Translation is exempt"
         )

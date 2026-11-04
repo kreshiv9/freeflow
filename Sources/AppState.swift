@@ -3379,6 +3379,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case postProcessingFailedFallback
         case postProcessingDroppedSnippetPlaceholders
         case postProcessingDroppedContentFallback
+        case postProcessingChangedMeaningFallback
         case postProcessingTimedOutFallback
         case cleanupFastPath(CleanupFastPath.Reason)
         case preservedExactWording
@@ -3419,6 +3420,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return isRetry
                     ? "Cleanup dropped part of the transcript on retry, using raw transcript"
                     : "Cleanup dropped part of the transcript, using raw transcript"
+            case .postProcessingChangedMeaningFallback:
+                return isRetry
+                    ? "Cleanup changed a negation or number on retry, using raw transcript"
+                    : "Cleanup changed a negation or number, using raw transcript"
             case .postProcessingTimedOutFallback:
                 return isRetry ? CleanupFastPath.timedOutRetryProcessingStatus : CleanupFastPath.timedOutProcessingStatus
             case .cleanupFastPath(let reason):
@@ -3660,6 +3665,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
             // Like Wispr Flow, a failed format falls back to the raw transcript.
             os_log(.error, log: recordingLog, "Post-processing dropped part of the transcript, using raw transcript")
             return (snippetPlan.expandedText, .postProcessingDroppedContentFallback, "", expandedSnippetCount, taggedFileCount)
+        } catch PostProcessingError.suspectedMeaningChange {
+            // The raw words, list-formatted as on a deadline miss, are safer than a flipped negation or a lost number.
+            os_log(.error, log: recordingLog, "Cleanup changed a negation or number, using raw transcript")
+            return (
+                CleanupFastPath.timedOutText(for: snippetPlan),
+                .postProcessingChangedMeaningFallback,
+                "",
+                expandedSnippetCount,
+                taggedFileCount
+            )
         } catch PostProcessingError.requestTimedOut(_) {
             os_log(.error, log: recordingLog, "Cleanup missed its deadline, using raw transcript")
             return (
@@ -4081,6 +4096,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         case .postProcessingFailedFallback,
                              .postProcessingDroppedSnippetPlaceholders,
                              .postProcessingDroppedContentFallback,
+                             .postProcessingChangedMeaningFallback,
                              .postProcessingTimedOutFallback,
                              .preservedExactWordingTranslationFailedFallback,
                              .verbatimTranslationDroppedSnippetPlaceholders:
