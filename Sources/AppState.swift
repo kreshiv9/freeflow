@@ -770,7 +770,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var selectedSettingsTab: SettingsTab? = .general
     @Published var pipelineHistory: [PipelineHistoryItem] = []
     @Published var debugStatusMessage = "Idle"
-    @Published var debugShowsUpdateReminderAfterDictation = false
     @Published var lastRawTranscript = ""
     @Published var lastPostProcessedTranscript = ""
     @Published var lastPostProcessingPrompt = ""
@@ -849,7 +848,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var pendingMicrophonePermissionSelectionSnapshot: AppSelectionSnapshot?
     private var pendingMicrophonePermissionManualCommandRequested: Bool?
     private var isApplyingAPIConfiguration = false
-    private let postTranscriptionUpdateReminderDuration: TimeInterval = 7
 
     init() {
         UserDefaults.standard.removeObject(forKey: "force_http2_transcription")
@@ -1090,11 +1088,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
         overlayManager.onStopButtonPressed = { [weak self] in
             DispatchQueue.main.async {
                 self?.handleOverlayStopButtonPressed()
-            }
-        }
-        overlayManager.onUpdateOverlayPressed = { [weak self] in
-            DispatchQueue.main.async {
-                self?.handleUpdateOverlayPressed()
             }
         }
 
@@ -3883,9 +3876,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 ? CommandModeIntent.webSearchStatusText
                                 : shouldPressEnterAfterPaste ? enterOnlyStatusText : "Nothing to transcribe"
                             self.clearPendingOverlayDismissToken()
-                            if !self.showPostTranscriptionUpdateReminderIfNeeded() {
-                                self.overlayManager.dismiss()
-                            }
+                            self.overlayManager.dismiss()
                             if shouldPressEnterAfterPaste && !isWebSearch {
                                 if useOriginalFieldInsertion {
                                     if let textInsertionTarget {
@@ -3910,9 +3901,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             if case .commandModeSucceeded = result.outcome {
                                 self.statusText = completionStatusText
                                 self.clearPendingOverlayDismissToken()
-                                if !self.showPostTranscriptionUpdateReminderIfNeeded() {
-                                    self.overlayManager.dismiss()
-                                }
+                                self.overlayManager.dismiss()
                                 self.pasteGate.schedule { [weak self] firedAt in
                                     guard let firedAt else {
                                         self?.completeStageTimings(recordedMarks.timings, entryID: nil)
@@ -3937,9 +3926,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 self.scheduleOverlayDismissAfterFailureIndicator(after: 2.5)
                             } else {
                                 self.clearPendingOverlayDismissToken()
-                                if !self.showPostTranscriptionUpdateReminderIfNeeded() {
-                                    self.overlayManager.dismiss()
-                                }
+                                self.overlayManager.dismiss()
                             }
 
                             self.pasteGate.schedule { [weak self] firedAt in
@@ -4072,9 +4059,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         endCriticalDictationActivity()
         statusText = status
         clearPendingOverlayDismissToken()
-        if !showPostTranscriptionUpdateReminderIfNeeded() {
-            overlayManager.dismiss()
-        }
+        overlayManager.dismiss()
         audioRecorder.cleanup()
         refreshAvailableMicrophonesIfNeeded()
         scheduleReadyStatusReset(after: 3, matching: [status])
@@ -4467,62 +4452,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func clearPendingOverlayDismissToken() {
         pendingOverlayDismissToken = nil
-    }
-
-    @MainActor
-    private func showPostTranscriptionUpdateReminderIfNeeded() -> Bool {
-        if debugShowsUpdateReminderAfterDictation {
-            showDebugUpdateAvailableOverlay()
-            return true
-        }
-
-        let updateManager = UpdateManager.shared
-        guard updateManager.shouldShowPostTranscriptionReminder() else { return false }
-
-        let dismissToken = UUID()
-        pendingOverlayDismissToken = dismissToken
-        updateManager.markPostTranscriptionReminderShown()
-        overlayManager.showUpdateAvailable(version: updateManager.latestReleaseVersion)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + postTranscriptionUpdateReminderDuration) { [weak self] in
-            guard let self, self.pendingOverlayDismissToken == dismissToken else { return }
-            self.pendingOverlayDismissToken = nil
-            self.overlayManager.dismiss()
-        }
-
-        return true
-    }
-
-    @MainActor
-    func showDebugUpdateAvailableOverlay() {
-        let updateManager = UpdateManager.shared
-        let version = updateManager.latestReleaseVersion.isEmpty ? "9.9.9" : updateManager.latestReleaseVersion
-        let dismissToken = UUID()
-        if isDebugOverlayActive || debugOverlayTimer != nil {
-            stopDebugOverlay()
-        }
-        pendingOverlayDismissToken = dismissToken
-        overlayManager.showUpdateAvailable(version: version)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + postTranscriptionUpdateReminderDuration) { [weak self] in
-            guard let self, self.pendingOverlayDismissToken == dismissToken else { return }
-            self.pendingOverlayDismissToken = nil
-            self.overlayManager.dismiss()
-        }
-    }
-
-    @MainActor
-    private func handleUpdateOverlayPressed() {
-        clearPendingOverlayDismissToken()
-        overlayManager.dismiss()
-        selectedSettingsTab = .general
-        NotificationCenter.default.post(name: .showSettings, object: nil)
-
-        DispatchQueue.main.async {
-            if UpdateManager.shared.updateAvailable {
-                UpdateManager.shared.showUpdateAlert()
-            }
-        }
     }
 
     private func scheduleOverlayDismissAfterFailureIndicator(after delay: TimeInterval) {

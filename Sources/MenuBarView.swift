@@ -2,7 +2,6 @@ import SwiftUI
 
 struct MenuBarView: View {
     @EnvironmentObject var appState: AppState
-    @ObservedObject private var updateManager = UpdateManager.shared
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -349,68 +348,6 @@ struct MenuBarView: View {
 
             Button("Settings") {
                 NotificationCenter.default.post(name: .showSettings, object: nil)
-            }
-
-            Button {
-                Task {
-                    await updateManager.checkForUpdates(userInitiated: true)
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    if updateManager.isChecking {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-                    Text(updateManager.isChecking ? "Checking for Updates..." : "Check for Updates")
-                }
-            }
-            .disabled(updateManager.isChecking)
-
-            if updateManager.updateAvailable {
-                Divider()
-
-                switch updateManager.updateStatus {
-                case .downloading:
-                    VStack(spacing: 4) {
-                        Text("Downloading update... \(Int((updateManager.downloadProgress ?? 0) * 100))%")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.white)
-                        ProgressView(value: updateManager.downloadProgress ?? 0)
-                            .progressViewStyle(.linear)
-                            .tint(.white)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity)
-                    .background(Color.blue)
-
-                case .installing, .readyToRelaunch:
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Installing update...")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity)
-                    .background(Color.blue)
-
-                default:
-                    Button {
-                        updateManager.showUpdateAlert()
-                    } label: {
-                        Label("Update available", systemImage: "arrow.down.circle.fill")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.white)
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity)
-                    .background(Color.blue)
-                }
             }
 
             Divider()

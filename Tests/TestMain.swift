@@ -35,6 +35,8 @@ struct FreeFlowTests {
         OriginalFieldInsertionPreferenceTests.run()
         ShortcutCoreTests.run()
         SemanticVersionTests.run()
+        AppSettingsStoreTests.run()
+        UpstreamDisconnectTests.run()
         LLMCooldownManagerTests.run()
         PostProcessingServiceTests.run()
         TransformCoreTests.run()
