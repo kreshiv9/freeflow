@@ -111,28 +111,32 @@ enum CleanupFastPath {
     }
 
     /// Hesitations and the discourse fillers the prompt removes, over-inclusive: any "like", "so"
-    /// or "okay so" opening a sentence, and a "right?" tag. "just" is left out because in a short
+    /// or "okay so" opening a sentence, a "right?" tag, and "just" after "I", "we" or "you" ("I
+    /// just think", "can you just"). A sentence-initial "just" is left out because in a short
     /// dictation it nearly always carries meaning ("Just ship it."); "actually" and "I mean" come
     /// from the backtrack marker list. The search-box rule shares this list, so these fillers are
     /// never pasted there either.
     private static let fillerPattern =
-        #"(?i)\b(?:u+m+|u+h+m*|e+r+m*|a+h+|e+h+|h+m+|m+h*m+|you know|so yeah|basically|literally|like)\b|(?i)(?:^|[.!?…]\s+)so\b|(?i)\b(?:okay|ok),?\s+so\b|(?i)\bright\s*\?"#
-    /// "no" anywhere but the start ("Monday. No, Tuesday.", "tokyo no osaka"), with the common
-    /// non-English negations an unaccented Auto-detect dictation can still carry, plus
-    /// "I meant" and "oops", which the sanitizer's shared list lacks.
-    private static let extraBacktrackPattern =
-        #"(?i)(?:[,.;:!?]|\S\s)\s*(?:no|nu|non|nein|não)\b|\bno,?\s+no\b|\bi meant\b|\b(?:wh)?oops\b"#
+        #"(?i)\b(?:u+m+|u+h+m*|e+r+m*|a+h+|e+h+|h+m+|m+h*m+|you know|so yeah|basically|literally|like)\b|(?i)(?:^|[.!?…]\s+)so\b|(?i)\b(?:okay|ok),?\s+so\b|(?i)\bright\s*\?|(?i)\b(?:i|we|you)\s+just\b"#
     private static let spokenCommandPattern =
         #"(?i)\b(?:first|second|third|firstly|secondly|thirdly|1st|2nd|3rd|number (?:one|two|1|2)|bullet|numbered|new line|next line|line break|new paragraph|skip a line|comma|period|full stop|question mark|exclamation (?:point|mark)|colon|semicolon|em dash|dash dash|underscore|dot|slash|open (?:paren|quote|bracket)|close (?:paren|quote|bracket)|quote|unquote|camel case|snake case|all caps)\b"#
     private static let trailingClosers: Set<Character> = ["\"", "\u{201D}", "\u{2019}", "'", ")", "]"]
     private static let sentenceEndMarks: Set<Character> = [".", "?", "!", "\u{2026}"]
     /// Punctuation placed at a pause rather than by grammar: a sentence after an inner sentence
-    /// mark that opens with a connective ("I fixed it. Into the settings.") or has one or two
-    /// words ("I fixed it. Last night."), a comma or period right after a function word ("Open
-    /// the, settings."), or a comma right before one ("Check, the logs."). Used by the
-    /// already-clean rule only; the search box ignores it.
+    /// mark that opens with a connective or subordinator ("I fixed it. Into the settings.",
+    /// "Push it. Before the demo.") or has one or two words ("I fixed it. Last night."), a
+    /// sentence of up to three words that opens with a time word and sits before or after
+    /// another one ("I fixed it. Late last night.", "Tomorrow. Ship the fix."), a comma or
+    /// period right after a function word ("Open the, settings."), or a comma right before one
+    /// ("Check, the logs."). Other three-word sentences stay clean ("Done. See you tomorrow.").
+    /// Used by the already-clean rule only; the search box ignores it.
     private static let pauseSplitPattern =
-        #"(?i)[.!?…]["'”’)\]]*\s+(?:and|but|or|so|because|which|that|than|then|into|onto|to|for|with|without|from|in|on|at|of|by|about|like|until|unless|instead)\b|[.!?…]["'”’)\]]*\s+[\w'’-]+(?:\s+[\w'’-]+)?[.!?…]|\b(?:a|an|the|to|of|and|or|but|for|with|from|into|my|your|our|their|its)[,.;:](?:\s|$)|,\s+(?:the|a|an|to|of|into|for|with|from|in|on|at|my|your|our|their|this|these|those)\b"#
+        #"(?i)[.!?…]["'”’)\]]*\s+(?:and|but|or|so|because|which|that|than|then|into|onto|to|for|with|without|from|in|on|at|of|by|about|like|until|unless|instead|before|after|while|when|whenever|since|if|though|although)\b|[.!?…]["'”’)\]]*\s+[\w'’-]+(?:\s+[\w'’-]+)?[.!?…]|"#
+            + #"[.!?…]["'”’)\]]*\s+"# + timeWordFragment + #"|^["'“‘(\[]*"# + timeWordFragment + #"["'”’)\]]*\s+\S|"#
+            + #"\b(?:a|an|the|to|of|and|or|but|for|with|from|into|my|your|our|their|its)[,.;:](?:\s|$)|,\s+(?:the|a|an|to|of|into|for|with|from|in|on|at|my|your|our|their|this|these|those)\b"#
+    /// A short sentence that opens with a time word: "Late last night.", "Tomorrow.", "This morning."
+    private static let timeWordFragment =
+        #"(?:last|late|early|later|next|right|today|tonight|tomorrow|yesterday|this (?:morning|afternoon|evening|week|weekend|month|year))\b(?:\s+[\w'’-]+){0,2}[.!?…]"#
 
     /// One line of at most `maximumWords` words with a letter or digit that starts capitalized,
     /// ends with a sentence mark, and has no lowercase "i", lowercase sentence start after an
@@ -171,7 +175,7 @@ enum CleanupFastPath {
         return [
             fillerPattern,
             TranscriptOutputSanitizer.backtrackMarkerPattern,
-            extraBacktrackPattern,
+            TranscriptOutputSanitizer.extraBacktrackMarkerPattern,
             spokenCommandPattern
         ].contains { text.range(of: $0, options: .regularExpression) != nil }
     }

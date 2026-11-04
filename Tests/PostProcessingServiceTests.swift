@@ -550,12 +550,15 @@ Synthetic term
         let prompt = PostProcessingService.defaultSystemPrompt
         for rule in [
             "Meaning is fixed: outside a self-correction, never add or remove a negation (not, never, no, n't, cannot), a number, a name, or the action a request asks for",
+            // A false start is not a content word to keep, or Light would keep it.
+            "keep every content word that is not filler or a false start",
             "\"you know\"",
             "\"I mean\" with no correction after it",
             "\"actually\" that corrects nothing",
             "\"so\" or \"okay so\" opening a sentence",
-            "a tag \"right?\"",
-            "Keep them when they carry meaning",
+            // A confirmation tag stays: only a filler "right?" goes.
+            "\"right?\" mid-sentence",
+            "Keep them when they carry meaning (\"I like it\", \"we ship Friday, right?\")",
             "Commas and periods often mark pauses, not grammar",
             "join a fragment split off by a period",
             "This is punctuation, not rewording.",
@@ -566,7 +569,7 @@ Synthetic term
         ] {
             TestSupport.expect(prompt.contains(rule), "The default prompt must contain: \(rule)")
         }
-        for removed in ["obvious ASR mistakes", "Markers include \"actually\""] {
+        for removed in ["obvious ASR mistakes", "Markers include \"actually\"", "a tag \"right?\""] {
             TestSupport.expect(!prompt.contains(removed), "The default prompt must drop: \(removed)")
         }
     }
@@ -720,7 +723,7 @@ Synthetic term
         TestSupport.expectEqual(requests[0].systemPrompt, requests[1].systemPrompt)
     }
 
-    /// About 1,400 tokens (1,394 with o200k_base when trimmed, up from 1,026 before the cleanup
+    /// About 1,400 tokens (1,401 with o200k_base when trimmed, up from 1,026 before the cleanup
     /// quality rules and examples); the character count is the dependency-free proxy.
     private static func testDefaultPromptStaysShort() {
         TestSupport.expect(

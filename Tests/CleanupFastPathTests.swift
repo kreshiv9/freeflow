@@ -51,10 +51,13 @@ enum CleanupFastPathTests {
             "Open the settings page!",
             "Sounds good. See you then.",
             "Please send the synthetic quarterly report to the whole team by Friday.",
-            // "just" usually carries meaning, a comma the grammar needs, and a three-word sentence.
+            // "just" usually carries meaning, a comma the grammar needs, and three-word sentences
+            // that open with no time word; a lone sentence opening with one is not a split.
             "Just ship it.",
             "Run the linter, then push.",
-            "Done. See you tomorrow."
+            "Done. See you tomorrow.",
+            "Thanks. Talk to you later.",
+            "Next week works for me."
         ] {
             TestSupport.expectEqual(reason(transcript), .alreadyClean)
         }
@@ -131,6 +134,8 @@ enum CleanupFastPathTests {
             "Ok, so run it again.",
             "We ship Friday, right?",
             "The build passed. So we can ship.",
+            "I just think it's fine.",
+            "Can you just ship it?",
             // Pause punctuation: a fragment split off by a period, a comma beside a function word.
             "Move the button. To the left side.",
             "Run the tests. And then deploy.",
@@ -139,7 +144,15 @@ enum CleanupFastPathTests {
             "Open the, settings page.",
             "Send it to the. Design team.",
             "Check, the logs again.",
-            "Add a test, for the parser."
+            "Add a test, for the parser.",
+            // A fragment opening with a subordinator, or a short one opening with a time word.
+            "Push the fix. Before the demo starts.",
+            "Ship it. When the tests pass.",
+            "I fixed the bug. Late last night.",
+            "Ship it. Right after lunch.",
+            "We deploy. This morning at nine.",
+            "Tomorrow. Ship the fix.",
+            "Next week. We ship it."
         ] {
             TestSupport.expect(reason(transcript) == nil, "Must reach cleanup: \(transcript)")
             TestSupport.expect(!CleanupFastPath.isAlreadyClean(transcript), "Must not be clean: \(transcript)")
