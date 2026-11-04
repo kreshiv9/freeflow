@@ -78,7 +78,9 @@ enum StreamingTranscriptionProvider: String, CaseIterable, Identifiable {
 /// from the commit makes resolveRawTranscript fall back to the file upload.
 /// Class-bound so AppState's `[weak service]` capture keeps working.
 protocol StreamingTranscriptionSession: AnyObject {
-    /// PipelineStageTimings source label recorded by resolveRawTranscript.
+    /// PipelineStageTimings source label, read by resolveRawTranscript after a
+    /// successful commit; a session may refine it to the path that produced the
+    /// text (Deepgram does).
     var transcriptionSource: String { get }
     func start() throws
     func appendPCM16(_ data: Data)

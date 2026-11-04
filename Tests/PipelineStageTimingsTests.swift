@@ -97,6 +97,16 @@ enum PipelineStageTimingsTests {
             "audio 40 ms · transcription 820 ms (deepgram) · context 0 ms · cleanup 610 ms · paste 35 ms · total 1.5 s"
         )
 
+        TestSupport.expectEqual(PipelineStageTimings.fileFallbackTranscriptionSource, "file-fallback")
+        // A stream abandoned before its commit is a fallback too, not streaming Off.
+        TestSupport.expectEqual(PipelineStageTimings.fileUploadSource(streamAbandoned: true), "file-fallback")
+        TestSupport.expectEqual(PipelineStageTimings.fileUploadSource(streamAbandoned: false), "file")
+        sourced.transcriptionSource = "deepgram-final+interim-tail"
+        TestSupport.expect(
+            sourced.summaryLine.contains("transcription 820 ms (deepgram-final+interim-tail)"),
+            "The Run Log line must name the stream path that produced the text"
+        )
+
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 0), "0 ms")
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 999), "999 ms")
         TestSupport.expectEqual(PipelineStageTimings.formatted(milliseconds: 1000), "1.0 s")

@@ -3498,9 +3498,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// was never started) fall back to the file-based POST so the user still
     /// gets a transcript. Runs the streaming commit and file upload in that
     /// strict order to avoid paying for both when streaming succeeds. Reports
-    /// which path produced the transcript so stage timings can record it.
+    /// which path produced the transcript so stage timings can record it;
+    /// streamAbandoned marks a stream dropped before its commit (its audio
+    /// conversion failed), whose file upload is a fallback too.
     private static func resolveRawTranscript(
         realtimeService: StreamingTranscriptionSession?,
+        streamAbandoned: Bool,
         fileService: TranscriptionService,
         fileURL: URL
     ) async throws -> (transcript: String, source: String) {
@@ -3518,11 +3521,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
             } catch {
                 try Task.checkCancellation()
                 let text = try await fileService.transcribe(fileURL: fileURL)
-                return (text, PipelineStageTimings.fileTranscriptionSource)
+                return (text, PipelineStageTimings.fileFallbackTranscriptionSource)
             }
         }
         let text = try await fileService.transcribe(fileURL: fileURL)
-        return (text, PipelineStageTimings.fileTranscriptionSource)
+        return (text, PipelineStageTimings.fileUploadSource(streamAbandoned: streamAbandoned))
     }
 
     private func stopAndTranscribe() {
@@ -3615,6 +3618,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 streamingSession?.cancel()
             }
             let activeRealtime = streamFailed ? nil : streamingSession
+            // Lets Deepgram fall back to the file when its stream returns no words for counted speech.
+            (activeRealtime as? DeepgramStreamingService)?.setRecorderHeardSpeech(speechActivity.hasSpeech)
             self.transcriptionTask?.cancel()
             guard self.isTranscribing else {
                 if let savedAudioFile {
@@ -3667,6 +3672,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     stageMarks.transcriptionStarted = CFAbsoluteTimeGetCurrent()
                     async let resolvedTranscript = Self.resolveRawTranscript(
                         realtimeService: activeRealtime,
+                        streamAbandoned: streamFailed,
                         fileService: transcriptionService,
                         fileURL: transcriptionFileURL
                     )
