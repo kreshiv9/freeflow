@@ -348,6 +348,94 @@ enum AssemblyAIStreamingCore {
         }
     }
 
+    /// The same edge punctuation as CorrectionLearner's tokens; the replay tool compiles this
+    /// file without the learner, and a test pins that the two agree.
+    private static let wordEdgePunctuation = CharacterSet(charactersIn: ".,;:!?\"'()[]{}<>…“”‘’`*#>~")
+
+    /// The words of a Turn with `end_of_turn` true and an integral turn_order, nil for any other
+    /// frame. An entry without a string `text` or a numeric `confidence` is skipped and the
+    /// confidence is clamped to 0...1. `punctuatedWord` is the text as formatted ("Sonny.");
+    /// `word` is lowercased without edge punctuation, so it matches the learner's token fold.
+    /// Parsed apart from ServerMessage, which the transcript path uses.
+    static func finalTurnWords(in data: Data) -> (order: Int, words: [DeepgramStreamingCore.RecognizedWord])? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["type"] as? String == "Turn",
+              object["end_of_turn"] as? Bool ?? false,
+              let order = object["turn_order"] as? Int else { return nil }
+        let words = (object["words"] as? [Any] ?? []).compactMap { entry -> DeepgramStreamingCore.RecognizedWord? in
+            guard let entry = entry as? [String: Any],
+                  let text = entry["text"] as? String,
+                  let number = entry["confidence"] as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            return DeepgramStreamingCore.RecognizedWord(
+                word: text.trimmingCharacters(in: wordEdgePunctuation).lowercased(),
+                punctuatedWord: text,
+                confidence: min(max(number.doubleValue, 0), 1)
+            )
+        }
+        return (order, words)
+    }
+
+    /// One stream's final words and sent keyterms for the learning loop. In memory only.
+    struct LearningEvidenceRecorder: Equatable {
+        private var wordsByOrder: [Int: [DeepgramStreamingCore.RecognizedWord]] = [:]
+        private var wordCount = 0
+        private var plannedKeyterms: [String]?
+        private var sentKeyterms: [String]?
+
+        /// A final turn's words, nil for any other frame: the stream parses them outside its lock.
+        static func finalWords(
+            of parsed: ServerMessage, in data: Data
+        ) -> (order: Int, words: [DeepgramStreamingCore.RecognizedWord])? {
+            guard case .turn(_, _, true, _) = parsed else { return nil }
+            return finalTurnWords(in: data)
+        }
+
+        /// One server frame: a final turn's words, or Begin, which sends a held update ahead of
+        /// the buffered audio.
+        mutating func note(
+            _ parsed: ServerMessage,
+            finalWords: (order: Int, words: [DeepgramStreamingCore.RecognizedWord])?
+        ) {
+            switch parsed {
+            case .begin:
+                noteKeytermsSent()
+            case .turn:
+                if let finalWords { noteFinalWords(order: finalWords.order, words: finalWords.words) }
+            case .termination, .error, .unknown:
+                break
+            }
+        }
+
+        /// The first end_of_turn of a turn_order wins, like TurnAssembler, which ignores later
+        /// messages of an ended turn. Past maxRecognizedWords nothing more is kept.
+        mutating func noteFinalWords(order: Int, words: [DeepgramStreamingCore.RecognizedWord]) {
+            guard wordsByOrder[order] == nil else { return }
+            let kept = Array(words.prefix(max(0, DeepgramStreamingCore.maxRecognizedWords - wordCount)))
+            wordsByOrder[order] = kept
+            wordCount += kept.count
+        }
+
+        mutating func notePlannedKeyterms(_ keyterms: [String]) {
+            plannedKeyterms = keyterms
+        }
+
+        /// The planned update went out.
+        mutating func noteKeytermsSent() {
+            sentKeyterms = plannedKeyterms
+        }
+
+        /// The ended turns' words, in turn_order.
+        var words: [DeepgramStreamingCore.RecognizedWord] {
+            wordsByOrder.keys.sorted().flatMap { wordsByOrder[$0] ?? [] }
+        }
+
+        /// The sent update if one went out (it replaces the whole list), otherwise `connect`.
+        func keyterms(connect: [String]) -> [String] {
+            sentKeyterms ?? connect
+        }
+    }
+
     enum ServerMessage: Equatable {
         /// About 24.8 days of stream audio; sessions end after 3 hours.
         static let maxWordEndMilliseconds = Int(Int32.max)

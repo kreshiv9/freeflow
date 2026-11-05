@@ -63,11 +63,11 @@ extension AppState {
         }
     }
 
-    /// Called on the main thread once a dictation's paste is scheduled. Keeps the Deepgram
+    /// Called on the main thread once a dictation's paste is scheduled. Keeps the stream's
     /// words and keyterms in memory for a later Fix, and counts hits of learned terms in the
     /// raw transcript: the scan runs off main on a copy of the store, and only the counts are
     /// applied on main, by item id. Nothing is stored or logged; nothing happens while
-    /// learning is off.
+    /// learning is off. A paste joins the record only once dispatched (noteDispatchedPaste).
     func recordLearningEvidence(
         entryID: UUID,
         evidence: (words: [DeepgramStreamingCore.RecognizedWord], keyterms: [String])?,
@@ -128,26 +128,7 @@ extension AppState {
         guard !final.isEmpty, final != pasted else { return RunLogFix.Result(text: RunLogFix.unchangedText) }
 
         let record = dictationRecords.record(id: item.id, now: Date())
-        let confidences = record?.confidences() ?? [:]
-        let manualTerms = EffectiveVocabulary.manualTermKeys(vocabulary: customVocabulary, corrections: dictionaryCorrections)
-        let learnedTerms = learnedVocabulary.termKeys
-        let learnedRules = learnedVocabulary.ruleKeys
-        let tombstones = Set(learnedVocabulary.tombstones)
-        let outcome: CorrectionLearner.Outcome? = await Task.detached(priority: .userInitiated) {
-            // The word list loads once, here, off the main thread.
-            guard let lexicon = LearningWordList.bundled else { return nil }
-            return CorrectionLearner.learn(
-                pasted: pasted,
-                final: final,
-                lexicon: lexicon,
-                confidences: confidences,
-                manualTerms: manualTerms,
-                learnedTerms: learnedTerms,
-                learnedRules: learnedRules,
-                isTombstoned: { tombstones.contains(LearnedVocabulary.termHash($0)) }
-            )
-        }.value
-        guard let outcome else {
+        guard let outcome = await learnerOutcome(pasted: pasted, final: final, confidences: record?.confidences() ?? [:]) else {
             os_log(.error, log: learningLog, "run log fix: word list missing")
             return RunLogFix.Result(text: RunLogFix.wordListMissingText)
         }
@@ -186,6 +167,28 @@ extension AppState {
             offerLearnedUndo(change)
         }
         return RunLogFix.Result(text: RunLogFix.resultText(for: change, reason: reason), learned: change.hasLearned ? change : nil)
+    }
+
+    /// The learner's verdict on a fix, off main; nil when the word list is missing.
+    @MainActor
+    func learnerOutcome(pasted: String, final: String, confidences: [String: Double]) async -> CorrectionLearner.Outcome? {
+        let knowledge = learnerKnowledge()
+        return await Task.detached(priority: .userInitiated) {
+            // The word list loads once, here, off the main thread.
+            guard let lexicon = LearningWordList.bundled else { return nil }
+            return knowledge.outcome(pasted: pasted, final: final, lexicon: lexicon, confidences: confidences)
+        }.value
+    }
+
+    /// What the learner needs to know about the vocabulary, copied here for a detached task.
+    @MainActor
+    func learnerKnowledge() -> LearnerKnowledge {
+        LearnerKnowledge(
+            manualTerms: EffectiveVocabulary.manualTermKeys(vocabulary: customVocabulary, corrections: dictionaryCorrections),
+            learnedTerms: learnedVocabulary.termKeys,
+            learnedRules: learnedVocabulary.ruleKeys,
+            tombstones: Set(learnedVocabulary.tombstones)
+        )
     }
 
     /// Shows "Learned: X · Undo" (merged with a toast of the last toastBatchSeconds) unless the
@@ -234,6 +237,7 @@ extension AppState {
     /// Corrections are not touched.
     @MainActor
     func deleteAllLearnedData() {
+        endGoogleSearchWatch(keepsEvidence: false)
         learnedVocabulary = LearnedVocabulary()
         // The stored key goes now, not after the save delay.
         learnedSaveWorkItem?.cancel()

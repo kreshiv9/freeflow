@@ -2,8 +2,9 @@ import CryptoKit
 import Foundation
 
 /// "Learn automatically". A missing preference keeps learning on (the user's decision).
-/// Off stops learning (Run Log Fix, hit counts, Deepgram evidence) and the aging of learned
-/// items, which stay in use until deleted; expired evidence is still deleted at launch.
+/// Off stops learning (Run Log Fix, the sent-text sources, hit counts, streaming evidence) and
+/// the aging of learned items, which stay in use until deleted; expired evidence is still
+/// deleted at launch.
 enum LearningPreference {
     static let storageKey = "auto_learning_enabled"
     static let defaultEnabled = true
@@ -63,6 +64,8 @@ struct LearnedVocabulary: Codable, Equatable {
     /// Reverts and rule-later sightings count inside this window.
     static let evidenceWindow = 30 * day
     static let revertsForAmbiguous = 2
+    /// A kept cleanup fix teaches its term after this many distinct dictations in evidenceWindow.
+    static let cleanupFixDictations = 3
     static let ruleLaterSightings = 2
     static let ruleLaterKeytermSightings = 1
     static let correctionWeight = 3.0
@@ -88,6 +91,11 @@ struct LearnedVocabulary: Codable, Equatable {
             case .aiChat: self = .aiChat
             default: self = .other
             }
+        }
+
+        /// A dictation into Google search is `.search` whatever its app category.
+        init(_ category: DictationAppCategory?, isGoogleSearch: Bool) {
+            self = isGoogleSearch ? .search : Category(category)
         }
     }
 
@@ -168,6 +176,15 @@ struct LearnedVocabulary: Codable, Equatable {
         var countedAt: Date
     }
 
+    /// A kept cleanup fix of a term not in the store yet: hashes of the pair and of the Run Log
+    /// entry, when, and whether the term was among that dictation's sent keyterms.
+    struct CleanupCredit: Codable, Equatable {
+        var pairHash: String
+        var entryHash: String
+        var countedAt: Date
+        var wasKeyterm: Bool
+    }
+
     /// One fix to learn from. `pasted` and `final` serve only the kept-unchanged check and are
     /// never stored.
     struct Observation {
@@ -175,7 +192,7 @@ struct LearnedVocabulary: Codable, Equatable {
         var category: Category
         /// The final text is known to be what was sent (Run Log Fix always is).
         var settled: Bool
-        /// The keyterms that dictation actually sent to Deepgram.
+        /// The keyterms that dictation actually sent to its streaming provider.
         var sentKeyterms: [String]
         var pasted: String
         var final: String
@@ -281,6 +298,9 @@ struct LearnedVocabulary: Codable, Equatable {
     /// maxPending): fixing the same dictation again, even after a relaunch, adds nothing.
     /// Optional so a store saved without it still loads; nil when empty.
     var countedEntries: [CountedEntry]?
+    /// Kept cleanup fixes waiting for cleanupFixDictations dictations, kept for evidenceWindow
+    /// (at most maxPending). Optional so a store saved without it still loads; nil when empty.
+    var cleanupCredits: [CleanupCredit]?
 
     // MARK: Persistence
 
@@ -514,6 +534,80 @@ struct LearnedVocabulary: Codable, Equatable {
         return change
     }
 
+    /// Records the kept cleanup fixes of one dictation. Cleanup is not the user, so a fix never
+    /// becomes a rule at once: it waits as a credit, which Undo AI edit can still cancel, until
+    /// cleanupFixDictations distinct dictations within evidenceWindow kept the same pair, also
+    /// for a term already in the store. It then becomes a strong, settled term with those
+    /// sightings (or counts them on the term), and a sent keyterm in any of them counts toward a
+    /// rule. Tombstoned terms and pairs get nothing.
+    mutating func applyCleanupFixes(
+        _ candidates: [CorrectionLearner.Candidate],
+        entryID: UUID,
+        observation: Observation,
+        now: Date
+    ) -> Change {
+        _ = expireEvidence(now: now)
+        var change = Change()
+        let entryHash = Self.entryHash(entryID)
+        let sentKeys = Set(observation.sentKeyterms.map(Self.key))
+        for var candidate in candidates {
+            candidate.ruleNow = false
+            guard Self.isStorable(candidate.term), Self.isStorable(candidate.heard),
+                  !isTombstoned(term: candidate.term),
+                  !isTombstoned(heard: candidate.heard, term: candidate.term) else { continue }
+            let termKey = Self.key(candidate.term)
+            let pairHash = Self.pairHash(heard: candidate.heard, term: candidate.term)
+            var credits = cleanupCredits ?? []
+            if !credits.contains(where: { $0.pairHash == pairHash && $0.entryHash == entryHash }) {
+                credits.append(CleanupCredit(
+                    pairHash: pairHash, entryHash: entryHash, countedAt: now, wasKeyterm: sentKeys.contains(termKey)
+                ))
+            }
+            let forPair = credits.filter { $0.pairHash == pairHash }
+            if forPair.count >= Self.cleanupFixDictations {
+                credits.removeAll { $0.pairHash == pairHash }
+                candidate.strength = .strong
+                apply(
+                    candidate,
+                    observation: observation,
+                    sentKeys: forPair.contains(where: \.wasKeyterm) ? sentKeys.union([termKey]) : sentKeys,
+                    now: now,
+                    earlierSightings: forPair.filter { $0.entryHash != entryHash }.map(\.countedAt).sorted(),
+                    change: &change
+                )
+            }
+            cleanupCredits = credits.isEmpty ? nil : credits
+        }
+        capCleanupCredits()
+        capItems(now: now, keeping: Set(change.addedItemIDs))
+        change.code = change.hasLearned ? "learned" : change.updatedTerms.isEmpty ? "cleanupCredit" : "seenAgain"
+        return change
+    }
+
+    /// Undo AI edit: this dictation's cleanup fixes stop counting. What the credits already
+    /// taught stays: the toast's Undo and the chip's delete remove those. True when a credit
+    /// was removed.
+    mutating func cancelCleanupCredit(entryID: UUID) -> Bool {
+        guard let credits = cleanupCredits else { return false }
+        let hash = Self.entryHash(entryID)
+        let kept = credits.filter { $0.entryHash != hash }
+        guard kept.count != credits.count else { return false }
+        cleanupCredits = kept.isEmpty ? nil : kept
+        return true
+    }
+
+    /// A paste sent as it was: its heard phrases were kept. The activity line does not count it.
+    mutating func recordAccepted(pasted: String, final: String, now: Date) {
+        recordKept(pasted: pasted, final: final, now: now)
+        count("acceptedUnchanged")
+    }
+
+    /// The heard phrases that both texts hold were kept, though other words changed.
+    mutating func recordKept(pasted: String, final: String, now: Date) {
+        _ = prune(now: now)
+        recordKeptUnchanged(pasted: pasted, final: final)
+    }
+
     /// A term or heard phrase the store refuses: a list separator, too long, or secret-like.
     static func isStorable(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -586,6 +680,7 @@ struct LearnedVocabulary: Codable, Equatable {
         observation: Observation,
         sentKeys: Set<String>,
         now: Date,
+        earlierSightings: [Date] = [],
         change: inout Change
     ) {
         guard Self.isStorable(candidate.term), Self.isStorable(candidate.heard), !isTombstoned(term: candidate.term) else {
@@ -599,7 +694,7 @@ struct LearnedVocabulary: Codable, Equatable {
         // A pending sighting of this pair (prune removed those older than pendingLifetime) is
         // an earlier sighting whatever this candidate's strength, so its hash is used up here.
         let pairHash = Self.pairHash(heard: candidate.heard, term: candidate.term)
-        var sightingDates = [now]
+        var sightingDates = earlierSightings + [now]
         if let pendingIndex = pending.firstIndex(where: { $0.pairHash == pairHash }) {
             sightingDates.insert(pending[pendingIndex].firstSeen, at: 0)
             pending.remove(at: pendingIndex)
@@ -807,9 +902,9 @@ struct LearnedVocabulary: Codable, Equatable {
     }
 
     /// Expires pending sightings after pendingLifetime (the oldest first past maxPending),
-    /// revert dates and counted Run Log entries after evidenceWindow. It only deletes evidence
-    /// and never learns, so it runs at launch even while learning is off. True when anything
-    /// changed.
+    /// revert dates, counted Run Log entries and cleanup credits after evidenceWindow. It only
+    /// deletes evidence and never learns, so it runs at launch even while learning is off. True
+    /// when anything changed.
     mutating func expireEvidence(now: Date) -> Bool {
         let before = self
         pending.removeAll { now.timeIntervalSince($0.firstSeen) > Self.pendingLifetime }
@@ -818,7 +913,18 @@ struct LearnedVocabulary: Codable, Equatable {
             items[index].revertDates.removeAll { now.timeIntervalSince($0) > Self.evidenceWindow }
         }
         keepCountedEntries { now.timeIntervalSince($0.countedAt) <= Self.evidenceWindow }
+        if let credits = cleanupCredits {
+            let kept = credits.filter { now.timeIntervalSince($0.countedAt) <= Self.evidenceWindow }
+            cleanupCredits = kept.isEmpty ? nil : kept
+        }
+        capCleanupCredits()
         return self != before
+    }
+
+    /// Past maxPending, drops the oldest cleanup credits.
+    private mutating func capCleanupCredits() {
+        guard let credits = cleanupCredits, credits.count > Self.maxPending else { return }
+        cleanupCredits = Array(credits.sorted { $0.countedAt < $1.countedAt }.suffix(Self.maxPending))
     }
 
     /// Past maxPending, drops the least recently seen pending sightings.

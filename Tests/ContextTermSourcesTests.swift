@@ -9,6 +9,7 @@ enum ContextTermSourcesTests {
         testGoogleQueryParsing()
         testVSCodeTitleParsing()
         testClassify()
+        testBrowserAndEditorChecks()
         testPrimesAccessibility()
         testTurnLabels()
         testSourcesPerTarget()
@@ -114,6 +115,26 @@ enum ContextTermSourcesTests {
         TestSupport.expectEqual(Sources.googleQuery(fromPage: "deepgram pricing - Google Search - Pinned"), "deepgram pricing")
         TestSupport.expectEqual(Sources.googleQuery(fromPage: "ChatGPT"), nil)
         TestSupport.expectEqual(Sources.googleQuery(fromPage: " - Google Search"), nil)
+        // Another Google product is not a search, and its page name is not a query.
+        TestSupport.expectEqual(Sources.googleQuery(fromPage: "Overview - Google Search Console"), nil)
+        TestSupport.expectEqual(Sources.googleQuery(fromPage: "Overview - Google Search Console - Pinned"), nil)
+        TestSupport.expectEqual(Sources.googleQuery(fromPage: "rust - ownership - Google Search"), "rust - ownership")
+    }
+
+    private static func testBrowserAndEditorChecks() {
+        for bundle in ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders", " COM.MICROSOFT.VSCODE "] {
+            TestSupport.expect(ContextTarget.isVSCode(bundleIdentifier: bundle), "\(bundle) is VS Code")
+        }
+        for bundle in ["com.todesktop.230313mzl4w4u92", "com.google.Chrome", "", nil] as [String?] {
+            TestSupport.expect(!ContextTarget.isVSCode(bundleIdentifier: bundle), "Not VS Code")
+        }
+        for domain in ["google.com", "google.co.uk", "google.de"] {
+            TestSupport.expect(ContextTarget.isGoogleSearch(bundleIdentifier: "com.google.Chrome", websiteDomain: domain), "\(domain) in Chrome")
+            TestSupport.expect(!ContextTarget.isGoogleSearch(bundleIdentifier: "com.apple.Safari", websiteDomain: domain), "\(domain) in Safari")
+        }
+        for domain in ["mail.google.com", "docs.google.com", "chatgpt.com", "example.com", nil] as [String?] {
+            TestSupport.expect(!ContextTarget.isGoogleSearch(bundleIdentifier: "com.google.Chrome", websiteDomain: domain), "Not Google search")
+        }
     }
 
     private static func testVSCodeTitleParsing() {

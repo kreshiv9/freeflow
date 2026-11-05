@@ -334,6 +334,8 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             bundleIdentifier: snapshot.bundleIdentifier, websiteDomain: snapshot.websiteDomain,
             focusedRole: role, focusedLabel: label, insideWebArea: true
         )
+        snapshot.composerTarget = composer
+        snapshot.composerClassified = true
         if !isBrowser, readsSpeechSources, composer != nil {
             // The Claude Code composer and ChatGPT.app's composer sit in a web area that
             // only the conversation read needs.

@@ -26,6 +26,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AudioLevelMeter.swift \
 	Sources/CaptureBackendPreference.swift \
 	Sources/CaptureFormatPreference.swift \
+	Sources/ClaudeCodeHook.swift \
+	Sources/ClaudeHookListener.swift \
 	Sources/CleanupFastPath.swift \
 	Sources/CleanupLevel.swift \
 	Sources/CommandModeIntent.swift \
@@ -34,11 +36,13 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/CorrectionLearner.swift \
 	Sources/CursorFormatting.swift \
 	Sources/DeepgramStreamingCore.swift \
+	Sources/DeepgramStreamingService.swift \
 	Sources/DictationStyle.swift \
 	Sources/DictionaryCorrections.swift \
 	Sources/EffectiveVocabulary.swift \
 	Sources/EverydayWords.swift \
 	Sources/FileTagMatcher.swift \
+	Sources/GoogleSearchWatch.swift \
 	Sources/HandsFreeAutoStop.swift \
 	Sources/IdentifierExtractor.swift \
 	Sources/KeychainStorage.swift \

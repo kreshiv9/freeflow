@@ -57,6 +57,19 @@ enum ContextTarget: String, Equatable, Sendable {
         normalized(bundleIdentifier).map(chromeBundles.contains) ?? false
     }
 
+    /// VS Code in any channel.
+    static func isVSCode(bundleIdentifier: String?) -> Bool {
+        normalized(bundleIdentifier).map(vscodeBundles.contains) ?? false
+    }
+
+    /// A google.com (or google.<country>) page in Chrome, not another Google product.
+    static func isGoogleSearch(bundleIdentifier: String?, websiteDomain: String?) -> Bool {
+        classify(
+            bundleIdentifier: bundleIdentifier, websiteDomain: websiteDomain,
+            focusedRole: nil, focusedLabel: nil, insideWebArea: false
+        ) == .googleSearch
+    }
+
     /// Only VS Code needs the focused field's label, to tell the Claude composer apart.
     static func readsFocusedLabel(bundleIdentifier: String?) -> Bool {
         guard let bundle = normalized(bundleIdentifier) else { return false }
@@ -220,9 +233,12 @@ enum ContextTermSources {
 
     private static let chromeChannels = [" Beta", " Dev", " Canary"]
 
-    /// "<query> - Google Search[ - tab state]" gives the query. English UI only.
+    /// "<query> - Google Search[ - tab state]" gives the query, and "… - Google Search Console"
+    /// (another product) does not. English UI only.
     static func googleQuery(fromPage page: String) -> String? {
         guard let suffix = page.range(of: " - Google Search", options: .backwards) else { return nil }
+        let tail = page[suffix.upperBound...]
+        guard tail.isEmpty || tail.hasPrefix(" - ") else { return nil }
         let query = page[..<suffix.lowerBound].trimmingCharacters(in: .whitespaces)
         return query.isEmpty ? nil : query
     }

@@ -161,13 +161,23 @@ struct LearningSettingsSection: View {
     @EnvironmentObject var appState: AppState
     @State private var confirmsDeleteAll = false
 
+    /// Deleting learned data neither turns learning off nor disconnects Claude Code.
+    private var learningContinuesText: String {
+        guard appState.learningEnabled else { return "Learning stays off." }
+        return appState.claudeCodeHookConnected
+            ? "Claude Code stays connected and learning continues; use Disconnect or turn off Learn automatically to stop it."
+            : "Learning continues; turn off Learn automatically to stop it."
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Learn automatically", isOn: $appState.learningEnabled)
 
-            Text("Fix in the Run Log teaches FreeFlow misheard words and names. Learned items stay on this Mac and go only where your vocabulary already goes: Deepgram key terms and cleanup spellings. Turning this off stops learning; learned items stay in use until you delete them.")
+            Text("FreeFlow learns misheard words and names from Fix in the Run Log, from what you send in Claude Code once it is connected, from your Google searches in Chrome, and from cleanup fixes you keep. Learned items stay on this Mac and go only where your vocabulary already goes: your streaming provider's key terms and cleanup spellings. Turning this off stops learning; learned items stay in use until you delete them.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            ClaudeCodeConnectionRow()
 
             HStack {
                 Button("Undo last learned") {
@@ -196,7 +206,143 @@ struct LearningSettingsSection: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Learned terms and corrections, what FreeFlow is not sure about yet, and the list of removed items are deleted. Your Custom Vocabulary and Corrections stay as they are. Run Log entries keep the cleanup prompts they were sent with, which can name learned terms, until you delete those entries.")
+            Text("Learned terms and corrections, what FreeFlow is not sure about yet, and the list of removed items are deleted. Your Custom Vocabulary and Corrections stay as they are. Run Log entries keep the cleanup prompts they were sent with, which can name learned terms, until you delete those entries. \(learningContinuesText)")
+        }
+    }
+}
+
+// MARK: - Claude Code connection
+
+/// Connect and Disconnect for the Claude Code hook. The settings file is read only once the
+/// user has connected, and changed only by these two buttons.
+private struct ClaudeCodeConnectionRow: View {
+    @EnvironmentObject var appState: AppState
+    @State private var showsConsent = false
+
+    private var statusText: String {
+        guard appState.claudeCodeHookConnected else { return "Not connected" }
+        return appState.learningEnabled ? "Connected" : "Connected, but learning is off"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Claude Code")
+                        .font(.callout)
+                    Text(statusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if appState.claudeCodeHookConnected {
+                    Button("Disconnect") {
+                        appState.disconnectClaudeCode()
+                    }
+                } else {
+                    Button("Connect Claude Code…") {
+                        showsConsent = true
+                    }
+                    .disabled(!appState.learningEnabled)
+                    .help(appState.learningEnabled ? "Shows the change before making it" : "Turn on Learn automatically to connect")
+                }
+            }
+            if appState.claudeHookNotReporting {
+                Text(ClaudeHookHealth.warningText)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let message = appState.claudeHookStatusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear {
+            appState.refreshClaudeCodeHookStatus()
+        }
+        .sheet(isPresented: $showsConsent) {
+            ClaudeCodeConsentSheet(isPresented: $showsConsent)
+                .environmentObject(appState)
+        }
+    }
+}
+
+/// Shows the exact entry and the file it changes. Nothing is written until Connect.
+private struct ClaudeCodeConsentSheet: View {
+    @EnvironmentObject var appState: AppState
+    @Binding var isPresented: Bool
+    @State private var failureText: String?
+    @State private var offersSnippet = false
+
+    private var snippet: String { AppState.claudeCodeHookSnippet }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Connect Claude Code")
+                .font(.headline)
+            Text("FreeFlow will add this entry to \(AppState.claudeCodeSettingsDisplayPath):")
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            ScrollView {
+                Text(snippet)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+            }
+            .frame(height: 170)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+            )
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Claude Code will send each prompt from its VS Code panel to FreeFlow on this Mac, including what it attaches to the prompt, such as your editor selection or open file, and details such as the working folder and session paths. FreeFlow discards those attachments and details at once.")
+                Text("Prompts stay in memory and are used only when they match a recent FreeFlow paste. They are never stored or logged.")
+                Text("Connect and Disconnect each save a backup beside the file first, with everything the file holds, and FreeFlow does not delete those backups. Key order and spacing in the file may change.")
+                Text("Disconnect removes only this entry.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            if let failureText {
+                Text(failureText)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                if offersSnippet {
+                    Button("Copy snippet") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(snippet, forType: .string)
+                    }
+                }
+                Spacer()
+                Button("Cancel") {
+                    isPresented = false
+                }
+                .keyboardShortcut(.defaultAction)
+                Button("Connect") {
+                    connect()
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    private func connect() {
+        switch appState.connectClaudeCode() {
+        case .done, .alreadyDone:
+            isPresented = false
+        case .invalidJSON, .unexpectedShape:
+            failureText = "FreeFlow did not change the file: it is not the settings JSON FreeFlow expected. FreeFlow can only listen once it can read the file, so the snippet alone is not enough. Make the file valid JSON, add the entry with the snippet if you like, then press Connect again."
+            offersSnippet = true
+        case .ioFailure:
+            failureText = "FreeFlow could not write the file, so it stays as it was. You can add the entry yourself with the snippet, then press Connect again so FreeFlow starts listening."
+            offersSnippet = true
         }
     }
 }
