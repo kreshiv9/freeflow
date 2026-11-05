@@ -18,6 +18,8 @@ enum CorrectionLearnerTests {
         testSettledTermsAreNotRelearnedInPart()
         testLearnedRulesRevert()
         testBounds()
+        testWithoutEditGates()
+        testSentenceStartNames()
         testWordListParsing()
         testBundledWordListResource()
     }
@@ -26,7 +28,7 @@ enum CorrectionLearnerTests {
 
     /// EverydayWords plus 50 known words and 12 first names: on every case below this gives
     /// the same outcomes as the bundled SCOWL list and /usr/share/dict/propernames.
-    private struct TestLexicon: LearningLexicon {
+    struct TestLexicon: LearningLexicon {
         static let knownOnly: Set<String> = [
             "ai", "ant", "asp", "audit", "chow", "codex", "com", "cooper", "copilot", "dashboard",
             "deploy", "docs", "email", "ember", "flights", "gram", "hashtag", "i", "ie", "john",
@@ -43,7 +45,7 @@ enum CorrectionLearnerTests {
         func isFirstName(_ lowercased: String) -> Bool { Self.firstNames.contains(lowercased) }
     }
 
-    private static let lexicon = TestLexicon()
+    static let lexicon = TestLexicon()
 
     private struct Case {
         let name: String
@@ -567,6 +569,84 @@ enum CorrectionLearnerTests {
         let manyFinal = Array(repeating: "their for two ate and", count: 60).joined(separator: " ")
         TestSupport.expectEqual(reason(learn(manyPasted, manyFinal)), .rewording)
         TestSupport.expect(Date().timeIntervalSince(manyHunksStarted) < 1, "many unlearnable hunks stay fast")
+    }
+
+    /// Cleanup's edit of the raw text removes filler, so only each hunk is judged. Every other
+    /// case in this file keeps the gates by default.
+    /// A first name that is no ordinary word is a name at a sentence start too, which is where a
+    /// search query's first words sit. An ordinary word's capital there still says nothing.
+    private static func testSentenceStartNames() {
+        func ungated(_ pasted: String, _ final: String) -> Learner.Outcome {
+            Learner.learn(pasted: pasted, final: final, lexicon: lexicon, appliesEditGates: false)
+        }
+        // Mid-sentence and at a start now agree.
+        TestSupport.expectEqual(fmt(ungated("pricing for cloud code", "pricing for Claude Code")), "cloud code->Claude Code:strong:later")
+        TestSupport.expectEqual(fmt(ungated("cloud code pricing", "Claude Code pricing")), "cloud code->Claude Code:strong:later")
+        TestSupport.expectEqual(fmt(learn("cloud code pricing", "Claude Code pricing")), "cloud code->Claude Code:strong:later")
+        TestSupport.expectEqual(fmt(learn("it works. cloud code is good", "it works. Claude Code is good")), "cloud code->Claude Code:strong:later")
+        TestSupport.expectEqual(fmt(learn("cloud is down", "Claude is down")), "cloud->Claude:strong:term")
+        // A change of case alone at a start stays style.
+        TestSupport.expectEqual(fmt(learn("claude is down", "Claude is down")), "nothing")
+        // A first name that is also an ordinary word, and an ordinary word, teach nothing there.
+        TestSupport.expectEqual(fmt(learn("pink is down", "Ping is down")), "nothing")
+        TestSupport.expectEqual(fmt(learn("the mellow setup", "The yellow setup")), "nothing")
+        TestSupport.expectEqual(fmt(learn("motion pricing", "Notion pricing")), "nothing")
+        // Two first names are still a swap.
+        TestSupport.expectEqual(fmt(learn("john is here", "Jason is here")), "nothing")
+    }
+
+    private static func testWithoutEditGates() {
+        func ungated(_ pasted: String, _ final: String, manual: Set<String> = []) -> Learner.Outcome {
+            Learner.learn(pasted: pasted, final: final, lexicon: lexicon, manualTerms: manual, appliesEditGates: false)
+        }
+        let raw = "um so ask cloud code to like refactor the uh parser"
+        let cleaned = "Ask Claude Code to refactor the parser."
+        TestSupport.expectEqual(fmt(learn(raw, cleaned)), "nothing")
+        TestSupport.expectEqual(fmt(ungated(raw, cleaned)), "cloud code->Claude Code:strong:later")
+        // No partial-rewrite downgrade: the strength stays as judged.
+        TestSupport.expectEqual(
+            fmt(ungated("so like basically versel was maybe sort of down", "Vercel was down.")),
+            "versel->Vercel:strong:now"
+        )
+        // Hunk-level judging, the phrase cap and the candidate cap stay.
+        TestSupport.expectEqual(fmt(ungated("the quick brown fox", "a slow red dog")), "nothing")
+        TestSupport.expectEqual(fmt(ungated(raw, cleaned, manual: ["claude code"])), "nothing")
+        TestSupport.expectEqual(fmt(ungated(cleaned, cleaned)), "nothing")
+        TestSupport.expectEqual(
+            fmt(ungated(String(repeating: "word ", count: Learner.maxTokens + 1), "word")),
+            "nothing"
+        )
+        // The default still gates the same pair.
+        TestSupport.expectEqual(reason(learn(raw, cleaned)), .rewrite)
+
+        // Nothing gates a heavy rewrite here, so the hunks resolved are capped: a fix inside the
+        // cap is found, and one past it is not looked at.
+        func rewrite(hunks: Int) -> (pasted: String, final: String) {
+            (
+                Array(repeating: "there four too eight and", count: hunks).joined(separator: " ") + " versel now",
+                Array(repeating: "their for two ate and", count: hunks).joined(separator: " ") + " Vercel now"
+            )
+        }
+        let inside = rewrite(hunks: Learner.maxUngatedHunks - 1)
+        TestSupport.expectEqual(fmt(ungated(inside.pasted, inside.final)), "versel->Vercel:strong:now")
+        let past = rewrite(hunks: Learner.maxUngatedHunks)
+        TestSupport.expectEqual(fmt(ungated(past.pasted, past.final)), "nothing")
+        let longest = rewrite(hunks: Learner.maxTokens / 5 - 1)
+        let started = Date()
+        TestSupport.expectEqual(fmt(ungated(longest.pasted, longest.final)), "nothing")
+        TestSupport.expect(Date().timeIntervalSince(started) < 5, "the longest rewrite stays fast")
+
+        // Resolving stops at maxCandidates strong candidates, which is all that could be kept.
+        let manyFixes = ungated(
+            "use versel and kwen and postgress and supabayse and redis and deepgramm",
+            "use Vercel and Qwen and Postgres and Supabase and Redis and Deepgram"
+        )
+        if case .learned(let candidates) = manyFixes {
+            TestSupport.expectEqual(candidates.count, Learner.maxCandidates)
+            TestSupport.expect(candidates.allSatisfy { $0.strength == .strong }, "Strong ones are kept")
+        } else {
+            TestSupport.expect(false, "The first fixes are learned")
+        }
     }
 
     private static func testWordListParsing() {

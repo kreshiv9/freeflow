@@ -69,6 +69,8 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
     /// Regroups appended chunks into 50 ms frames; the commit sends the padded partial frame.
     private var frameAggregator: DeepgramStreamingCore.FrameAggregator
     private var assembler = AssemblyAIStreamingCore.TurnAssembler()
+    /// Final words and sent keyterms, in memory, for the learning loop.
+    private var learningRecorder = AssemblyAIStreamingCore.LearningEvidenceRecorder()
     /// The first failure the server reported (Error frame or error close).
     private var failure: AssemblyAIStreamingError?
     private var socketState = CommitPolicy.SocketState.open
@@ -318,9 +320,11 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
             keytermUpdateRequested = true
             screenKeytermCount = plan.screenCount
             identifierKeytermCount = plan.identifierCount
+            learningRecorder.notePlannedKeyterms(plan.terms)
             if isReady, let task {
                 keytermUpdateAudioMilliseconds = audioMillisecondsSentLocked
                 sendUpdateLocked(message, over: task)
+                learningRecorder.noteKeytermsSent()
             } else {
                 keytermUpdateAudioMilliseconds = 0
                 keytermUpdateHeld = true
@@ -369,6 +373,15 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
         }
     }
 
+    /// The final words heard and the keyterms the stream last used: the update's list once it
+    /// went out (it replaces the whole list), otherwise the connect list. In memory, for the
+    /// learning loop only; never stored or logged. Teardown keeps it for the stop path.
+    var learningEvidence: (words: [DeepgramStreamingCore.RecognizedWord], keyterms: [String]) {
+        stateQueue.sync {
+            (learningRecorder.words, learningRecorder.keyterms(connect: connectKeyterms))
+        }
+    }
+
     // MARK: Socket events
 
     fileprivate func socketDidOpen() {
@@ -413,7 +426,8 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
         service()?.receiveEnded(error: nil)
     }
 
-    private func handle(_ message: URLSessionWebSocketTask.Message) {
+    /// One frame off the socket. Not private: a test feeds it frames with no socket.
+    func handle(_ message: URLSessionWebSocketTask.Message) {
         let data: Data
         switch message {
         case .string(let text):
@@ -424,8 +438,12 @@ final class AssemblyAIStreamingService: StreamingTranscriptionSession {
             return
         }
         let parsed = AssemblyAIStreamingCore.ServerMessage(data: data)
+        // Only a final turn is parsed again, and outside the lock.
+        let finalWords = AssemblyAIStreamingCore.LearningEvidenceRecorder.finalWords(of: parsed, in: data)
         stateQueue.sync {
             guard !closed else { return }
+            // Before the evaluation, so the text a commit resolves and its evidence agree.
+            learningRecorder.note(parsed, finalWords: finalWords)
             switch parsed {
             case .begin:
                 beginLocked()

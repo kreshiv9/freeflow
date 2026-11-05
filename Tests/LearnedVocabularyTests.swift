@@ -15,8 +15,7 @@ enum LearnedVocabularyTests {
         testRevertsMakeAmbiguousAndDeleteRules()
         testFrecencyDecays()
         testPlannerKeepsManualFirstAndCapsLearnedSlice()
-        // ST8 (a hook prompt with markers gives the same verdict) needs the Claude Code
-        // hook-prompt normalizer, which comes with the hook source in a later change.
+        // ST8 (a hook prompt with markers gives the same verdict) is in LearningSourcesTests.
         testUndoRemovesAndTombstones()
         testDeleteAllLeavesManualListsIntact()
         testSearchOnlyCasingScopesRules()

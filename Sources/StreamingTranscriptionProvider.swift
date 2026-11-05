@@ -114,4 +114,20 @@ protocol KeytermStreamingSession: StreamingTranscriptionSession {
     func updateKeyterms(screenTerms: [String], identifiers: [String])
     /// Numbers only, for the Run Log.
     var keytermReport: DeepgramStreamingCore.KeytermReport { get }
+    /// The final words heard and the keyterms the stream last used. In memory, for the learning
+    /// loop only; never stored or logged. Teardown keeps it for the stop path.
+    var learningEvidence: (words: [DeepgramStreamingCore.RecognizedWord], keyterms: [String]) { get }
+}
+
+extension StreamingTranscriptionProvider {
+    /// The session's evidence only when its stream produced the transcript (Deepgram or
+    /// AssemblyAI source labels), so file-upload and fallback text never gets stream evidence.
+    static func learningEvidence(
+        from session: StreamingTranscriptionSession?,
+        transcriptionSource: String
+    ) -> (words: [DeepgramStreamingCore.RecognizedWord], keyterms: [String])? {
+        guard transcriptionSource.hasPrefix(PipelineStageTimings.deepgramTranscriptionSource)
+            || transcriptionSource.hasPrefix(PipelineStageTimings.assemblyAITranscriptionSource) else { return nil }
+        return (session as? KeytermStreamingSession)?.learningEvidence
+    }
 }

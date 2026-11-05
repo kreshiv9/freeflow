@@ -794,6 +794,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         didSet {
             UserDefaults.standard.set(learningEnabled, forKey: LearningPreference.storageKey)
             if !learningEnabled { dictationRecords = DictationRecordRing() }
+            syncLearningSources()
         }
     }
 
@@ -801,8 +802,25 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var lastLearnedChange: LearnedVocabulary.Change?
     /// The menu bar offers Undo Last Learned for LearnedVocabulary.undoMenuSeconds.
     @Published var showsLearnedUndoInMenu = false
-    /// Deepgram words and keyterms of recent dictations, in memory only.
+    /// Streaming words, keyterms and observable pastes of recent dictations, in memory only.
     var dictationRecords = DictationRecordRing()
+    /// The user connected Claude Code in Settings (AppState+LearningSources).
+    @Published var claudeCodeHookConnected: Bool {
+        didSet {
+            UserDefaults.standard.set(claudeCodeHookConnected, forKey: ClaudeCodeHookPreference.storageKey)
+        }
+    }
+    /// Settings shows ClaudeHookHealth.warningText.
+    @Published var claudeHookNotReporting = false
+    /// A line for the Claude Code row: an invalid settings file, a removed entry or a socket failure.
+    @Published var claudeHookStatusMessage: String?
+    var claudeHookListener: ClaudeHookListener?
+    var claudeHookHealth = ClaudeHookHealth()
+    /// The Google search watch of the last paste into Chrome, and its title poller.
+    var googleSearchWatch: GoogleSearchWatch?
+    var googleTitlePoller: GoogleTitlePoller?
+    /// Bumped when a watch starts or ends, so a late Accessibility read or title is dropped.
+    var googleSearchWatchGeneration = 0
     /// The learned keyterms ranked off main after each change of the learned store, Custom
     /// Vocabulary or Corrections, so a dictation start only reads them; nil while ranking.
     var learnedKeytermIndex: EffectiveVocabulary.LearnedKeytermIndex?
@@ -1115,6 +1133,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.cursorFormattingEnabled = CursorFormatting.load(from: .standard)
         self.vibeCodingFileTaggingEnabled = FileTagMatcher.load(from: .standard)
         self.learningEnabled = LearningPreference.load(from: .standard)
+        self.claudeCodeHookConnected = ClaudeCodeHookPreference.load(from: .standard)
         self.dictationStyles = StyleCategory.loadStyles(from: .standard)
         self.isPressEnterVoiceCommandEnabled = isPressEnterVoiceCommandEnabled
         self.alertSoundsEnabled = alertSoundsEnabled
@@ -1187,7 +1206,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
             queue: .main
         ) { [weak self] _ in
             self?.saveLearnedVocabularyNow()
+            self?.claudeHookListener?.stop()
         }
+        syncLearningSources()
         overlayManager.onLearnedUndoPressed = { [weak self] in
             DispatchQueue.main.async {
                 self?.undoLastLearned()
@@ -1757,6 +1778,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// `lastTranscript` is left alone so Paste Again keeps re-pasting the last dictation.
     func undoAIEdit(item: PipelineHistoryItem) {
         guard item.canUndoAIEdit else { return }
+        cancelLearningCredit(entryID: item.id)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(item.rawTranscript, forType: .string)
         let status = CleanupLevel.rawTranscriptCopiedStatusText
@@ -2883,6 +2905,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         activeTextInsertionTarget = activeOriginalFieldInsertionEnabled ? selectionSnapshot.textInsertionTarget : nil
         textInsertionTargetID = activeTextInsertionTarget?.identifier
         activeRecordingBundleIdentifier = selectionSnapshot.bundleIdentifier
+        // A new dictation ends any Google search watch.
+        endGoogleSearchWatch()
         guard let resolvedIntent = resolveSessionIntent(
             triggerMode: triggerMode,
             selectionSnapshot: selectionSnapshot,
@@ -3890,10 +3914,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         stageMarks.codeKeyterms = report.identifierCount
                         stageMarks.screenKeytermsAudioMilliseconds = report.audioMillisecondsBeforeUpdate
                     }
-                    // Words and keyterms only when Deepgram streaming produced this transcript.
-                    let learningEvidence = resolved.source.hasPrefix(PipelineStageTimings.deepgramTranscriptionSource)
-                        ? (activeRealtime as? DeepgramStreamingService)?.learningEvidence
-                        : nil
+                    // Words and keyterms only when a keyterm stream produced this transcript.
+                    let learningEvidence = StreamingTranscriptionProvider.learningEvidence(
+                        from: activeRealtime,
+                        transcriptionSource: resolved.source
+                    )
                     let rawTranscript = resolved.transcript
                     let parsedTranscript = Self.parseTranscriptCommands(
                         from: rawTranscript,
@@ -3925,11 +3950,19 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         textContext: appContext.textContext,
                         bundleIdentifier: sessionBundleIdentifier
                     )
+                    let learnedCategory = LearnedVocabulary.Category(
+                        sessionCategory,
+                        isGoogleSearch: GoogleSearchTitle.isSearchSurface(
+                            bundleIdentifier: appContext.bundleIdentifier ?? sessionBundleIdentifier,
+                            websiteDomain: appContext.textContext?.websiteDomain,
+                            windowTitle: appContext.windowTitle
+                        )
+                    )
                     let effectiveVocabulary = EffectiveVocabulary.merge(
                         manualVocabulary: manualVocabularySnapshot,
                         manualCorrections: manualCorrectionsSnapshot,
                         learned: learnedVocabularySnapshot,
-                        category: LearnedVocabulary.Category(sessionCategory),
+                        category: learnedCategory,
                         now: Date()
                     )
                     let rawTranscriptForAIApp = AIAppRawTranscriptPreference.shouldPasteRawTranscript(
@@ -4171,6 +4204,22 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 self.overlayManager.dismiss()
                             }
 
+                            let learningPaste = LearningPaste.eligible(
+                                inserted: insertedTranscript,
+                                raw: trimmedRawTranscript,
+                                bundleIdentifier: appContext.bundleIdentifier ?? sessionBundleIdentifier,
+                                category: learnedCategory,
+                                composerTarget: appContext.textContext?.composerTarget,
+                                composerClassified: appContext.textContext?.composerClassified ?? false,
+                                listensForPrompts: self.claudeHookListener != nil,
+                                pressedEnter: shouldPressEnterAfterPaste,
+                                isCommandMode: sessionIntent.isCommandMode,
+                                isVoiceMacro: result.outcome.isVoiceMacro,
+                                expandedSnippetCount: result.expandedSnippetCount,
+                                taggedFileCount: result.taggedFileCount,
+                                autoApplied: autoApplyKind != nil
+                            )
+                            let learningWebsiteDomain = appContext.textContext?.websiteDomain
                             self.pasteGate.schedule { [weak self] firedAt in
                                 guard let firedAt else {
                                     // Nothing was pasted or inserted; the stored row already holds these timings.
@@ -4180,12 +4229,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 var firedMarks = recordedMarks
                                 firedMarks.pasteFired = firedAt
                                 self?.completeStageTimings(firedMarks.timings, entryID: entryID)
+                                if let learningPaste {
+                                    self?.noteDispatchedPaste(entryID: entryID, paste: learningPaste, websiteDomain: learningWebsiteDomain)
+                                }
                             }
                             self.insertTranscriptWhenShortcutReleased(
                                 insertedTranscript, target: textInsertionTarget,
                                 shouldPressEnter: shouldPressEnterAfterPaste,
                                 useOriginalField: useOriginalFieldInsertion,
-                                appendsSpaceAfterSentenceMark: !(cursorFit?.handledTrailingEdge ?? false)
+                                appendsSpaceAfterSentenceMark: !(cursorFit?.handledTrailingEdge ?? false),
+                                onInsertionFailed: { [weak self] in self?.forgetFailedInsertion(entryID: entryID) }
                             )
                         }
                         // After the paste is scheduled; the hit scan itself runs off main.
@@ -4822,7 +4875,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// that already settled the trailing edge passes `appendsSpaceAfterSentenceMark: false`.
     private func insertTranscriptWhenShortcutReleased(
         _ transcript: String, target: AppTextInsertionTarget?, shouldPressEnter: Bool, useOriginalField: Bool,
-        appendsSpaceAfterSentenceMark: Bool = true
+        appendsSpaceAfterSentenceMark: Bool = true,
+        onInsertionFailed: @escaping () -> Void = {}
     ) {
         guard useOriginalField else {
             let pendingRestore = writeTranscriptToPasteboard(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark)
@@ -4884,6 +4938,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 }
                 return
             }
+            // The result can come before or after the gate reports this dispatch, which keeps
+            // whichever report comes first. An unverified write may have landed, so it is no failure.
+            let insertionFailed = {
+                self.pasteGate.report(dispatched: false)
+                onInsertionFailed()
+            }
             target.insert(
                 self.transcriptTextForInsertion(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark),
                 isCurrent: { target.identifier == self.textInsertionTargetID }
@@ -4912,6 +4972,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             if target.identifier == self.textInsertionTargetID {
                                 finish("Insertion unavailable — use Paste Again")
                             }
+                            insertionFailed()
                             return
                         }
                         guard target.identifier == self.textInsertionTargetID else {
@@ -4930,6 +4991,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     finish("Insertion unconfirmed — use Paste Again")
                 case .unavailable:
                     finish("Original field changed or unavailable — use Paste Again")
+                    insertionFailed()
                 }
             }
         }

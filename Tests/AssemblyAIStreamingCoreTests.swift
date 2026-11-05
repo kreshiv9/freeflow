@@ -30,6 +30,9 @@ enum AssemblyAIStreamingCoreTests {
         testParsesServerMessages()
         testFailureClassification()
         testTurnAssembler()
+        testFinalTurnWords()
+        testLearningEvidenceRecorder()
+        testLearningEvidenceFromFrames()
         testCommitConstants()
         testCommitDecision()
         testBacklogEstimate()
@@ -786,12 +789,133 @@ enum AssemblyAIStreamingCoreTests {
         }
     }
 
+    private static func testFinalTurnWords() {
+        typealias Word = DeepgramStreamingCore.RecognizedWord
+        func parsed(_ text: String) -> (order: Int, words: [Word])? {
+            Core.finalTurnWords(in: Data(text.utf8))
+        }
+        let final = parsed(#"{"type":"Turn","turn_order":3,"end_of_turn":true,"transcript":"Ask Sonny.","words":[{"text":"Ask","confidence":0.9},{"text":"Sonny.","confidence":0.5}]}"#)
+        TestSupport.expectEqual(final?.order, 3)
+        TestSupport.expectEqual(
+            final?.words,
+            [
+                Word(word: "ask", punctuatedWord: "Ask", confidence: 0.9),
+                Word(word: "sonny", punctuatedWord: "Sonny.", confidence: 0.5),
+            ]
+        )
+        // A partial turn, another frame, or no integral order has no final words.
+        TestSupport.expect(parsed(#"{"type":"Turn","turn_order":3,"end_of_turn":false,"words":[{"text":"Ask","confidence":0.9}]}"#) == nil, "Partial turn")
+        TestSupport.expect(parsed(#"{"type":"Turn","turn_order":3,"words":[{"text":"Ask","confidence":0.9}]}"#) == nil, "No end_of_turn")
+        TestSupport.expect(parsed(#"{"type":"Turn","end_of_turn":true,"words":[]}"#) == nil, "No turn_order")
+        TestSupport.expect(parsed(#"{"type":"Turn","turn_order":1.5,"end_of_turn":true,"words":[]}"#) == nil, "A fractional turn_order")
+        TestSupport.expect(parsed(#"{"type":"Begin"}"#) == nil, "Another frame")
+        TestSupport.expect(parsed("not json") == nil, "Malformed")
+        // Entries without text or a numeric confidence are skipped; confidence is clamped.
+        TestSupport.expectEqual(
+            parsed(#"{"type":"Turn","turn_order":0,"end_of_turn":true,"words":[{"text":"a"},{"confidence":0.5},{"text":"b","confidence":"high"},{"text":"c","confidence":true},{"text":"d","confidence":1.5},{"text":"e","confidence":-1}]}"#)?.words,
+            [
+                Word(word: "d", punctuatedWord: "d", confidence: 1),
+                Word(word: "e", punctuatedWord: "e", confidence: 0),
+            ]
+        )
+        TestSupport.expectEqual(parsed(#"{"type":"Turn","turn_order":0,"end_of_turn":true,"words":[{"text":"a"}]}"#)?.words, [])
+        TestSupport.expectEqual(parsed(#"{"type":"Turn","turn_order":0,"end_of_turn":true}"#)?.words, [])
+    }
+
+    private static func testLearningEvidenceRecorder() {
+        typealias Word = DeepgramStreamingCore.RecognizedWord
+        func words(_ text: String, count: Int = 1) -> [Word] {
+            Array(repeating: Word(word: text, punctuatedWord: text, confidence: 0.5), count: count)
+        }
+        var recorder = Core.LearningEvidenceRecorder()
+        recorder.noteFinalWords(order: 2, words: words("two"))
+        recorder.noteFinalWords(order: 0, words: words("zero"))
+        // A turn's later formatted end_of_turn is ignored, as TurnAssembler ignores it.
+        recorder.noteFinalWords(order: 2, words: words("Two."))
+        TestSupport.expectEqual(recorder.words.map(\.word), ["zero", "two"])
+
+        var capped = Core.LearningEvidenceRecorder()
+        capped.noteFinalWords(order: 0, words: words("a", count: DeepgramStreamingCore.maxRecognizedWords - 1))
+        capped.noteFinalWords(order: 1, words: words("b", count: 5))
+        capped.noteFinalWords(order: 2, words: words("c"))
+        TestSupport.expectEqual(capped.words.count, DeepgramStreamingCore.maxRecognizedWords)
+        TestSupport.expectEqual(capped.words.last?.word, "b")
+
+        // Planned terms count only once they went out; the update replaces the whole list.
+        var terms = Core.LearningEvidenceRecorder()
+        TestSupport.expectEqual(terms.keyterms(connect: ["Kai"]), ["Kai"])
+        terms.notePlannedKeyterms(["Kai", "Supabase"])
+        TestSupport.expectEqual(terms.keyterms(connect: ["Kai"]), ["Kai"])
+        terms.noteKeytermsSent()
+        TestSupport.expectEqual(terms.keyterms(connect: ["Kai"]), ["Kai", "Supabase"])
+        var unsent = Core.LearningEvidenceRecorder()
+        unsent.noteKeytermsSent()
+        TestSupport.expectEqual(unsent.keyterms(connect: ["Kai"]), ["Kai"])
+    }
+
+    /// The wiring from frames to evidence, through the recorder alone and through a real service
+    /// with no socket, then the provider-neutral gate.
+    private static func testLearningEvidenceFromFrames() {
+        typealias Word = DeepgramStreamingCore.RecognizedWord
+        let begin = #"{"type":"Begin","id":"synthetic","expires_at":0}"#
+        let partial = #"{"type":"Turn","turn_order":0,"end_of_turn":false,"transcript":"ask","words":[{"text":"ask","confidence":0.2,"start":0,"end":1}]}"#
+        let final = #"{"type":"Turn","turn_order":0,"end_of_turn":true,"transcript":"ask sonny","words":[{"text":"ask","confidence":0.9,"start":0,"end":1},{"text":"sonny","confidence":0.5,"start":1,"end":2}]}"#
+        let formatted = #"{"type":"Turn","turn_order":0,"end_of_turn":true,"turn_is_formatted":true,"transcript":"Ask Sonny.","words":[{"text":"Ask","confidence":0.1,"start":0,"end":1},{"text":"Sonny.","confidence":0.1,"start":1,"end":2}]}"#
+        let next = #"{"type":"Turn","turn_order":1,"end_of_turn":true,"transcript":"now","words":[{"text":"now","confidence":0.8,"start":2,"end":3}]}"#
+        let termination = #"{"type":"Termination"}"#
+        let expected = [
+            Word(word: "ask", punctuatedWord: "ask", confidence: 0.9),
+            Word(word: "sonny", punctuatedWord: "sonny", confidence: 0.5),
+            Word(word: "now", punctuatedWord: "now", confidence: 0.8),
+        ]
+
+        var recorder = Core.LearningEvidenceRecorder()
+        recorder.notePlannedKeyterms(["Kai", "Supabase"])
+        for frame in [begin, partial, final, formatted, next, termination] {
+            let data = Data(frame.utf8)
+            let parsed = Core.ServerMessage(data: data)
+            recorder.note(parsed, finalWords: Core.LearningEvidenceRecorder.finalWords(of: parsed, in: data))
+        }
+        TestSupport.expectEqual(recorder.words, expected)
+        TestSupport.expectEqual(recorder.keyterms(connect: ["Kai"]), ["Kai", "Supabase"])
+
+        let service = AssemblyAIStreamingService(config: configuration(keyterms: ["Kai"]))
+        func feed(_ frame: String) { service.handle(.string(frame)) }
+        // A held update counts as sent only once Begin sends it ahead of the audio.
+        service.updateKeyterms(screenTerms: ["Supabase"], identifiers: [])
+        TestSupport.expectEqual(service.learningEvidence.keyterms, ["Kai"])
+        feed(begin)
+        TestSupport.expectEqual(service.learningEvidence.keyterms, ["Kai", "Supabase"])
+        // Only a final turn has words, and its first end_of_turn wins.
+        feed(partial)
+        TestSupport.expectEqual(service.learningEvidence.words, [])
+        feed(final)
+        feed(formatted)
+        feed(next)
+        TestSupport.expectEqual(service.learningEvidence.words, expected)
+
+        let evidence = StreamingTranscriptionProvider.learningEvidence(from: service, transcriptionSource: "assemblyai-final")
+        TestSupport.expectEqual(evidence?.words, expected)
+        TestSupport.expectEqual(evidence?.keyterms, ["Kai", "Supabase"])
+        TestSupport.expect(
+            StreamingTranscriptionProvider.learningEvidence(from: service, transcriptionSource: PipelineStageTimings.fileTranscriptionSource) == nil,
+            "A file transcript gets no stream evidence"
+        )
+
+        // Teardown keeps the evidence, and later frames are ignored.
+        service.cancel()
+        feed(#"{"type":"Turn","turn_order":2,"end_of_turn":true,"transcript":"late","words":[{"text":"late","confidence":0.8,"start":3,"end":4}]}"#)
+        TestSupport.expectEqual(service.learningEvidence.words, expected)
+    }
+
     private static func testServiceWithoutNetwork() async {
         typealias Report = DeepgramStreamingCore.KeytermReport
         let service = AssemblyAIStreamingService(
             config: configuration(keyterms: ["Wispr Flow", "wispr flow", "Kai"], promptScenario: .dictation)
         )
         TestSupport.expectEqual(service.transcriptionSource, "assemblyai")
+        TestSupport.expectEqual(service.learningEvidence.keyterms, ["Wispr Flow", "Kai"])
+        TestSupport.expectEqual(service.learningEvidence.words, [])
         TestSupport.expectEqual(
             service.keytermReport,
             Report(connectCount: 2, screenCount: nil, identifierCount: nil, audioMillisecondsBeforeUpdate: nil)
@@ -815,8 +939,12 @@ enum AssemblyAIStreamingCoreTests {
             Report(connectCount: 2, screenCount: nil, identifierCount: nil, audioMillisecondsBeforeUpdate: nil)
         )
         TestSupport.expectEqual(service.transcriptionSource, "assemblyai")
+        // Nor among the sent keyterms: the learner would read it as sent.
+        TestSupport.expectEqual(service.learningEvidence.keyterms, ["Wispr Flow", "Kai"])
         service.cancel()
         service.cancel()
+        // Teardown keeps the evidence for the stop path.
+        TestSupport.expectEqual(service.learningEvidence.keyterms, ["Wispr Flow", "Kai"])
         service.updateKeyterms(screenTerms: ["Supabase"], identifiers: [])
         service.updatePromptScenario(.email)
         TestSupport.expectEqual(service.keytermReport.screenCount, nil)
@@ -826,6 +954,7 @@ enum AssemblyAIStreamingCoreTests {
         TestSupport.expect(service.acceptsKeytermUpdates, "Keyterms on take the mid-stream update")
         let noKeyterms = AssemblyAIStreamingService(config: configuration(keyterms: ["Wispr Flow"], keytermsEnabled: false))
         TestSupport.expect(!noKeyterms.acceptsKeytermUpdates, "Keyterms off take no mid-stream update")
+        TestSupport.expectEqual(noKeyterms.learningEvidence.keyterms, [])
         noKeyterms.updateKeyterms(screenTerms: ["Supabase"], identifiers: [])
         TestSupport.expectEqual(
             noKeyterms.keytermReport,

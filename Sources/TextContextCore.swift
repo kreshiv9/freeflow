@@ -76,6 +76,12 @@ struct TextContextSnapshot: Equatable, Sendable {
     /// only as keyterms in the stream's one Deepgram Configure. Not rendered by
     /// `promptSection(for:)` and never persisted.
     var contextTerms: [String] = []
+    /// The composer the focused field is by its role and label, with or without a stream, for
+    /// the learning loop. Never rendered, never persisted.
+    var composerTarget: ContextTarget?
+    /// The focused field was read far enough to set `composerTarget`, so nil there means it is
+    /// no composer rather than that nothing was read.
+    var composerClassified = false
 }
 
 struct CursorTextSlices: Equatable {

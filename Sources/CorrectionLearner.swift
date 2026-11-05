@@ -83,6 +83,9 @@ enum CorrectionLearner {
     static let partialRewriteWords = 3
     /// Longer inputs are not aligned (the LCS table is n × m).
     static let maxTokens = 1_000
+    /// Without the edit gates nothing else stops a heavy rewrite, and each hunk can cost hundreds
+    /// of judge calls, so this many hunks are resolved at most.
+    static let maxUngatedHunks = 32
 
     // MARK: Tokens
 
@@ -495,7 +498,12 @@ enum CorrectionLearner {
         let termWords = term.map(\.core), heardWords = heard.map(\.core)
         let unknownTerm = termWords.contains { !isKnown($0, lexicon) && !lexicon.isFirstName($0.lowercased()) }
         let capitalizedName = termWords.enumerated().contains { index, word in
-            (word.first?.isUppercase ?? false) && !(index == 0 && atSentenceStart) && !lexicon.isEveryday(word.lowercased())
+            guard word.first?.isUppercase ?? false, !lexicon.isEveryday(word.lowercased()) else { return false }
+            guard index == 0 && atSentenceStart else { return true }
+            // A sentence start's capital says nothing about an ordinary word, but a first name
+            // that is no ordinary word ("cloud code" -> "Claude Code") is a name there too. A
+            // change of case alone at a sentence start stays style.
+            return !caseOnly && lexicon.isFirstName(word.lowercased()) && !isKnown(word, lexicon)
         }
         let termShaped = codeShape || unknownTerm || capitalizedName
         let everydayTerm = termWords.allSatisfy { lexicon.isEveryday($0.lowercased()) } && !codeShape
@@ -772,12 +780,38 @@ enum CorrectionLearner {
 
     // MARK: Whole edit
 
+    /// The old words of every run of changes that only removes words.
+    private static func pureDeletions(_ steps: [Step]) -> Set<Int> {
+        var deleted = Set<Int>()
+        var run: [Int] = []
+        var runInserts = false
+        func endRun() {
+            if !runInserts { deleted.formUnion(run) }
+            run = []
+            runInserts = false
+        }
+        for step in steps {
+            switch step {
+            case .equal: endRun()
+            case .removed(let index): run.append(index)
+            case .inserted: runInserts = true
+            }
+        }
+        endRun()
+        return deleted
+    }
+
     /// What the fix from `pasted` to `final` teaches. `confidences` maps lowercased Deepgram
     /// words to their confidence (keyterm words already removed); `manualTerms` and
     /// `learnedTerms` hold lowercased vocabulary keys; `learnedRules` holds the `ruleKey` of
     /// each learned rule; `isTombstoned` receives a lowercased term. A term in `manualTerms` is
     /// already known; the heard side is never learned away from a manual or learned term, and
-    /// changing a learned rule's output back to its heard phrase is a revert.
+    /// changing a learned rule's output back to its heard phrase is a revert. With
+    /// `appliesEditGates` false (cleanup's edit of the raw text, which normally removes filler)
+    /// each hunk is judged alone: the whole-edit gates and the partial-rewrite downgrade are
+    /// skipped, and pure deletions are peeled first, so a filler beside a sentence-start capital
+    /// does not grow a hunk past `maxSideWords`; resolving stops after `maxUngatedHunks` hunks or
+    /// once `maxCandidates` strong candidates make the rest irrelevant.
     static func learn(
         pasted: String,
         final: String,
@@ -787,7 +821,8 @@ enum CorrectionLearner {
         learnedTerms: Set<String> = [],
         learnedRules: Set<String> = [],
         isTombstoned: @escaping (String) -> Bool = { _ in false },
-        tieBreak: TieBreak = .earliest
+        tieBreak: TieBreak = .earliest,
+        appliesEditGates: Bool = true
     ) -> Outcome {
         var old = tokens(pasted), new = tokens(final)
         guard !old.isEmpty, !new.isEmpty else { return .nothing(.empty) }
@@ -822,6 +857,13 @@ enum CorrectionLearner {
             new = new.enumerated().filter { !dropNew.contains($0.offset) }.map(\.element)
             steps = script(old.map(\.fold), new.map(\.fold), tieBreak: tieBreak)
         }
+        if !appliesEditGates {
+            let deleted = pureDeletions(steps)
+            if !deleted.isEmpty {
+                old = old.enumerated().filter { !deleted.contains($0.offset) }.map(\.element)
+                steps = script(old.map(\.fold), new.map(\.fold), tieBreak: tieBreak)
+            }
+        }
         let kept = steps.reduce(0) { count, step in
             if case .equal = step { return count + 1 }
             return count
@@ -839,9 +881,13 @@ enum CorrectionLearner {
         var found: [Candidate] = []
         var reasons: [Reason] = []
         var other = otherFromDuplicates, nonSoundAlike = otherFromDuplicates, styleWords = 0, fixed = 0
+        var resolvedHunks = 0
+        func pairKey(_ candidate: Candidate) -> String {
+            candidate.heard.lowercased() + "\u{1F}" + candidate.term.lowercased()
+        }
         // Every count only grows, so an edit over the rewrite budget or with too many other
         // changes stops early instead of resolving its remaining hunks.
-        if nonSoundAlike + styleWords > rewriteBudget { return .nothing(.rewrite) }
+        if appliesEditGates, nonSoundAlike + styleWords > rewriteBudget { return .nothing(.rewrite) }
         for hunk in hunks(steps, old, new) {
             let heard = hunk.old.map { old[$0] }, term = hunk.new.map { new[$0] }
             if heard.isEmpty && (hunk.leading || hunk.trailing) { continue }
@@ -872,22 +918,30 @@ enum CorrectionLearner {
                 styleWords += resolution.styleWords
                 fixed += resolution.fixedHeard
                 reasons += resolution.reasons
+                resolvedHunks += 1
             }
-            if nonSoundAlike + styleWords > rewriteBudget { return .nothing(.rewrite) }
+            if appliesEditGates {
+                if nonSoundAlike + styleWords > rewriteBudget { return .nothing(.rewrite) }
+                if other > maxOtherChanged { return .nothing(.rewording) }
+            } else if resolvedHunks >= maxUngatedHunks
+                || Set(found.filter { $0.strength == .strong }.map(pairKey)).count >= maxCandidates {
+                break
+            }
+        }
+        if appliesEditGates {
             if other > maxOtherChanged { return .nothing(.rewording) }
-        }
-        if other > maxOtherChanged { return .nothing(.rewording) }
-        let exactKept = steps.reduce(0) { count, step in
-            if case .equal(let i, let j) = step, old[i].core == new[j].core { return count + 1 }
-            return count
-        }
-        if old.count - fixed > 0, Double(exactKept) < minKeptShare * Double(old.count - fixed) {
-            return .nothing(.notThisDictation)
+            let exactKept = steps.reduce(0) { count, step in
+                if case .equal(let i, let j) = step, old[i].core == new[j].core { return count + 1 }
+                return count
+            }
+            if old.count - fixed > 0, Double(exactKept) < minKeptShare * Double(old.count - fixed) {
+                return .nothing(.notThisDictation)
+            }
         }
         var seen = Set<String>()
-        found = found.filter { seen.insert($0.heard.lowercased() + "\u{1F}" + $0.term.lowercased()).inserted }
+        found = found.filter { seen.insert(pairKey($0)).inserted }
         if found.isEmpty { return .nothing(reasons.first ?? (other > 0 ? .contentEdit : .styleOrUnchanged)) }
-        if nonSoundAlike >= partialRewriteWords {
+        if appliesEditGates, nonSoundAlike >= partialRewriteWords {
             // A partial rewrite: every candidate becomes weak and none is a rule at once.
             found = found.map { candidate in
                 var candidate = candidate
