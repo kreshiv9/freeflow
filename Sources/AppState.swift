@@ -4237,7 +4237,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 insertedTranscript, target: textInsertionTarget,
                                 shouldPressEnter: shouldPressEnterAfterPaste,
                                 useOriginalField: useOriginalFieldInsertion,
-                                appendsSpaceAfterSentenceMark: !(cursorFit?.handledTrailingEdge ?? false)
+                                appendsSpaceAfterSentenceMark: !(cursorFit?.handledTrailingEdge ?? false),
+                                onInsertionFailed: { [weak self] in self?.forgetFailedInsertion(entryID: entryID) }
                             )
                         }
                         // After the paste is scheduled; the hit scan itself runs off main.
@@ -4874,7 +4875,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// that already settled the trailing edge passes `appendsSpaceAfterSentenceMark: false`.
     private func insertTranscriptWhenShortcutReleased(
         _ transcript: String, target: AppTextInsertionTarget?, shouldPressEnter: Bool, useOriginalField: Bool,
-        appendsSpaceAfterSentenceMark: Bool = true
+        appendsSpaceAfterSentenceMark: Bool = true,
+        onInsertionFailed: @escaping () -> Void = {}
     ) {
         guard useOriginalField else {
             let pendingRestore = writeTranscriptToPasteboard(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark)
@@ -4936,6 +4938,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 }
                 return
             }
+            // The result can come before or after the gate reports this dispatch, which keeps
+            // whichever report comes first. An unverified write may have landed, so it is no failure.
+            let insertionFailed = {
+                self.pasteGate.report(dispatched: false)
+                onInsertionFailed()
+            }
             target.insert(
                 self.transcriptTextForInsertion(transcript, appendsSpaceAfterSentenceMark: appendsSpaceAfterSentenceMark),
                 isCurrent: { target.identifier == self.textInsertionTargetID }
@@ -4964,6 +4972,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             if target.identifier == self.textInsertionTargetID {
                                 finish("Insertion unavailable — use Paste Again")
                             }
+                            insertionFailed()
                             return
                         }
                         guard target.identifier == self.textInsertionTargetID else {
@@ -4982,6 +4991,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     finish("Insertion unconfirmed — use Paste Again")
                 case .unavailable:
                     finish("Original field changed or unavailable — use Paste Again")
+                    insertionFailed()
                 }
             }
         }

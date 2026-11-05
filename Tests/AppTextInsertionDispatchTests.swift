@@ -36,6 +36,7 @@ enum AppTextInsertionDispatchTests {
         testDisabledOriginalFieldUsesCurrentFieldPaste()
         testFittedTranscriptKeepsItsTrailingEdge()
         testPasteTimingReportsSkippedOriginalFieldInsertion()
+        testFailedInsertionTellsTheCaller()
         testWholeFieldRefusalCopiesWithoutPasting()
         testWholeFieldWriteNeverPastes()
         testWholeFieldStaleSessionDoesNothing()
@@ -766,6 +767,66 @@ enum AppTextInsertionDispatchTests {
         TestSupport.expectEqual(dispatchThroughPasteGate(changedSession, target: changedSession.target), [nil])
         TestSupport.expectEqual(changedSession.state.clipboardWriteCount, 1)
         TestSupport.expectEqual(changedSession.state.pasteCalls.count, 0)
+    }
+
+    /// An insertion that reports it did not land tells the caller, so learning can forget the
+    /// text. One that landed, or may have landed, does not. The fake's insert completes at once,
+    /// so a failure there also reaches the gate before it reports the dispatch.
+    private static func testFailedInsertionTellsTheCaller() {
+        let mark = TestInsertionState.pasteFiredMark
+
+        func dispatch(_ fixture: Fixture) -> (failures: Int, reported: [CFAbsoluteTime?]) {
+            var failures = 0
+            var reported: [CFAbsoluteTime?] = []
+            fixture.state.pasteGate.schedule { reported.append($0) }
+            let gated = fixture.state.pasteGate.wrappingScheduledPaste {
+                fixture.state.testDispatchInsertion(
+                    "dictation", target: fixture.target, shouldPressEnter: false, useOriginalField: true,
+                    onInsertionFailed: { failures += 1 }
+                )
+            }
+            gated()
+            TestDispatchQueue.runAll()
+            return (failures, reported)
+        }
+
+        let inserted = makeFixture(focused: false)
+        inserted.target.insertionResult = .inserted
+        let insertedResult = dispatch(inserted)
+        TestSupport.expectEqual(insertedResult.failures, 0)
+        TestSupport.expectEqual(insertedResult.reported, [mark])
+
+        let unverified = makeFixture(focused: false)
+        unverified.target.insertionResult = .unverified
+        let unverifiedResult = dispatch(unverified)
+        TestSupport.expectEqual(unverifiedResult.failures, 0)
+        TestSupport.expectEqual(unverifiedResult.reported, [mark])
+
+        let unavailable = makeFixture(focused: false)
+        unavailable.target.insertionResult = .unavailable
+        let unavailableResult = dispatch(unavailable)
+        TestSupport.expectEqual(unavailableResult.failures, 1)
+        TestSupport.expectEqual(unavailableResult.reported, [nil])
+
+        // The fallback paste landed.
+        let fellBack = makeFixture(focused: false)
+        fellBack.target.insertionResult = .notInserted
+        TestSupport.expectEqual(dispatch(fellBack).failures, 0)
+        TestSupport.expectEqual(fellBack.state.pasteCalls.count, 1)
+
+        // The fallback paste was refused because the field changed.
+        let refused = makeFixture(focused: false)
+        refused.target.insertionResult = .notInserted
+        refused.target.value = "captured text edited while away"
+        TestSupport.expectEqual(dispatch(refused).failures, 1)
+        TestSupport.expectEqual(refused.state.pasteCalls.count, 0)
+
+        // The other paths already report a skip to the gate, and need nothing more.
+        let focusedStale = makeFixture(focused: true)
+        focusedStale.state.textInsertionTargetID = UUID()
+        let focusedStaleResult = dispatch(focusedStale)
+        TestSupport.expectEqual(focusedStaleResult.failures, 0)
+        TestSupport.expectEqual(focusedStaleResult.reported, [nil])
     }
 
     /// Runs a dispatch through the paste-timing gate the way

@@ -153,6 +153,15 @@ extension AppState {
         }
     }
 
+    /// An insertion reported after it was dispatched that it did not land, so no source may
+    /// match this text or watch for it.
+    func forgetFailedInsertion(entryID: UUID) {
+        dictationRecords.clearPaste(id: entryID)
+        if googleSearchWatch?.entryID == entryID {
+            endGoogleSearchWatch(keepsEvidence: false)
+        }
+    }
+
     /// Undo AI edit (SentTextLearning.cancel), which also ends that dictation's watch.
     func cancelLearningCredit(entryID: UUID) {
         var store = learnedVocabulary
