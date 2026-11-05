@@ -24,6 +24,13 @@ final class GlobalShortcutBackend {
 
     var onInputEvent: ((ShortcutInputEvent) -> ShortcutConsumeDecision)?
     var onEscapeKeyPressed: (() -> Bool)?
+    /// Told about each key the tap let through, after the decision was made. It returns nothing,
+    /// so it cannot change what the tap consumes.
+    var onKeyActivity: ((KeyActivity) -> Void)?
+
+    var isTapInstalled: Bool {
+        eventTap != nil
+    }
 
     func start() throws {
         stop()
@@ -97,9 +104,10 @@ final class GlobalShortcutBackend {
     private func notifyBackendReset() {
         fnKeyIsDown = false
         _ = onInputEvent?(.backendReset)
+        onKeyActivity?(.reset)
     }
 
-    private func handleEventTap(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    func handleEventTap(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             notifyBackendReset()
@@ -111,6 +119,7 @@ final class GlobalShortcutBackend {
 
         case .flagsChanged, .keyDown, .keyUp:
             guard let nsEvent = NSEvent(cgEvent: event) else {
+                if type == .keyDown { reportKeyDown(event) }
                 return Unmanaged.passUnretained(event)
             }
 
@@ -126,11 +135,22 @@ final class GlobalShortcutBackend {
                 shouldConsume = false
             }
 
+            if type == .keyDown && !shouldConsume { reportKeyDown(event) }
             return shouldConsume ? nil : Unmanaged.passUnretained(event)
 
         default:
             return Unmanaged.passUnretained(event)
         }
+    }
+
+    /// The key's category only: its code and flags stop here, and its characters are never read.
+    private func reportKeyDown(_ event: CGEvent) {
+        guard let onKeyActivity else { return }
+        onKeyActivity(.key(CommitKeyClassifier.category(
+            keyCode: UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode)),
+            flags: event.flags,
+            isOwnEvent: event.getIntegerValueField(.eventSourceUnixProcessID) == Int64(getpid())
+        )))
     }
 
     private func handleFlagsChanged(_ event: NSEvent) -> Bool {

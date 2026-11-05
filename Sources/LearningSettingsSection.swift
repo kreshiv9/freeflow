@@ -165,7 +165,7 @@ struct LearningSettingsSection: View {
     private var learningContinuesText: String {
         guard appState.learningEnabled else { return "Learning stays off." }
         return appState.claudeCodeHookConnected
-            ? "Claude Code stays connected and learning continues; use Disconnect or turn off Learn automatically to stop it."
+            ? "Claude Code stays connected and learning continues; turn off Learn automatically to stop it. Disconnect removes the hook, but FreeFlow can still learn by reading the Claude Code box after its own paste."
             : "Learning continues; turn off Learn automatically to stop it."
     }
 
@@ -173,7 +173,7 @@ struct LearningSettingsSection: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Learn automatically", isOn: $appState.learningEnabled)
 
-            Text("FreeFlow learns misheard words and names from Fix in the Run Log, from what you send in Claude Code once it is connected, from your Google searches in Chrome, and from cleanup fixes you keep. Learned items stay on this Mac and go only where your vocabulary already goes: your streaming provider's key terms and cleanup spellings. Turning this off stops learning; learned items stay in use until you delete them.")
+            Text("FreeFlow learns misheard words and names from Fix in the Run Log, from what you send in ChatGPT in Chrome, the ChatGPT app and the Claude Code panel in VS Code, from your Google searches in Chrome, and from cleanup fixes you keep. To see what you send in ChatGPT, or in the Claude Code panel while Claude Code is not connected or not reporting, FreeFlow reads the message box only after its own paste, and learns only when you send; that reading needs Context Awareness on and Screenshot context off. Learned items stay on this Mac and go only where your vocabulary already goes: your streaming provider's key terms and cleanup spellings. Turning this off stops learning; learned items stay in use until you delete them.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -251,6 +251,12 @@ private struct ClaudeCodeConnectionRow: View {
                 Text(ClaudeHookHealth.warningText)
                     .font(.caption)
                     .foregroundStyle(.orange)
+                if appState.contextAwarenessEnabled && !appState.screenshotContextEnabled {
+                    Text("FreeFlow watches the Claude Code box instead until prompts arrive again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             if let message = appState.claudeHookStatusMessage {
                 Text(message)

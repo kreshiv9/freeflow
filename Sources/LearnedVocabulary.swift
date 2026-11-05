@@ -478,6 +478,18 @@ struct LearnedVocabulary: Codable, Equatable {
         counters[code, default: 0] += amount
     }
 
+    /// How a composer watch ended, as codes and counts. No sentence, title or term.
+    mutating func countComposerWatch(outcome: String, replacements: Int, payloads: Int) {
+        count("composer:\(outcome)")
+        if replacements > 0 { count("composer:elementReplaced", by: replacements) }
+        if payloads > 0 { count("composer:payload", by: payloads) }
+    }
+
+    /// Pastes a composer send showed were deleted and dictated again.
+    mutating func countReDictations(_ pastes: Int) {
+        count("composer:reDictation", by: pastes)
+    }
+
     private func itemIndex(forKey termKey: String) -> Int? {
         items.firstIndex { Self.key($0.text) == termKey }
     }

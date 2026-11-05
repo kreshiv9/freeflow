@@ -113,6 +113,15 @@ struct DictationRecordRing: Equatable {
         }
     }
 
+    /// The unobserved pastes among `ids`, oldest first, for SentTextMatcher.
+    func pastes(ids: [UUID], now: Date) -> [(id: UUID, pasted: String)] {
+        let wanted = Set(ids)
+        return unobservedPastes(now: now).compactMap { record in
+            guard wanted.contains(record.id), let paste = record.paste else { return nil }
+            return (record.id, paste.pasted)
+        }
+    }
+
     /// Takes one prompt's match: credited pastes are marked observed before any further await,
     /// so a second frame cannot reuse them, and are returned to learn from. Superseded pastes
     /// were never sent, so they are forgotten and no later prompt can match them.
@@ -131,6 +140,7 @@ struct LearningPaste: Equatable {
     enum Destination: Equatable {
         case vsCode
         case chrome
+        case chatGPTApp
     }
 
     /// The text as inserted.
@@ -146,12 +156,13 @@ struct LearningPaste: Equatable {
     let countsForHookHealth: Bool
     var observed = false
 
-    /// Nil for anything no source may learn from: an empty paste, another app (only VS Code and
-    /// Chrome are observed at all), VS Code while no hook listener runs (nothing could use the
-    /// text, so it is not kept), and text FreeFlow wrote itself, namely Edit Mode, voice macros,
-    /// snippets, file tags and auto-applied transforms. `composerClassified` is false when no
-    /// field was read: Context Awareness off, screenshot context, a capture that missed the stop
-    /// deadline or an omission. Matching works without it, so the health check must too.
+    /// Nil for anything no source may learn from: an empty paste, another app (only VS Code,
+    /// Chrome and the ChatGPT app are observed at all), VS Code while neither a hook listener nor
+    /// a composer watch could use the text, the ChatGPT app while no composer watch could, and
+    /// text FreeFlow wrote itself, namely Edit Mode, voice macros, snippets, file tags and
+    /// auto-applied transforms. `composerClassified` is false when no field was read: Context
+    /// Awareness off, screenshot context, a capture that missed the stop deadline or an omission.
+    /// Matching works without it, so the health check must too.
     static func eligible(
         inserted: String,
         raw: String,
@@ -160,6 +171,7 @@ struct LearningPaste: Equatable {
         composerTarget: ContextTarget?,
         composerClassified: Bool,
         listensForPrompts: Bool,
+        composerWatchMayArm: Bool = false,
         pressedEnter: Bool,
         isCommandMode: Bool,
         isVoiceMacro: Bool,
@@ -172,10 +184,13 @@ struct LearningPaste: Equatable {
         }
         let destination: Destination
         if ContextTarget.isVSCode(bundleIdentifier: bundleIdentifier) {
-            guard listensForPrompts else { return nil }
+            guard listensForPrompts || composerWatchMayArm else { return nil }
             destination = .vsCode
         } else if ContextTarget.isChrome(bundleIdentifier: bundleIdentifier) {
             destination = .chrome
+        } else if ContextTarget.isChatGPTApp(bundleIdentifier: bundleIdentifier) {
+            guard composerWatchMayArm else { return nil }
+            destination = .chatGPTApp
         } else {
             return nil
         }
@@ -312,12 +327,22 @@ enum SentTextLearning {
         case firstResultsAfterEnter
         /// Signal B: one results title to the next.
         case nextResults(previous: String)
+        /// What a composer watch confirmed was sent: the composer's span that holds the paste.
+        case composerSend(LearningSource)
+
+        var isSearch: Bool {
+            switch self {
+            case .firstResults, .firstResultsAfterEnter, .nextResults: true
+            case .hookPrompt, .composerSend: false
+            }
+        }
     }
 
     struct Verdict: Equatable, Sendable {
         let sighting: Sighting
         let category: LearnedVocabulary.Category
-        /// Both sides as compared: normalized queries for a search.
+        /// Both sides as compared: normalized queries for a search, normalized text for a
+        /// composer.
         let compared: String
         let observed: String
         let outcome: CorrectionLearner.Outcome
@@ -327,7 +352,8 @@ enum SentTextLearning {
     /// The paste (or for Signal B the previous query) against `final`, plus the cleanup fixes
     /// `final` kept. A search compares normalized queries and never learns from case alone, and
     /// Signal B, which comes after the dictation's first observation, keeps no cleanup fix and
-    /// only changes of words the paste held.
+    /// only changes of words the paste held. A composer compares both sides without what it
+    /// adds to a paste (ComposerText.normalized).
     static func judge(
         _ sighting: Sighting,
         paste: LearningPaste,
@@ -336,15 +362,25 @@ enum SentTextLearning {
         lexicon: LearningLexicon,
         confidences: [String: Double]
     ) -> Verdict {
-        let isSearch = sighting != .hookPrompt
+        let isSearch = sighting.isSearch
         var earlier = paste.pasted
         var restrictedTo: String?
         if case .nextResults(let previous) = sighting {
             earlier = previous
             restrictedTo = paste.pasted
         }
-        let compared = isSearch ? GoogleSearchTitle.normalizedQuery(earlier) : earlier
-        let observed = isSearch ? GoogleSearchTitle.normalizedQuery(final) : final
+        let compared: String
+        let observed: String
+        if isSearch {
+            compared = GoogleSearchTitle.normalizedQuery(earlier)
+            observed = GoogleSearchTitle.normalizedQuery(final)
+        } else if case .composerSend = sighting {
+            compared = ComposerText.normalized(earlier)
+            observed = ComposerText.normalized(final)
+        } else {
+            compared = earlier
+            observed = final
+        }
         let found = knowledge.outcome(pasted: compared, final: observed, lexicon: lexicon, confidences: confidences)
         let fixes = restrictedTo != nil ? [] : CleanupFixSignal.keptFixes(
             raw: paste.raw,
@@ -413,15 +449,22 @@ enum SentTextLearning {
             }
         }
 
-        switch verdict.sighting {
-        case .hookPrompt:
+        /// What was finally sent: a change teaches, and no change counts as accepted at once.
+        func applyPrompt(_ source: LearningSource) {
             if unchanged {
                 store.recordAccepted(pasted: verdict.compared, final: verdict.observed, now: now)
                 applied.code = "acceptedUnchanged"
                 applied.touchedStore = true
             } else {
-                applySource(.claudeCode, keptCheck: true)
+                applySource(source, keptCheck: true)
             }
+        }
+
+        switch verdict.sighting {
+        case .hookPrompt:
+            applyPrompt(.claudeCode)
+        case .composerSend(let source):
+            applyPrompt(source)
         case .firstResults, .firstResultsAfterEnter:
             applied.keptSearch = GoogleSearchWatch.KeptSearch(pasted: verdict.compared, query: verdict.observed, unchanged: unchanged)
             if verdict.sighting == .firstResultsAfterEnter || unchanged {

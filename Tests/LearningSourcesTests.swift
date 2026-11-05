@@ -33,6 +33,9 @@ enum LearningSourcesTests {
         testSearchSurfaceAppliesSearchRules()
         testEvidenceGate()
         testConfidencesOverAssemblyAIWords()
+        testComposerWatchEligibility()
+        testComposerSendSightings()
+        testComposerPastes()
     }
 
     // MARK: Fixtures
@@ -980,5 +983,157 @@ enum LearningSourcesTests {
             edgeFrame.flatMap { AssemblyAIStreamingCore.finalTurnWords(in: $0)?.words.first?.word },
             token?.fold
         )
+    }
+
+    // MARK: Composer watch
+
+    /// A composer watch keeps the paste alive where nothing else would observe it.
+    private static func testComposerWatchEligibility() {
+        func eligible(
+            bundle: String?,
+            composer: ContextTarget?,
+            listening: Bool = false,
+            mayArm: Bool
+        ) -> LearningPaste? {
+            LearningPaste.eligible(
+                inserted: "synthetic words",
+                raw: "synthetic raw",
+                bundleIdentifier: bundle,
+                category: .coding,
+                composerTarget: composer,
+                composerClassified: true,
+                listensForPrompts: listening,
+                composerWatchMayArm: mayArm,
+                pressedEnter: false,
+                isCommandMode: false,
+                isVoiceMacro: false,
+                expandedSnippetCount: 0,
+                taggedFileCount: 0,
+                autoApplied: false
+            )
+        }
+        let vsCode = "com.microsoft.VSCode", chatGPT = "com.openai.codex", chrome = "com.google.Chrome"
+        // The fallback: no hook, or one that is not reporting.
+        TestSupport.expectEqual(eligible(bundle: vsCode, composer: .claudeCodePanel, mayArm: true)?.destination, .vsCode)
+        TestSupport.expectEqual(eligible(bundle: vsCode, composer: .claudeCodePanel, listening: true, mayArm: true)?.destination, .vsCode)
+        TestSupport.expect(eligible(bundle: vsCode, composer: nil, mayArm: false) == nil, "A VS Code editor with nothing to observe it")
+        TestSupport.expect(eligible(bundle: vsCode, composer: .claudeCodePanel, mayArm: false) == nil, "No hook and no watch")
+        // The ChatGPT app only ever goes through a watch.
+        TestSupport.expectEqual(eligible(bundle: chatGPT, composer: .chatGPTApp, mayArm: true)?.destination, .chatGPTApp)
+        TestSupport.expectEqual(eligible(bundle: chatGPT, composer: .chatGPTApp, mayArm: true)?.countsForHookHealth, false)
+        TestSupport.expect(eligible(bundle: chatGPT, composer: .chatGPTApp, mayArm: false) == nil, "No watch for this paste")
+        TestSupport.expect(eligible(bundle: chatGPT, composer: .chatGPTApp, listening: true, mayArm: false) == nil, "The hook does not cover it")
+        // ChatGPT Classic and Atlas stay out.
+        TestSupport.expect(eligible(bundle: "com.openai.chat", composer: nil, mayArm: true) == nil, "ChatGPT Classic")
+        TestSupport.expect(eligible(bundle: "com.openai.atlas", composer: nil, mayArm: true) == nil, "Atlas")
+        // Chrome is unchanged.
+        TestSupport.expectEqual(eligible(bundle: chrome, composer: .chatGPTWeb, mayArm: true)?.destination, .chrome)
+        TestSupport.expectEqual(eligible(bundle: chrome, composer: .chatGPTWeb, mayArm: false)?.destination, .chrome)
+        TestSupport.expectEqual(eligible(bundle: chrome, composer: .googleSearch, mayArm: false)?.destination, .chrome)
+
+        TestSupport.expect(ContextTarget.isChatGPTApp(bundleIdentifier: " com.openai.Codex "), "Any case")
+        TestSupport.expect(!ContextTarget.isChatGPTApp(bundleIdentifier: "com.openai.chat"), "ChatGPT Classic")
+        TestSupport.expect(!ContextTarget.isChatGPTApp(bundleIdentifier: nil), "No app")
+    }
+
+    private static func testComposerSendSightings() {
+        let chatGPT = SentTextLearning.Sighting.composerSend(.chatGPT)
+        TestSupport.expect(!chatGPT.isSearch, "A composer is no search")
+        TestSupport.expect(!SentTextLearning.Sighting.hookPrompt.isSearch, "A prompt is no search")
+        TestSupport.expect(SentTextLearning.Sighting.firstResults.isSearch, "First results")
+        TestSupport.expect(SentTextLearning.Sighting.firstResultsAfterEnter.isSearch, "First results after Enter")
+        TestSupport.expect(SentTextLearning.Sighting.nextResults(previous: "x").isSearch, "Next results")
+
+        // Sent as pasted, once a list marker and a no-break space are set aside.
+        var store = Store()
+        let accepted = UUID()
+        var applied = sight(
+            chatGPT, paste: paste("use the api\u{00A0}today", destination: .chrome), final: "- use the api today",
+            store: &store, entry: accepted, now: start + 1
+        )
+        TestSupport.expectEqual(applied.code, "acceptedUnchanged")
+        TestSupport.expectEqual(store.counters["acceptedUnchanged"], 1)
+        TestSupport.expect(!store.hasCounted(entryID: accepted, now: start + 1), "A later Run Log Fix can still count it")
+        TestSupport.expect(!applied.change.hasLearned, "Nothing to learn")
+        TestSupport.expect(applied.keptSearch == nil, "A composer send holds nothing back")
+
+        // Both sides reach the learner normalized, in the paste's own category.
+        let verdict = SentTextLearning.judge(
+            chatGPT,
+            paste: paste("1. use the\u{200B} versel api", destination: .chrome),
+            final: "> use the Vercel api",
+            knowledge: knowledge(of: Store()),
+            lexicon: lexicon,
+            confidences: [:]
+        )
+        TestSupport.expectEqual(verdict.compared, "use the versel api")
+        TestSupport.expectEqual(verdict.observed, "use the Vercel api")
+        TestSupport.expectEqual(verdict.category, .coding)
+
+        // M15: a case-only fix through ChatGPT's Markdown is weak, and active on its second
+        // sighting, from ChatGPT.
+        store = Store()
+        let bold = paste("use the wispr flow api", destination: .chrome)
+        applied = sight(chatGPT, paste: bold, final: "use the **Wispr Flow** api", store: &store, now: start + 1)
+        TestSupport.expectEqual(applied.change.pendingAdded, 1)
+        TestSupport.expect(!applied.change.hasLearned, "A weak fix waits for a second sighting")
+        applied = sight(chatGPT, paste: bold, final: "use the **Wispr Flow** api", store: &store, now: start + 2)
+        TestSupport.expect(applied.change.hasLearned, "The second sighting activates it")
+        TestSupport.expectEqual(store.items.first { $0.text == "Wispr Flow" }?.sources, [.chatGPT])
+
+        // The fallback teaches as Claude Code.
+        store = Store()
+        applied = sight(.composerSend(.claudeCode), paste: paste("ask versel about it"), final: "ask Vercel about it", store: &store, now: start + 1)
+        TestSupport.expect(applied.change.learnedTerms.contains("Vercel"), "The fix is learned")
+        TestSupport.expectEqual(store.items.first { $0.text == "Vercel" }?.sources, [.claudeCode])
+
+        // The hook's own behaviour is unchanged by sharing the code.
+        var viaHook = Store(), viaComposer = Store()
+        let hooked = sight(.hookPrompt, paste: paste("ask versel about it"), final: "ask Vercel about it", store: &viaHook, now: start + 1)
+        let composed = sight(.composerSend(.claudeCode), paste: paste("ask versel about it"), final: "ask Vercel about it", store: &viaComposer, now: start + 1)
+        TestSupport.expectEqual(hooked.code, composed.code)
+        TestSupport.expectEqual(hooked.change.learnedTerms, composed.change.learnedTerms)
+
+        // An entry already counted stays one observation.
+        var counted = Store()
+        let entry = UUID()
+        _ = sight(chatGPT, paste: paste("ask versel about it", destination: .chrome), final: "ask Vercel about it", store: &counted, entry: entry, now: start + 1)
+        applied = sight(chatGPT, paste: paste("ask versel about it", destination: .chrome), final: "ask Vercel about it", store: &counted, entry: entry, now: start + 2)
+        TestSupport.expectEqual(applied.code, "alreadyCounted")
+
+        // Only codes and counts reach the store's counters, and the activity line ignores them.
+        var counters = Store()
+        counters.countComposerWatch(outcome: "sent", replacements: 2, payloads: 1)
+        counters.countComposerWatch(outcome: "unsettled", replacements: 0, payloads: 0)
+        counters.countReDictations(3)
+        TestSupport.expectEqual(counters.counters, [
+            "composer:sent": 1, "composer:unsettled": 1, "composer:elementReplaced": 2, "composer:payload": 1, "composer:reDictation": 3,
+        ])
+        TestSupport.expectEqual(counters.activityLine, Store().activityLine)
+    }
+
+    private static func testComposerPastes() {
+        let first = UUID(), second = UUID(), third = UUID(), expired = UUID(), elsewhere = UUID()
+        var ring = DictationRecordRing()
+        ring.append(record(id: expired, at: start, paste: paste("expired words", destination: .chrome)), now: start)
+        ring.append(record(id: first, at: start + 600, paste: paste("first words", destination: .chatGPTApp)), now: start + 600)
+        ring.append(record(id: second, at: start + 601, paste: paste("second words", destination: .chrome)), now: start + 601)
+        ring.append(record(id: third, at: start + 602, paste: paste("third words", destination: .chrome, observed: true)), now: start + 602)
+        ring.append(record(id: elsewhere, at: start + 603, paste: paste("other words", destination: .chrome)), now: start + 603)
+        // Asked for, unobserved and alive, oldest first, whatever order they are named in.
+        let found = ring.pastes(ids: [second, third, first, expired], now: start + 604)
+        TestSupport.expectEqual(found.map(\.id), [first, second])
+        TestSupport.expectEqual(found.map(\.pasted), ["first words", "second words"])
+        // A destination of its own: the hook's list does not see the ChatGPT app.
+        TestSupport.expectEqual(ring.pastes(into: .vsCode, now: start + 604).map(\.id), [])
+
+        // The hook and the watch both see a send: the first claim takes the credit.
+        var both = DictationRecordRing()
+        let id = UUID()
+        both.append(record(id: id, paste: paste("ask versel about it")), now: start)
+        let match = SentTextMatcher.Match(credited: [id])
+        TestSupport.expectEqual(both.claim(match, now: start + 1).map(\.id), [id])
+        TestSupport.expectEqual(both.claim(match, now: start + 2).map(\.id), [])
+        TestSupport.expectEqual(both.pastes(ids: [id], now: start + 2).map(\.id), [])
     }
 }

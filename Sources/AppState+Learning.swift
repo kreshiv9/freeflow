@@ -238,6 +238,7 @@ extension AppState {
     @MainActor
     func deleteAllLearnedData() {
         endGoogleSearchWatch(keepsEvidence: false)
+        endComposerWatch(.cancelled, counts: false)
         learnedVocabulary = LearnedVocabulary()
         // The stored key goes now, not after the save delay.
         learnedSaveWorkItem?.cancel()

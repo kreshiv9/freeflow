@@ -31,6 +31,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/CleanupFastPath.swift \
 	Sources/CleanupLevel.swift \
 	Sources/CommandModeIntent.swift \
+	Sources/ComposerWatch.swift \
 	Sources/ContextInferenceFailure.swift \
 	Sources/ContextTermSources.swift \
 	Sources/CorrectionLearner.swift \
@@ -42,6 +43,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/EffectiveVocabulary.swift \
 	Sources/EverydayWords.swift \
 	Sources/FileTagMatcher.swift \
+	Sources/GlobalShortcutBackend.swift \
 	Sources/GoogleSearchWatch.swift \
 	Sources/HandsFreeAutoStop.swift \
 	Sources/IdentifierExtractor.swift \
@@ -53,6 +55,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/LearningRecords.swift \
 	Sources/LearningWordList.swift \
 	Sources/ModelConfiguration.swift \
+	Sources/ModifierKeyEventState.swift \
 	Sources/NameExtractor.swift \
 	Sources/OriginalFieldInsertionPreference.swift \
 	Sources/PCMSampleHandlerSlot.swift \

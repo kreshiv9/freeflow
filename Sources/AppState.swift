@@ -821,6 +821,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
     var googleTitlePoller: GoogleTitlePoller?
     /// Bumped when a watch starts or ends, so a late Accessibility read or title is dropped.
     var googleSearchWatchGeneration = 0
+    /// The composer watch of the last pastes into ChatGPT, or into the Claude Code panel while
+    /// the hook is not reporting, and its Accessibility session (AppState+ComposerWatch).
+    var composerWatch: ComposerWatch?
+    var composerWatchSession: ComposerWatchSession?
+    /// Bumped when a composer watch starts or ends, so a late read is dropped.
+    var composerWatchGeneration = 0
+    /// The next FreeFlow write is the paste of a dictation the watch may extend to.
+    var composerWatchExpectsPaste = false
+    var composerWatchActivation: AnyCancellable?
     /// The learned keyterms ranked off main after each change of the learned store, Custom
     /// Vocabulary or Corrections, so a dictation start only reads them; nil while ranking.
     var learnedKeytermIndex: EffectiveVocabulary.LearnedKeytermIndex?
@@ -2248,6 +2257,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         hotkeyManager.onEscapeKeyPressed = { [weak self] in
             self?.handleEscapeKeyPress() ?? false
         }
+        hotkeyManager.onKeyActivity = { [weak self] activity in
+            self?.handleComposerKeyActivity(activity)
+        }
         restartHotkeyMonitoring()
     }
 
@@ -2283,6 +2295,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         hotkeyManager.onShortcutEvent = nil
         hotkeyManager.onEscapeKeyPressed = nil
         hotkeyManager.stop()
+        // After stop: the reset it reports ends any composer watch.
+        hotkeyManager.onKeyActivity = nil
     }
 
     func suspendHotkeyMonitoringForShortcutCapture() {
@@ -4204,14 +4218,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 self.overlayManager.dismiss()
                             }
 
+                            let composerTarget = appContext.textContext?.composerTarget
+                            let composerWatchMayArm = ComposerWatchGate.mayArm(
+                                target: composerTarget,
+                                pressedEnter: shouldPressEnterAfterPaste,
+                                hookIsReporting: self.claudeHookListener != nil && !self.claudeHookNotReporting
+                            )
                             let learningPaste = LearningPaste.eligible(
                                 inserted: insertedTranscript,
                                 raw: trimmedRawTranscript,
                                 bundleIdentifier: appContext.bundleIdentifier ?? sessionBundleIdentifier,
                                 category: learnedCategory,
-                                composerTarget: appContext.textContext?.composerTarget,
+                                composerTarget: composerTarget,
                                 composerClassified: appContext.textContext?.composerClassified ?? false,
                                 listensForPrompts: self.claudeHookListener != nil,
+                                composerWatchMayArm: composerWatchMayArm,
                                 pressedEnter: shouldPressEnterAfterPaste,
                                 isCommandMode: sessionIntent.isCommandMode,
                                 isVoiceMacro: result.outcome.isVoiceMacro,
@@ -4230,9 +4251,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 firedMarks.pasteFired = firedAt
                                 self?.completeStageTimings(firedMarks.timings, entryID: entryID)
                                 if let learningPaste {
-                                    self?.noteDispatchedPaste(entryID: entryID, paste: learningPaste, websiteDomain: learningWebsiteDomain)
+                                    self?.noteDispatchedPaste(
+                                        entryID: entryID,
+                                        paste: learningPaste,
+                                        websiteDomain: learningWebsiteDomain,
+                                        composerToWatch: composerWatchMayArm ? composerTarget : nil
+                                    )
                                 }
                             }
+                            self.composerWatchExpectsPaste = learningPaste != nil && composerWatchMayArm
                             self.insertTranscriptWhenShortcutReleased(
                                 insertedTranscript, target: textInsertionTarget,
                                 shouldPressEnter: shouldPressEnterAfterPaste,
@@ -5291,6 +5318,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func performAfterShortcutReleased(attempt: Int = 0, action: @escaping () -> Void) {
+        if attempt == 0 { noteFreeFlowWrite() }
         let action = attempt == 0 ? pasteGate.wrappingScheduledPaste(action) : action
         let maxAttempts = 24
         if hotkeyManager.hasPressedShortcutInputs && attempt < maxAttempts {

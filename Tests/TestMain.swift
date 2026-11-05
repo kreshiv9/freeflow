@@ -33,6 +33,8 @@ struct FreeFlowTests {
         ClaudeCodeHookTests.run()
         ClaudeHookListenerTests.run()
         GoogleSearchWatchTests.run()
+        ComposerWatchTests.run()
+        GlobalShortcutBackendTests.run()
         LearningSourcesTests.run()
         VocabularyDraftMergeTests.run()
         SnippetExpansionTests.run()

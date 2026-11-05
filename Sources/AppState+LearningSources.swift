@@ -34,7 +34,7 @@ extension AppState {
     // MARK: Switches
 
     /// Listens if and only if learning is on and the user connected Claude Code. Turning
-    /// learning off also ends the Google watch at once.
+    /// learning off also ends the Google and composer watches at once.
     func syncLearningSources() {
         let wantsListener = learningEnabled && claudeCodeHookConnected
         if wantsListener, claudeHookListener == nil {
@@ -62,6 +62,7 @@ extension AppState {
         }
         if !learningEnabled {
             endGoogleSearchWatch()
+            endComposerWatch(.killSwitch, counts: false)
         }
     }
 
@@ -129,7 +130,7 @@ extension AppState {
 
     /// A paste a source can observe was dispatched. One that was skipped never gets here, so
     /// text that never landed cannot match a prompt, count for the health check or arm a watch.
-    func noteDispatchedPaste(entryID: UUID, paste: LearningPaste, websiteDomain: String?) {
+    func noteDispatchedPaste(entryID: UUID, paste: LearningPaste, websiteDomain: String?, composerToWatch: ContextTarget?) {
         guard learningEnabled else { return }
         dictationRecords.attachPaste(paste, id: entryID, now: Date())
         DispatchQueue.main.asyncAfter(deadline: .now() + DictationRecordRing.lifetime + 1) { [weak self] in
@@ -141,7 +142,9 @@ extension AppState {
                 self?.refreshClaudeHookHealth()
             }
         }
-        if paste.destination == .chrome {
+        if let composerToWatch {
+            armComposerWatch(entryID: entryID, paste: paste, target: composerToWatch)
+        } else if paste.destination == .chrome {
             armGoogleSearchWatch(entryID: entryID, paste: paste, websiteDomain: websiteDomain)
         }
     }
@@ -160,6 +163,9 @@ extension AppState {
         if googleSearchWatch?.entryID == entryID {
             endGoogleSearchWatch(keepsEvidence: false)
         }
+        if composerWatch?.entryIDs.contains(entryID) == true {
+            endComposerWatch(.cancelled, counts: false)
+        }
     }
 
     /// Undo AI edit (SentTextLearning.cancel), which also ends that dictation's watch.
@@ -168,6 +174,9 @@ extension AppState {
         let cancelled = SentTextLearning.cancel(entryID: entryID, records: &dictationRecords, store: &store)
         if googleSearchWatch?.entryID == entryID {
             endGoogleSearchWatch(keepsEvidence: false)
+        }
+        if composerWatch?.entryIDs.contains(entryID) == true {
+            endComposerWatch(.cancelled, counts: false)
         }
         if cancelled {
             learnedVocabulary = store

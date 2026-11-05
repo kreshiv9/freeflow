@@ -62,6 +62,11 @@ enum ContextTarget: String, Equatable, Sendable {
         normalized(bundleIdentifier).map(vscodeBundles.contains) ?? false
     }
 
+    /// /Applications/ChatGPT.app, not ChatGPT Classic or Atlas.
+    static func isChatGPTApp(bundleIdentifier: String?) -> Bool {
+        normalized(bundleIdentifier) == chatGPTAppBundle
+    }
+
     /// A google.com (or google.<country>) page in Chrome, not another Google product.
     static func isGoogleSearch(bundleIdentifier: String?, websiteDomain: String?) -> Bool {
         classify(

@@ -10,6 +10,11 @@ final class HotkeyManager {
 
     var onShortcutEvent: ((ShortcutEvent) -> Void)?
     var onEscapeKeyPressed: (() -> Bool)?
+    var onKeyActivity: ((KeyActivity) -> Void)?
+
+    var isTapInstalled: Bool {
+        backend.isTapInstalled
+    }
 
     var currentPressedModifiers: ShortcutModifiers {
         inputState.currentModifiers
@@ -28,11 +33,15 @@ final class HotkeyManager {
         backend.onEscapeKeyPressed = { [weak self] in
             self?.onEscapeKeyPressed?() ?? false
         }
+        backend.onKeyActivity = { [weak self] activity in
+            self?.onKeyActivity?(activity)
+        }
         do {
             try backend.start()
         } catch {
             backend.onInputEvent = nil
             backend.onEscapeKeyPressed = nil
+            backend.onKeyActivity = nil
             inputState = ShortcutInputState()
             throw error
         }
@@ -42,6 +51,7 @@ final class HotkeyManager {
         backend.stop()
         backend.onInputEvent = nil
         backend.onEscapeKeyPressed = nil
+        backend.onKeyActivity = nil
         inputState = ShortcutInputState()
     }
 
