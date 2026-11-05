@@ -498,7 +498,12 @@ enum CorrectionLearner {
         let termWords = term.map(\.core), heardWords = heard.map(\.core)
         let unknownTerm = termWords.contains { !isKnown($0, lexicon) && !lexicon.isFirstName($0.lowercased()) }
         let capitalizedName = termWords.enumerated().contains { index, word in
-            (word.first?.isUppercase ?? false) && !(index == 0 && atSentenceStart) && !lexicon.isEveryday(word.lowercased())
+            guard word.first?.isUppercase ?? false, !lexicon.isEveryday(word.lowercased()) else { return false }
+            guard index == 0 && atSentenceStart else { return true }
+            // A sentence start's capital says nothing about an ordinary word, but a first name
+            // that is no ordinary word ("cloud code" -> "Claude Code") is a name there too. A
+            // change of case alone at a sentence start stays style.
+            return !caseOnly && lexicon.isFirstName(word.lowercased()) && !isKnown(word, lexicon)
         }
         let termShaped = codeShape || unknownTerm || capitalizedName
         let everydayTerm = termWords.allSatisfy { lexicon.isEveryday($0.lowercased()) } && !codeShape

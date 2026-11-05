@@ -19,6 +19,7 @@ enum CorrectionLearnerTests {
         testLearnedRulesRevert()
         testBounds()
         testWithoutEditGates()
+        testSentenceStartNames()
         testWordListParsing()
         testBundledWordListResource()
     }
@@ -572,6 +573,28 @@ enum CorrectionLearnerTests {
 
     /// Cleanup's edit of the raw text removes filler, so only each hunk is judged. Every other
     /// case in this file keeps the gates by default.
+    /// A first name that is no ordinary word is a name at a sentence start too, which is where a
+    /// search query's first words sit. An ordinary word's capital there still says nothing.
+    private static func testSentenceStartNames() {
+        func ungated(_ pasted: String, _ final: String) -> Learner.Outcome {
+            Learner.learn(pasted: pasted, final: final, lexicon: lexicon, appliesEditGates: false)
+        }
+        // Mid-sentence and at a start now agree.
+        TestSupport.expectEqual(fmt(ungated("pricing for cloud code", "pricing for Claude Code")), "cloud code->Claude Code:strong:later")
+        TestSupport.expectEqual(fmt(ungated("cloud code pricing", "Claude Code pricing")), "cloud code->Claude Code:strong:later")
+        TestSupport.expectEqual(fmt(learn("cloud code pricing", "Claude Code pricing")), "cloud code->Claude Code:strong:later")
+        TestSupport.expectEqual(fmt(learn("it works. cloud code is good", "it works. Claude Code is good")), "cloud code->Claude Code:strong:later")
+        TestSupport.expectEqual(fmt(learn("cloud is down", "Claude is down")), "cloud->Claude:strong:term")
+        // A change of case alone at a start stays style.
+        TestSupport.expectEqual(fmt(learn("claude is down", "Claude is down")), "nothing")
+        // A first name that is also an ordinary word, and an ordinary word, teach nothing there.
+        TestSupport.expectEqual(fmt(learn("pink is down", "Ping is down")), "nothing")
+        TestSupport.expectEqual(fmt(learn("the mellow setup", "The yellow setup")), "nothing")
+        TestSupport.expectEqual(fmt(learn("motion pricing", "Notion pricing")), "nothing")
+        // Two first names are still a swap.
+        TestSupport.expectEqual(fmt(learn("john is here", "Jason is here")), "nothing")
+    }
+
     private static func testWithoutEditGates() {
         func ungated(_ pasted: String, _ final: String, manual: Set<String> = []) -> Learner.Outcome {
             Learner.learn(pasted: pasted, final: final, lexicon: lexicon, manualTerms: manual, appliesEditGates: false)
